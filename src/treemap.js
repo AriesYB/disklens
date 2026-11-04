@@ -165,7 +165,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     var availH=h0-stripH;
     if(availH<10){ break; }
     var k=(w0*availH)/goodSum;
-    var px=main.map(function(it,i2){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,idx:i2}; });
+    var px=main.map(function(it,i2){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,idx:i2}; });
     out=[]; squarify(px,x0,y0,w0,availH,out);
     var bad=false, keep={};
     for(var b=0;b<out.length;b++){
@@ -195,7 +195,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     return;
   }
   var k=(w0*availH)/goodSum;
-  var px=main.map(function(it){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done}; });
+  var px=main.map(function(it){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c}; });
   out=[]; squarify(px,x0,y0,w0,availH,out);
   var depth=stack.length;
   var sep=(keyBase.charAt(keyBase.length-1)==='\\')?'':'\\';

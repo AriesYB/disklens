@@ -8,21 +8,36 @@ var IN_TAURI = !!window.__TAURI__;
 
 function markDirty(){ dirty = true; }
 
-function applyEvent(ev){
-  var k = ev.path.toLowerCase();
+function ensureChain(path){
+  var k = path.toLowerCase();
   var n = store.get(k);
-  if(!n){
-    n = { n: ev.name, s: ev.size, done: ev.done, p: ev.path, f: ev.file, c: [] };
-    store.set(k, n);
-    var pk = (ev.parent||'').toLowerCase();
-    if(pk){ var pn = store.get(pk); if(pn) pn.c.push(n); }
-  } else {
-    n.s = ev.size;
-    n.done = ev.done;
+  if(n) return n;
+  var idx = path.lastIndexOf('\\');
+  var parent = idx > 0 ? path.slice(0, idx + 1) : '';   // 含反斜杠：'C:\Users'→'C:\'
+  if(parent === path) parent = '';                       // 盘根自身即顶，无上级
+  var name = idx > 0 ? path.slice(idx+1) : path;
+  if(!name) name = path;                                 // 盘根 'C:\' 的尾反斜杠让末段为空
+  var pn = parent ? ensureChain(parent) : null;
+  n = { n: name, s: 0, done: false, p: path, f: false, c: [] };
+  store.set(k, n);
+  if(pn && !pn.c.includes(n)) pn.c.push(n);
+  return n;
+}
+function applyEvent(ev){
+  var n = ensureChain(ev.path);          // 自身 + 祖先链全部就位（事件乱序到达也健壮）
+  if(ev.name) n.n = ev.name;             // 空名（盘根 growth 事件）不覆盖
+  n.f = ev.file || n.f;
+  n.s = ev.size;
+  n.done = ev.done;
+  var idx = ev.path.lastIndexOf('\\');
+  var parentPath = idx > 0 ? ev.path.slice(0, idx) : '';
+  if(parentPath){
+    var pn = store.get(parentPath.toLowerCase());
+    if(pn && !pn.c.includes(n)) pn.c.push(n);   // 时序原因成孤儿的自动回挂
   }
   markDirty();
 }
-(function loop(){ if(dirty){ dirty = false; render(); } requestAnimationFrame(loop); })();
+(function loop(){ if(dirty){ dirty = false; render(); } setTimeout(loop, 150); })();
 
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
 function TauriFeed(){
