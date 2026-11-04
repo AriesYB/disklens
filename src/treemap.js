@@ -1,0 +1,302 @@
+// DiskLens treemap 引擎 —— 从 c-relocator Map-Reloc.ps1 viewer 完整移植：
+// squarify 布局 + 排序迟滞(12%) + 极小项/细条折叠 + 单击展开/双击进入 +
+// 客户端风格右键菜单 + 文件灰/目录彩色 + counting 流动斜纹。
+// 数据来源与渲染解耦：store 由 main.js 的 Feed 填充，本文件只读 store 渲染。
+
+/* ===== 全局状态 ===== */
+var curPath = null, stack = [], store = new Map(), divs = {}, dirty = false;
+var expanded = {}, orderState = {};
+var menuPath = '', menuSel = false;
+var map, rootInput, statusEl, footStat;
+
+/* ===== 工具 ===== */
+function fmt(b){ if(b>=1073741824) return (b/1073741824).toFixed(2)+' GB';
+  if(b>=1048576) return (b/1048576).toFixed(1)+' MB';
+  if(b>=1024) return (b/1024).toFixed(0)+' KB'; return b+' B'; }
+function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function colors(d){ var b=[[52,110,166],[64,138,116],[140,108,150],[164,124,68],[68,124,164],[128,150,66],[150,90,96]];
+  var c=b[d%b.length]; return 'rgb('+c[0]+','+c[1]+','+c[2]+')'; }
+function worst(row,len){ if(!row.length) return Infinity;
+  var s=0,mx=0,mn=Infinity;
+  for(var i=0;i<row.length;i++){s+=row[i].s; if(row[i].s>mx)mx=row[i].s; if(row[i].s<mn)mn=row[i].s;}
+  if(mn<=0||s<=0) return Infinity;
+  var l=len*len, s2=s*s;
+  return Math.max(l*mx/s2, s2/(l*mn)); }
+function layoutRow(row,x,y,w,h,out){
+  var s=0; for(var i=0;i<row.length;i++) s+=row[i].s;
+  if(w>=h){ var rw=s/h, ry=y;
+    for(var j=0;j<row.length;j++){ var rh=row[j].s/rw; out.push({n:row[j],x:x,y:ry,w:rw,h:rh}); ry+=rh; }
+    return {x:x+rw,y:y};
+  } else { var rh=s/w, xx=x;
+    for(var j2=0;j2<row.length;j2++){ var rw2=row[j2].s/rh; out.push({n:row[j2],x:xx,y:y,w:rw2,h:rh}); xx+=rw2; }
+    return {x:x,y:y+rh};
+  } }
+function squarify(items,x,y,w,h,out){
+  var row=[],i=0;
+  while(i<items.length&&w>1&&h>1){
+    var len=Math.min(w,h);
+    var c1=worst(row,len), c2=worst(row.concat([items[i]]),len);
+    if(c1===Infinity||c2<=c1){ row.push(items[i]); i++; }
+    else { var r=layoutRow(row,x,y,w,h,out);
+      if(w>=h){ w-=(r.x-x); x=r.x; } else { h-=(r.y-y); y=r.y; }
+      row=[]; }
+  }
+  if(row.length&&w>1&&h>1) layoutRow(row,x,y,w,h,out);
+}
+
+/* ===== 排序迟滞：新项按大小插入，旧项超相邻 12% 才上移 ===== */
+function stableOrder(arr,keyBase){
+  var st=orderState[keyBase];
+  if(!st){ st=orderState[keyBase]={list:[]}; }
+  var byName={};
+  for(var i=0;i<arr.length;i++) byName[arr[i].n]=arr[i];
+  var out=[];
+  for(var j=0;j<st.list.length;j++){ var it=byName[st.list[j]]; if(it){ out.push(it); delete byName[st.list[j]]; } }
+  for(var k2=0;k2<arr.length;k2++){ if(byName[arr[k2].n]){ out.push(arr[k2]); delete byName[arr[k2].n]; } }
+  var changed=true,passes=0;
+  while(changed&&passes<60){
+    changed=false;passes++;
+    for(var m=0;m<out.length-1;m++){
+      if(out[m+1].s>out[m].s*1.12){ var t=out[m];out[m]=out[m+1];out[m+1]=t;changed=true; }
+    }
+  }
+  st.list=out.map(function(x){return x.n;});
+  return out;
+}
+
+/* ===== 单元格创建/绘制 ===== */
+function getCell(kk){
+  var d=divs[kk];
+  if(!d){
+    d=document.createElement('div'); d.className='cell new';
+    d.dataset.k=kk; map.appendChild(d); divs[kk]=d;
+    setTimeout(function(el){ return function(){ el.className=el.className.replace(' new',''); }; }(d), 40);
+    var l=document.createElement('div'); l.className='lbl'; d.appendChild(l);
+    var b=document.createElement('div'); b.className='badge'; d.appendChild(b);
+    d.style.cursor='pointer';
+    d.addEventListener('mousemove',function(ev){
+      var el=ev.currentTarget, n=el.__n||{};
+      var t=document.getElementById('tip'); t.style.display='block';
+      t.style.left=Math.min(ev.clientX+14,window.innerWidth-560)+'px';
+      t.style.top=(ev.clientY+14)+'px';
+      var fp=n.agg?('聚合 '+n.agg+' 个极小/未扫完项'):(el.__path||n.p||'');
+      t.innerHTML='<div style="color:#9fd1ff;word-break:break-all">'+esc(fp)+'</div><b>'+fmt(n.raw!=null?n.raw:n.s)+'</b>'+
+        (n.f?'<span style="color:#888"> · 文件</span>':'<span style="color:#888"> · 目录 · 单击展开/收起 · 双击进入</span>')+
+        (n.done?'':'<br><span style="color:#ffd479">counting...</span>')+
+        '<br><span style="color:#888">右键：'+(n.f?'打开所在文件夹':'更多操作')+'</span>';
+    });
+    d.addEventListener('mouseleave',function(){ document.getElementById('tip').style.display='none'; });
+    d.addEventListener('click',function(ev){ ev.stopPropagation();
+      var el=ev.currentTarget, n=el.__n||{};
+      if(n.f) return;
+      var p=el.__path; if(!p) return;
+      if(expanded[p]){ delete expanded[p]; }
+      else { expanded[p]=1; }
+      render();
+    });
+    d.addEventListener('dblclick',function(ev){ ev.stopPropagation();
+      var el=ev.currentTarget, n=el.__n||{};
+      if(n.f) return;
+      var p=el.__path;
+      if(p){ navigate(p); } });
+    d.addEventListener('contextmenu',function(ev){ ev.preventDefault(); ev.stopPropagation();
+      var el=ev.currentTarget, n=el.__n||{};
+      var fp=el.__path||n.p||'';
+      menuPath=fp; menuSel=!!n.f;
+      var isFile=!!n.f;
+      document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
+      document.getElementById('mi-enter').style.display=isFile?'none':'';
+      document.getElementById('mi-expand').style.display=isFile?'none':'';
+      document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
+      document.getElementById('mi-copy-t').textContent='复制完整路径';
+      document.getElementById('ctxpath').textContent=fp;
+      var c=document.getElementById('ctx');
+      c.style.display='block';
+      c.style.left=Math.min(ev.clientX,window.innerWidth-256)+'px';
+      c.style.top=Math.min(ev.clientY,window.innerHeight-200)+'px';
+    });
+  }
+  return d;
+}
+function paintCell(d,o,x,y,w,h,pth,kk,seen,ci){
+  d.__n=o.n; d.__path=pth;
+  d.style.left=x+'px'; d.style.top=y+'px';
+  d.style.width=Math.max(0,w-2)+'px'; d.style.height=Math.max(0,h-2)+'px';
+  d.style.background=o.n.f?(o.n.agg?'#3f3f46':'#6e6e6e'):colors(ci);
+  d.classList.toggle('expd',!!expanded[pth]);
+  d.classList.toggle('counting',!o.n.done);
+  var lbl=d.querySelector('.lbl');
+  lbl.textContent=o.n.n+'  '+fmt(o.n.raw!=null?o.n.raw:o.n.s)+(expanded[pth]?' ▾':'');
+  lbl.style.fontSize=(w>180&&h>50)?'14px':'11px';
+  lbl.style.paddingLeft=expanded[pth]?
+    (4+Math.max(0,pth.split('\\').length-curPath.split('\\').length)*12)+'px':'';
+  d.querySelector('.badge').textContent=o.n.done?'':'...';
+  seen[kk]=1;
+}
+
+/* ===== 布局：面积折叠 + 形状检测 + 剩余条占位 ===== */
+function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
+  var items=(node.c||[]).slice().sort(function(a,b){return b.s-a.s;});
+  var tot=0; for(var q=0;q<items.length;q++) tot+=items[q].s;
+  if(!items.length||tot<=0||w0<10||h0<10) return;
+  var MINA=180;
+  var k0=(w0*h0)/tot;
+  var main=[],rest=0,restN=0;
+  for(var q2=0;q2<items.length;q2++){
+    var it=items[q2];
+    if(it.s*k0>=MINA){ main.push(it); }
+    else { rest+=it.s; restN++; }
+  }
+  var aggS=rest, aggN=restN, agg=aggS>0;
+  if(!main.length){
+    if(agg){
+      var d0=getCell(keyBase+'|:agg');
+      paintCell(d0,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+      d0.style.background='#3f3f46';
+    }
+    return;
+  }
+  main=stableOrder(main,keyBase);
+  var out=[];
+  for(var pass=0;pass<4;pass++){
+    var goodSum=0; for(var g=0;g<main.length;g++) goodSum+=main[g].s;
+    if(goodSum<=0){ main=[]; break; }
+    var stripH=agg?Math.max(18,Math.min(Math.round(h0*aggS/(goodSum+aggS)),Math.round(h0*0.4))):0;
+    var availH=h0-stripH;
+    if(availH<10){ break; }
+    var k=(w0*availH)/goodSum;
+    var px=main.map(function(it,i2){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,idx:i2}; });
+    out=[]; squarify(px,x0,y0,w0,availH,out);
+    var bad=false, keep={};
+    for(var b=0;b<out.length;b++){
+      var r=out[b];
+      var mx=Math.max(r.w,r.h), mn=Math.min(r.w,r.h);
+      if(mn<5||mx/mn>7){ bad=true; agg=true; aggS+=r.n.raw; aggN++; }
+      else { keep[r.n.idx]=1; }
+    }
+    if(!bad) break;
+    main=main.filter(function(it,i3){ return keep[i3]; });
+  }
+  var goodSum=0; for(var g2=0;g2<main.length;g2++) goodSum+=main[g2].s;
+  if(goodSum<=0){
+    if(agg){
+      var d1=getCell(keyBase+'|:agg');
+      paintCell(d1,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+      d1.style.background='#3f3f46';
+    }
+    return;
+  }
+  var stripH=agg?Math.max(18,Math.min(Math.round(h0*aggS/(goodSum+aggS)),Math.round(h0*0.4))):0;
+  var availH=h0-stripH;
+  if(availH<10){
+    var d2=getCell(keyBase+'|:agg');
+    paintCell(d2,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+    d2.style.background='#3f3f46';
+    return;
+  }
+  var k=(w0*availH)/goodSum;
+  var px=main.map(function(it){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done}; });
+  out=[]; squarify(px,x0,y0,w0,availH,out);
+  var depth=stack.length;
+  var sep=(keyBase.charAt(keyBase.length-1)==='\\')?'':'\\';
+  for(var i=0;i<out.length;i++){
+    var o=out[i], kk=keyBase+'|'+o.n.n;
+    var pth=o.n.p||(keyBase+sep+o.n.n);
+    var d=getCell(kk);
+    paintCell(d,o,o.x,o.y,o.w,o.h,pth,kk,seen,depth+i);
+    if(expanded[pth]&&o.n.c&&o.n.c.length){
+      layoutInto(o.n,o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,seen);
+    }
+  }
+  if(agg&&stripH>0){
+    var akk=keyBase+'|:agg';
+    var ad=getCell(akk);
+    paintCell(ad,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0+availH,w0,stripH,keyBase,akk,seen,depth);
+    ad.style.background='#3f3f46';
+  }
+}
+
+/* ===== 渲染循环 ===== */
+function render(){
+  if(!curPath) return;
+  var node = store.get(curPath.toLowerCase());
+  if(!node) return;
+  var W = map.clientWidth, H = map.clientHeight;
+  var items=(node.c||[]);
+  var tot=0; for(var q=0;q<items.length;q++) tot+=items[q].s;
+  var wait = document.getElementById('wait');
+  wait.style.display = (items.length&&tot>0)? 'none':'flex';
+  var seen={};
+  layoutInto(node,0,0,W,H,curPath,seen);
+  for(var key in divs){ if(!seen[key]){ var old=divs[key]; old.style.opacity='0';
+    (function(el){ setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); },450); })(old);
+    delete divs[key]; } }
+  drawBar(node);
+}
+function drawBar(node){
+  var b=document.getElementById('bar'); b.innerHTML='';
+  if(stack.length){ var bk=document.createElement('span'); bk.className='crumb'; bk.textContent='⬅ 返回';
+    bk.onclick=function(){ goUp(); }; b.appendChild(bk);
+    b.appendChild(document.createTextNode(' | ')); }
+  function mk(label,p){ var s=document.createElement('span'); s.className='crumb'; s.textContent=label;
+    s.onclick=(function(pp){ return function(){ navigate(pp,false); }; })(p); b.appendChild(s); }
+  mk('[root]',ROOT);
+  var acc=ROOT;
+  for(var i=0;i<stack.length;i++){ acc=stack[i].path;
+    b.appendChild(document.createTextNode(' \\ ')); mk(stack[i].name,acc); }
+  b.appendChild(document.createTextNode(' \\ '));
+  var cb=document.createElement('b'); cb.textContent=node.n+' = '+fmt(node.s); b.appendChild(cb);
+  var statSpan=document.getElementById('stat');
+  if(statSpan) statSpan.innerHTML=node.done?
+    '<b>done</b> · 单击展开 · 双击进入 · 右键更多操作':'<b>counting...</b> blocks grow live';
+}
+function goUp(){
+  if(!stack.length) return;
+  var p=stack.pop(); curPath=p.path; divs={}; map.innerHTML=''; expanded={}; render();
+}
+function navigate(path,isChild){
+  if(isChild!==false && curPath && store.get(curPath.toLowerCase())){ stack.push({name:store.get(curPath.toLowerCase()).n,path:curPath}); }
+  curPath=path; divs={}; map.innerHTML=''; expanded={}; render();
+}
+
+/* ===== 菜单 ===== */
+function hideCtx(){ document.getElementById('ctx').style.display='none'; }
+function openPathInExplorer(p,sel){ feed.open(p,sel); }
+document.getElementById('mi-open').addEventListener('click',function(){ openPathInExplorer(menuPath,menuSel); hideCtx(); });
+document.getElementById('mi-copy').addEventListener('click',function(){
+  copyPath(menuPath,document.getElementById('mi-copy-t')); setTimeout(hideCtx,650); });
+document.getElementById('mi-enter').addEventListener('click',function(){
+  if(menuPath&&!menuSel){ navigate(menuPath); } hideCtx(); });
+document.getElementById('mi-expand').addEventListener('click',function(){
+  var p=menuPath;
+  if(p&&!menuSel){
+    if(expanded[p]){ delete expanded[p]; }
+    else { expanded[p]=1; }
+    render();
+  }
+  hideCtx();
+});
+document.addEventListener('mousedown',function(ev){
+  var c=document.getElementById('ctx');
+  if(c.style.display==='block'&&!c.contains(ev.target)) c.style.display='none';
+},true);
+document.addEventListener('keydown',function(e){
+  if(e.key==='Backspace'&&stack.length){ e.preventDefault(); goUp(); }
+  if(e.key==='Escape'){ hideCtx();
+    if(Object.keys(expanded).length){ expanded={}; render(); } }
+});
+map.addEventListener('click',function(){ goUp(); });
+window.addEventListener('resize',function(){ render(); });
+function copyPath(p,fbEl){
+  function restore(){ if(fbEl) fbEl.textContent='复制完整路径'; }
+  function ok(){ if(fbEl){ fbEl.textContent='✓ 已复制'; setTimeout(restore,900); } }
+  function fail(){ if(fbEl){ fbEl.textContent='复制失败'; setTimeout(restore,1200); } }
+  function fallback(){ var t=document.createElement('textarea'); t.value=p;
+    document.body.appendChild(t); t.select();
+    var done=false; try{ done=document.execCommand('copy'); }catch(e){ }
+    document.body.removeChild(t);
+    if(done){ ok(); } else { fail(); } }
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(p).then(ok,fallback);
+  } else { fallback(); }
+}

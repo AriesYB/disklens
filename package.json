@@ -1,0 +1,13 @@
+{
+  "name": "disklens",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "npx --yes serve -l 5180 src"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
