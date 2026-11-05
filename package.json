@@ -1,11 +1,14 @@
 {
   "name": "disklens",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "npx --yes serve -l 5180 src"
+    "dev": "npx --yes serve -l 5180 src",
+    "build": "tauri build",
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
