@@ -130,7 +130,7 @@ function paintCell(d,o,x,y,w,h,pth,kk,seen,ci){
   lbl.style.fontSize=(w>180&&h>50)?'14px':'11px';
   lbl.style.paddingLeft=expanded[pth]?
     (4+Math.max(0,pth.split('\\').length-curPath.split('\\').length)*12)+'px':'';
-  d.querySelector('.badge').textContent=o.n.done?'':'...';
+  d.querySelector('.badge').textContent='';
   seen[kk]=1;
 }
 

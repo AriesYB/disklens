@@ -23,10 +23,10 @@ html,body{margin:0;height:100%;font:13px/1.4 "Segoe UI",system-ui,sans-serif;bac
 .cell.expd>.lbl{left:0;top:0;right:0;height:15px;line-height:15px;padding:0 4px;
                 background:rgba(10,10,10,.72);border-bottom:1px solid #b8860b;overflow:hidden}
 .cell.counting>.lbl{color:#ffd479}
-.cell.counting::after{content:'';position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;
-  background:repeating-linear-gradient(45deg,rgba(255,255,255,0) 0 18px,rgba(255,255,255,.05) 18px 36px);
-  animation:scanmv 2.4s linear infinite}
-@keyframes scanmv{to{background-position:50.91px 0}}
+.cell.counting{animation:cpulse 2.8s ease-in-out infinite}
+@keyframes cpulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.22)}}
+.cell.counting .badge{width:11px;height:11px;border:2px solid rgba(255,212,121,.25);border-top-color:#ffd479;
+  border-radius:50%;animation:spin .8s linear infinite;top:5px;right:5px}
 .cell .lbl{position:absolute;left:4px;top:2px;right:4px;pointer-events:none;font-size:11px;
            text-shadow:0 1px 3px #000;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 #tip{position:fixed;display:none;background:#000d;border:1px solid #555;border-radius:4px;
