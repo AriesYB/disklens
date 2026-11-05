@@ -37,7 +37,18 @@ function applyEvent(ev){
   }
   markDirty();
 }
-(function loop(){ if(dirty){ dirty = false; render(); } setTimeout(loop, 150); })();
+(function loop(){
+  if(dirty){
+    dirty = false;
+    try { render(); }
+    catch(e){
+      window.__errs = window.__errs || [];
+      window.__errs.push('render: ' + e.message);
+      try { setStatus('渲染异常：' + e.message); } catch(_) {}
+    }
+  }
+  setTimeout(loop, 150);
+})();
 
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
 function TauriFeed(){
