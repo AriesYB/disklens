@@ -123,14 +123,55 @@ MockFeed.prototype.start = function(root, onDone){
       }, 800+t*420));
     })(t);
   }
+  // 第二波：深层目录"晚些才被扫到"并渐进生长（模拟真实 DFS 越扫越深，下钻有东西可看）
+  var late = [
+    ['C:\\Users\\HetFrame\\AppData\\Local', 'C:\\Users\\HetFrame\\AppData', 'Local', 25.2, 9200],
+    ['C:\\Users\\HetFrame\\AppData\\LocalLow', 'C:\\Users\\HetFrame\\AppData', 'LocalLow', 0.8, 9600],
+    ['C:\\Users\\HetFrame\\AppData\\Roaming', 'C:\\Users\\HetFrame\\AppData', 'Roaming', 8.1, 10000],
+    ['C:\\Users\\HetFrame\\Desktop', 'C:\\Users\\HetFrame', 'Desktop', 6.0, 10400],
+    ['C:\\Users\\HetFrame\\Documents', 'C:\\Users\\HetFrame', 'Documents', 3.5, 10800],
+    ['C:\\Users\\HetFrame\\Downloads', 'C:\\Users\\HetFrame', 'Downloads', 26.1, 11200],
+    ['C:\\Users\\HetFrame\\.vscode', 'C:\\Users\\HetFrame', '.vscode', 2.0, 11600],
+    ['C:\\Program Files\\Windows Apps', 'C:\\Program Files', 'Windows Apps', 4.2, 12000],
+    ['C:\\ProgramData\\Microsoft', 'C:\\ProgramData', 'Microsoft', 3.1, 12400],
+    ['C:\\Windows\\System32', 'C:\\Windows', 'System32', 6.1, 12800]
+  ];
+  var growth2 = {
+    'C:\\Users\\HetFrame\\AppData\\Local':25.2, 'C:\\Users\\HetFrame\\AppData\\Roaming':8.1,
+    'C:\\Users\\HetFrame\\AppData\\LocalLow':0.8, 'C:\\Users\\HetFrame\\Desktop':6.0,
+    'C:\\Users\\HetFrame\\Documents':3.5, 'C:\\Users\\HetFrame\\Downloads':26.1,
+    'C:\\Users\\HetFrame\\.vscode':2.0, 'C:\\Program Files\\Windows Apps':4.2,
+    'C:\\ProgramData\\Microsoft':3.1, 'C:\\Windows\\System32':6.1
+  };
+  late.forEach(function(d){
+    self.timers.push(setTimeout(function(){
+      applyEvent({ path:d[0], parent:d[1], name:d[2], size:0, done:false, file:false });
+    }, d[4]));
+  });
+  var ticks2 = 9;
+  for(var t2 = 1; t2 <= ticks2; t2++){
+    (function(frac){
+      self.timers.push(setTimeout(function(){
+        for(var p in growth2){
+          var target = growth2[p]*GB;
+          var parts = p.split('\\');
+          applyEvent({ path:p, parent:parts.slice(0,-1).join('\\'), name:parts[parts.length-1],
+                       size:Math.round(target*frac/ticks2), done:false, file:false });
+        }
+      }, 13200+t2*620));
+    })(t2);
+  }
+  var allPaths = {};
+  for(var gp in growth) allPaths[gp] = growth[gp];
+  for(var gp2 in growth2) allPaths[gp2] = growth2[gp2];
   self.timers.push(setTimeout(function(){
-    for(var p in growth){
+    for(var p in allPaths){
       var parts = p.split('\\');
       applyEvent({ path:p, parent:parts.slice(0,-1).join('\\'), name:parts[parts.length-1],
-                   size:Math.round(growth[p]*GB), done:true, file:false });
+                   size:Math.round(allPaths[p]*GB), done:true, file:false });
     }
     if(self.onDone) self.onDone('模拟扫描完成');
-  }, 800+(ticks+1)*420));
+  }, 13200+(ticks2+1)*620));
 };
 MockFeed.prototype.stop = function(){ this._clear(); setStatus('已停止'); };
 MockFeed.prototype.open = function(p){
