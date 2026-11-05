@@ -14,8 +14,23 @@ function fmt(b){ if(b>=1073741824) return (b/1073741824).toFixed(2)+' GB';
   if(b>=1048576) return (b/1048576).toFixed(1)+' MB';
   if(b>=1024) return (b/1024).toFixed(0)+' KB'; return b+' B'; }
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
-function colors(d){ var b=[[52,110,166],[64,138,116],[140,108,150],[164,124,68],[68,124,164],[128,150,66],[150,90,96]];
-  var c=b[d%b.length]; return 'rgb('+c[0]+','+c[1]+','+c[2]+')'; }
+var PALETTE=['#3987d8','#2ea88a','#a568d6','#d69a44','#4a7de0','#8fb544',
+             '#d46b78','#3fb3c4','#c474ad','#6f8f3d','#8a7fe0','#c98a3b'];
+function colors(d){ return PALETTE[((d%PALETTE.length)+PALETTE.length)%PALETTE.length]; }
+/* 共享右键菜单：treemap / 列表 / 大文件榜 三视图通用 */
+function openContextMenu(ev,fp,isFile){
+  menuPath=fp; menuSel=!!isFile;
+  document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
+  document.getElementById('mi-enter').style.display=isFile?'none':'';
+  document.getElementById('mi-expand').style.display=isFile?'none':'';
+  document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
+  document.getElementById('mi-copy-t').textContent='复制完整路径';
+  document.getElementById('ctxpath').textContent=fp;
+  var c=document.getElementById('ctx');
+  c.style.display='block';
+  c.style.left=Math.min(ev.clientX,window.innerWidth-256)+'px';
+  c.style.top=Math.min(ev.clientY,window.innerHeight-200)+'px';
+}
 function worst(row,len){ if(!row.length) return Infinity;
   var s=0,mx=0,mn=Infinity;
   for(var i=0;i<row.length;i++){s+=row[i].s; if(row[i].s>mx)mx=row[i].s; if(row[i].s<mn)mn=row[i].s;}
@@ -101,19 +116,7 @@ function getCell(kk){
       if(p){ navigate(p); } });
     d.addEventListener('contextmenu',function(ev){ ev.preventDefault(); ev.stopPropagation();
       var el=ev.currentTarget, n=el.__n||{};
-      var fp=el.__path||n.p||'';
-      menuPath=fp; menuSel=!!n.f;
-      var isFile=!!n.f;
-      document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
-      document.getElementById('mi-enter').style.display=isFile?'none':'';
-      document.getElementById('mi-expand').style.display=isFile?'none':'';
-      document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
-      document.getElementById('mi-copy-t').textContent='复制完整路径';
-      document.getElementById('ctxpath').textContent=fp;
-      var c=document.getElementById('ctx');
-      c.style.display='block';
-      c.style.left=Math.min(ev.clientX,window.innerWidth-256)+'px';
-      c.style.top=Math.min(ev.clientY,window.innerHeight-200)+'px';
+      openContextMenu(ev,el.__path||n.p||'',!!n.f);
     });
   }
   return d;
@@ -122,7 +125,7 @@ function paintCell(d,o,x,y,w,h,pth,kk,seen,ci){
   d.__n=o.n; d.__path=pth;
   d.style.left=x+'px'; d.style.top=y+'px';
   d.style.width=Math.max(0,w-2)+'px'; d.style.height=Math.max(0,h-2)+'px';
-  d.style.background=o.n.f?(o.n.agg?'#3f3f46':'#6e6e6e'):colors(ci);
+  d.style.backgroundColor=o.n.f?(o.n.agg?'#39414e':'#5b6472'):colors(ci);
   d.classList.toggle('expd',!!expanded[pth]);
   d.classList.toggle('counting',!o.n.done);
   var lbl=d.querySelector('.lbl');
@@ -216,8 +219,8 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   }
 }
 
-/* ===== 渲染循环 ===== */
-function render(){
+/* ===== 渲染（treemap 视图；render() 为 main.js 的视图调度器） ===== */
+function renderTreemap(){
   if(!curPath) return;
   var node = store.get(curPath.toLowerCase());
   if(!node) return;
@@ -233,24 +236,6 @@ function render(){
   for(var key in divs){ if(!seen[key]){ var old=divs[key]; old.style.opacity='0';
     (function(el){ setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); },450); })(old);
     delete divs[key]; } }
-  drawBar(node);
-}
-function drawBar(node){
-  var b=document.getElementById('bar'); b.innerHTML='';
-  if(stack.length){ var bk=document.createElement('span'); bk.className='crumb'; bk.textContent='⬅ 返回';
-    bk.onclick=function(){ goUp(); }; b.appendChild(bk);
-    b.appendChild(document.createTextNode(' | ')); }
-  function mk(label,p){ var s=document.createElement('span'); s.className='crumb'; s.textContent=label;
-    s.onclick=(function(pp){ return function(){ navigate(pp,false); }; })(p); b.appendChild(s); }
-  mk('[root]',ROOT);
-  var acc=ROOT;
-  for(var i=0;i<stack.length;i++){ acc=stack[i].path;
-    b.appendChild(document.createTextNode(' \\ ')); mk(stack[i].name,acc); }
-  b.appendChild(document.createTextNode(' \\ '));
-  var cb=document.createElement('b'); cb.textContent=node.n+' = '+fmt(node.s); b.appendChild(cb);
-  var statSpan=document.getElementById('stat');
-  if(statSpan) statSpan.innerHTML=node.done?
-    '<b>done</b> · 单击展开 · 双击进入 · 右键更多操作':'<b>counting...</b> blocks grow live';
 }
 function goUp(){
   if(!stack.length) return;

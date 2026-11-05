@@ -28,6 +28,11 @@ struct NodeEvent {
 
 const DENY_DIRS: &[&str] = &["system volume information", "$winreagent", "recovery"];
 
+/// ≥ 此大小的文件作为独立节点事件推给前端（也是"大文件榜"的数据来源下限）
+const MIN_BIG_FILE: u64 = 10 * 1024 * 1024;
+/// 单目录最多独立上报的大文件数（超出的并入目录大小，防止海量大文件刷爆事件流）
+const MAX_BIG_FILES_PER_DIR: u64 = 200;
+
 // FILE_ATTRIBUTE_REPARSE_POINT
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -79,7 +84,6 @@ fn scan_dir(
     let mut n_items: u64 = 0;
     let mut last_flush = Instant::now();
     let mut big_file_count: u64 = 0;
-    let min_big: u64 = 10 * 1024 * 1024; // ≥10MB 的文件作为独立子项推给前端
 
     let rd = fs::read_dir(dir);
     let mut total: u64 = 0;
@@ -112,7 +116,7 @@ fn scan_dir(
                     ))
                 } else {
                     let len = sm.len();
-                    if len >= min_big && big_file_count < 200 {
+                    if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
                         big_file_count += 1;
                         emit(
                             app,
@@ -268,4 +272,43 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deny_dirs_match_case_insensitively() {
+        assert!(is_deny("System Volume Information"));
+        assert!(is_deny("$WinREAgent"));
+        assert!(is_deny("RECOVERY"));
+        assert!(!is_deny("Windows"));
+        assert!(!is_deny("users"));
+    }
+
+    #[test]
+    fn node_event_serializes_expected_fields() {
+        let ev = NodeEvent {
+            path: r"C:\Users".into(),
+            parent: r"C:\".into(),
+            name: "Users".into(),
+            size: 123,
+            done: true,
+            file: false,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["path"], r"C:\Users");
+        assert_eq!(v["parent"], r"C:\");
+        assert_eq!(v["name"], "Users");
+        assert_eq!(v["size"], 123);
+        assert_eq!(v["done"], true);
+        assert_eq!(v["file"], false);
+    }
+
+    #[test]
+    fn big_file_threshold_is_10mb() {
+        assert_eq!(MIN_BIG_FILE, 10 * 1024 * 1024);
+        assert!(MAX_BIG_FILES_PER_DIR > 0);
+    }
 }

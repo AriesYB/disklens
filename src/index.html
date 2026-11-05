@@ -2,20 +2,45 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.4" />
+    <link rel="stylesheet" href="/styles.css?v=0.6" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DiskLens 盘析</title>
+    <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
-  <body>
-    <div id="toolbar">
-      <span style="color:#7fc7ff;font-weight:600">DiskLens 盘析</span>
+  <body data-view="treemap">
+    <header id="appbar">
+      <div id="brand">
+        <span id="brand-glyph"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.6 15.6 21 21"/></svg></span>
+        <span id="brand-name">DiskLens <i>盘析</i></span>
+      </div>
       <input id="root-input" value="C:\" spellcheck="false" />
-      <button id="scan-btn">开始扫描</button>
+      <button id="scan-btn" class="primary">开始扫描</button>
       <button id="stop-btn" disabled>停止</button>
-      <span id="status"></span>
+      <span id="status">就绪</span>
+    </header>
+
+    <div id="viewbar">
+      <nav id="views">
+        <button class="seg active" data-view="treemap">方块视图</button>
+        <button class="seg" data-view="list">列表视图</button>
+        <button class="seg" data-view="files">大文件榜</button>
+      </nav>
+      <span id="summary"></span>
     </div>
+
     <div id="bar"></div>
-    <div id="map"></div>
+
+    <main id="content">
+      <div id="map"></div>
+      <div id="list"></div>
+      <div id="files"></div>
+      <div id="wait"><div><div class="spin"></div><div style="margin-top:12px">等待扫描开始…</div></div></div>
+    </main>
+
+    <footer id="foot">
+      <span id="foot-stats"></span>
+      <span id="foot-hint"></span>
+    </footer>
+
     <div id="tip"></div>
     <div id="ctx">
       <div id="ctxpath"></div>
@@ -25,9 +50,9 @@
       <div class="mi" id="mi-enter"><span class="ic">↯</span><span>进入此目录</span></div>
       <div class="mi" id="mi-expand"><span class="ic">⊞</span><span id="mi-expand-t">展开</span></div>
     </div>
-    <div id="wait"><div><div class="spin"></div><div style="margin-top:12px">等待扫描开始…</div></div></div>
-    <div id="foot">输入根目录后点击「开始扫描」</div>
-    <script src="/treemap.js?v=0.4"></script>
-    <script src="/main.js?v=0.4"></script>
+
+    <script src="/treemap.js?v=0.6"></script>
+    <script src="/listview.js?v=0.6"></script>
+    <script src="/main.js?v=0.6"></script>
   </body>
 </html>
