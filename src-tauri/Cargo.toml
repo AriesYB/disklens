@@ -1,8 +1,8 @@
 [package]
 name = "disklens"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.3.0"
+description = "DiskLens —— 看清每一寸磁盘：实时 treemap + 列表 + 大文件榜 + junction 迁移"
+authors = ["AriesYB"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -22,6 +22,10 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 枚举本地卷（盘符/文件系统/剩余空间）供迁移目标选择
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

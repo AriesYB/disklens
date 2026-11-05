@@ -23,6 +23,7 @@ function openContextMenu(ev,fp,isFile){
   document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
   document.getElementById('mi-enter').style.display=isFile?'none':'';
   document.getElementById('mi-expand').style.display=isFile?'none':'';
+  document.getElementById('mi-migrate').style.display=isFile?'none':'';
   document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
   document.getElementById('mi-copy-t').textContent='复制完整路径';
   document.getElementById('ctxpath').textContent=fp;

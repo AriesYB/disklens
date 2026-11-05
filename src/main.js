@@ -135,6 +135,10 @@ function TauriFeed(){
     setStatus(ev.payload || '完成', 'done');
     setScanning(false);
   });
+  window.__TAURI__.event.listen('migrate-update', function(ev){
+    if(window.__migHandler) window.__migHandler(ev.payload);
+  });
+  window.__migHandler = null;   // migrate.js 对话框打开时接管
 }
 TauriFeed.prototype.start = function(root){
   setStatus('扫描中…', 'scanning');
@@ -150,6 +154,22 @@ TauriFeed.prototype.open = function(p, sel){
   window.__TAURI__.core.invoke('open_in_explorer', { path: p, select: !!sel }).catch(function(e){
     setStatus(String(e), 'err');
   });
+};
+TauriFeed.prototype.listVolumes = function(cb){
+  window.__TAURI__.core.invoke('list_volumes').then(cb).catch(function(){ cb([]); });
+};
+TauriFeed.prototype.migrateCheck = function(src, destRoot, cb){
+  window.__TAURI__.core.invoke('migrate_check', { src: src, destRoot: destRoot }).then(cb).catch(function(e){
+    setStatus(String(e), 'err'); cb(null);
+  });
+};
+TauriFeed.prototype.migrateStart = function(src, destRoot){
+  window.__TAURI__.core.invoke('migrate_start', { src: src, destRoot: destRoot }).catch(function(e){
+    if(window.__migHandler) window.__migHandler({ stage:'error', message:String(e), locked:[], bytes_done:0, bytes_total:0, files_done:0, files_total:0, current:'' });
+  });
+};
+TauriFeed.prototype.migrateStop = function(){
+  window.__TAURI__.core.invoke('migrate_stop').catch(function(){});
 };
 
 /* ===== Mock Feed：浏览器直接打开时的合成数据（UI 开发 / 演示用） ===== */
@@ -259,6 +279,61 @@ MockFeed.prototype.stop = function(){ this._clear(); setStatus('已停止','done
 MockFeed.prototype.open = function(p){
   setStatus('浏览器模式：打开文件夹需在 Tauri 客户端内使用','err');
 };
+
+/* ===== Mock 迁移：模拟三阶段事务事件流（浏览器演示用） ===== */
+MockFeed.prototype.listVolumes = function(cb){
+  setTimeout(function(){
+    cb([
+      { mount:'C:\\', label:'System', fs:'NTFS', free_bytes:21953699840, total_bytes:215047204864 },
+      { mount:'D:\\', label:'Data',   fs:'NTFS', free_bytes:28901150720, total_bytes:273803112448 },
+      { mount:'E:\\', label:'Archive',fs:'NTFS', free_bytes:505385566208, total_bytes:1000186310656 }
+    ]);
+  }, 150);
+};
+MockFeed.prototype.migrateCheck = function(src, destRoot, cb){
+  setTimeout(function(){
+    var node = store.get(src.toLowerCase());
+    var bytes = node ? node.s : 6 * 1073741824;
+    if (/\\windows(\\|$)/i.test(src)) {
+      cb({ ok:false, blockers:['系统目录（C:\\Windows）不可迁移'], warnings:['开始迁移前请关闭正在使用该目录的程序'],
+           src_bytes:bytes, src_files:12345, dest_path:destRoot+'\\'+src.split('\\').pop(),
+           dest_free:28901150720, same_volume:false });
+    } else {
+      cb({ ok:true, blockers:[], warnings:['（模拟）开始迁移前请关闭正在使用该目录的程序'],
+           src_bytes:bytes, src_files:8642, dest_path:destRoot+'\\'+src.split('\\').pop(),
+           dest_free:505385566208, same_volume:false });
+    }
+  }, 400);
+};
+MockFeed.prototype.migrateStart = function(src, destRoot){
+  var self = this;
+  this._clear();
+  this._migStopped = false;
+  var node = store.get(src.toLowerCase());
+  var total = node ? node.s : 6 * 1073741824;
+  var files = 8642;
+  var handler = window.__migHandler || function(){};
+  var ticks = 12, t = 0;
+  function tick(){
+    if (self._migStopped) { self._migStopped = false; handler({ stage:'aborted', message:'已停止：已完成部分保留，重新发起会自动续传', locked:[], bytes_done:0, bytes_total:0, files_done:0, files_total:0, current:'' }); return; }
+    t++;
+    if (t <= ticks) {
+      handler({ stage:'copy', message:'复制中…', locked:[], bytes_done:Math.round(total*t/ticks), bytes_total:total,
+                files_done:Math.round(files*t/ticks), files_total:files, current:src+'\\file-'+t+'.dat' });
+      self.timers.push(setTimeout(tick, 280));
+    } else if (t === ticks+1) {
+      handler({ stage:'verify', message:'校验中…', locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
+      self.timers.push(setTimeout(tick, 500));
+    } else if (t === ticks+2) {
+      handler({ stage:'switch', message:'切换中：删除源目录内容…', locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
+      self.timers.push(setTimeout(tick, 400));
+    } else {
+      handler({ stage:'done', message:'（模拟）迁移完成：原路径已是指向新位置的 junction', locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
+    }
+  }
+  self.timers.push(setTimeout(tick, 200));
+};
+MockFeed.prototype.migrateStop = function(){ this._migStopped = true; };
 
 /* ===== 启动 ===== */
 window.addEventListener('DOMContentLoaded', function(){

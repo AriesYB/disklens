@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.6" />
+    <link rel="stylesheet" href="/styles.css?v=0.7" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -49,10 +49,38 @@
       <div class="sep"></div>
       <div class="mi" id="mi-enter"><span class="ic">↯</span><span>进入此目录</span></div>
       <div class="mi" id="mi-expand"><span class="ic">⊞</span><span id="mi-expand-t">展开</span></div>
+      <div class="mi" id="mi-migrate"><span class="ic">📦</span><span>迁移此目录（junction）…</span></div>
     </div>
 
-    <script src="/treemap.js?v=0.6"></script>
-    <script src="/listview.js?v=0.6"></script>
-    <script src="/main.js?v=0.6"></script>
+    <div id="mig-mask" style="display:none">
+      <div id="mig">
+        <div id="mig-title">迁移目录 <button id="mig-close" title="关闭">✕</button></div>
+        <div id="mig-src"></div>
+        <div class="mig-row">
+          <span class="mig-lab">迁移到</span>
+          <select id="mig-vol"></select>
+          <span id="mig-vol-info"></span>
+        </div>
+        <div class="mig-row"><span class="mig-lab">目标路径</span><b id="mig-dest" class="mig-mono"></b></div>
+        <div id="mig-check"></div>
+        <div id="mig-prog" style="display:none">
+          <div id="mig-stage"></div>
+          <div class="mig-track"><div id="mig-fill"></div></div>
+          <div id="mig-cur" class="mig-mono"></div>
+        </div>
+        <div id="mig-locked" style="display:none"></div>
+        <div id="mig-actions">
+          <button id="mig-start" class="primary" disabled>检查中…</button>
+          <button id="mig-stop" style="display:none">停止</button>
+          <button id="mig-rescan" style="display:none">重新扫描</button>
+          <button id="mig-cancel">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/treemap.js?v=0.7"></script>
+    <script src="/listview.js?v=0.7"></script>
+    <script src="/migrate.js?v=0.7"></script>
+    <script src="/main.js?v=0.7"></script>
   </body>
 </html>
