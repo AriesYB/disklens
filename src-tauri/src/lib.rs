@@ -3,11 +3,11 @@
 // 32MB / 400 项 / 250ms 任一触发即向前端推送部分大小；目录完成推 done 事件）。
 // 跳过 reparse point（junction/symlink，避免环与重复计数）与 deny 目录。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -16,13 +16,13 @@ use std::os::windows::fs::MetadataExt;
 
 #[derive(Default)]
 pub struct ScanState {
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
     running: Mutex<bool>,
-    /// 未终结的扫描线程数（主 DFS 计 1，每个用户点击的优先扫描各计 1）；
+    /// 未终结的扫描线程数（主扫描计 1，每个用户点击的优先扫描各计 1）；
     /// 减到 0 的那个线程负责发 scan-finished
     active: Mutex<usize>,
     /// 已完成子树的字节数表：lower(path) -> 子树总大小。
-    /// 主 DFS 到达某目录时若表里已有（被优先扫描先行完成）则直接采用，不再重扫
+    /// 并行工作线程/优先扫描到达某目录时若表里已有（被另一方先行完成）则直接采用，不再重扫
     sizes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
@@ -217,7 +217,7 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
         m.clear();
     }
     if let Ok(mut a) = state.active.lock() {
-        *a = 1; // 主 DFS 自己占 1 个名额，优先扫描线程各再 +1
+        *a = 1; // 主扫描占 1 个名额，优先扫描线程各再 +1
     }
 
     let app2 = app.clone();
@@ -231,19 +231,58 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let t0 = Instant::now();
-        {
-            let st = app2.state::<ScanState>();
-            scan_dir(
-                &app2,
-                &root_path,
-                parent,
-                root_name,
-                48,
-                &st.stop,
-                &st.sizes,
-            );
+
+        // ===== 并行扫描引擎：N 个工作线程共享一个任务队列 =====
+        // 每个目录一个 DState：工作线程读完目录项后，子目录入队、文件累计；
+        // 子目录完成时把体积上缴父目录（remaining-- 到 0 且自身读完 → 级联完成）。
+        // 同一时刻大量目录处于统计中——前端会看到多个目录同时转圈，这是真实并行状态。
+        let root = Arc::new(DState {
+            path: root_path.to_string_lossy().to_string(),
+            parent_path: parent,
+            name: root_name,
+            depth: 48,
+            remaining: AtomicUsize::new(0),
+            size: Mutex::new(0),
+            iter_done: AtomicBool::new(false),
+            parent: None,
+        });
+        let jobs: Arc<Mutex<VecDeque<Arc<DState>>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let cv: Arc<Condvar> = Arc::new(Condvar::new());
+        jobs.lock().unwrap().push_back(root);
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 16);
+        let alive = Arc::new(AtomicUsize::new(n_workers));
+        let finished = Arc::new(AtomicBool::new(false));
+        let st = app2.state::<ScanState>();
+        let ctx = Arc::new(EngineCtx {
+            app: app2.clone(),
+            sizes: st.sizes.clone(),
+            stop: st.stop.clone(),
+            finished: finished.clone(),
+            cv: cv.clone(),
+        });
+        for _ in 0..n_workers {
+            let ctx = ctx.clone();
+            let jobs = jobs.clone();
+            let cv = cv.clone();
+            let alive = alive.clone();
+            std::thread::spawn(move || worker_loop(ctx, jobs, cv, alive));
         }
-        // 最后一个结束的线程（主 DFS 或任一优先扫描）负责宣布完成
+        // 协调者：等根目录完成（finished）或全部 worker 退出（停止）
+        loop {
+            std::thread::sleep(Duration::from_millis(120));
+            if finished.load(Ordering::Relaxed) || alive.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+        }
+        let msg = if finished.load(Ordering::Relaxed) {
+            format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32())
+        } else {
+            "已停止".to_string()
+        };
+        // 最后一个结束的线程（主扫描或任一优先扫描）负责宣布完成
         let mut announce = String::new();
         {
             let st = app2.state::<ScanState>();
@@ -252,7 +291,7 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
                     *a -= 1;
                 }
                 if *a == 0 {
-                    announce = format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32());
+                    announce = msg;
                 }
             }
         }
@@ -264,6 +303,250 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
         }
     });
     Ok(())
+}
+
+// ======================== 并行扫描引擎 ========================
+// 与串行 scan_dir（优先扫描用）共享 sizes 完成表：任何一方完成某目录即登记，
+// 另一方遇到时直接采用，避免重复扫描。
+
+/// 一个正在扫描的目录的共享状态：工作线程读完目录项后，子目录入队、文件累计；
+/// 子目录完成时把体积上缴父目录，父目录 remaining 减到 0 且自身目录项已读完 → 级联完成。
+struct DState {
+    path: String,
+    parent_path: String,
+    name: String,
+    depth: u32,
+    /// 尚未完成的子目录任务数
+    remaining: AtomicUsize,
+    /// 自身文件 + 已完成子目录的累计字节
+    size: Mutex<u64>,
+    /// 目录项是否已读完（read_dir 迭代结束）
+    iter_done: AtomicBool,
+    parent: Option<Arc<DState>>,
+}
+
+struct EngineCtx {
+    app: AppHandle,
+    sizes: Arc<Mutex<HashMap<String, u64>>>,
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    cv: Arc<Condvar>,
+}
+
+/// 完成一步聚合：登记 sizes、向父目录上缴体积；父目录若因此完成则返回它及其总价。
+fn settle(
+    state: &Arc<DState>,
+    total: u64,
+    sizes: &Mutex<HashMap<String, u64>>,
+) -> Option<(Arc<DState>, u64)> {
+    if let Ok(mut m) = sizes.lock() {
+        m.insert(state.path.to_lowercase(), total);
+    }
+    let p = state.parent.as_ref()?;
+    {
+        let mut ps = p.size.lock().ok()?;
+        *ps += total;
+    }
+    // fetch_sub 返回旧值 == 1 说明减到 0：目录项已读完 → 父目录级联完成
+    if p.remaining.fetch_sub(1, Ordering::Relaxed) == 1
+        && p.iter_done.load(Ordering::Relaxed)
+    {
+        let pt = *p.size.lock().ok()?;
+        return Some((p.clone(), pt));
+    }
+    None
+}
+
+/// 目录完成：发 done 事件并沿父链级联；根目录完成时置 finished 唤醒协调者。
+fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, already_emitted: bool) {
+    let mut cur = state.clone();
+    let mut t = total;
+    let mut first = already_emitted; // true：done 事件已由别处发过，只做聚合
+    loop {
+        if !first {
+            emit(
+                &ctx.app,
+                &NodeEvent {
+                    path: cur.path.clone(),
+                    parent: cur.parent_path.clone(),
+                    name: cur.name.clone(),
+                    size: t,
+                    done: true,
+                    file: false,
+                },
+            );
+        }
+        first = false;
+        match settle(&cur, t, &ctx.sizes) {
+            Some((p, pt)) => {
+                cur = p;
+                t = pt;
+            }
+            None => {
+                if cur.parent.is_none() {
+                    // 根目录完成 → 本次扫描结束
+                    ctx.finished.store(true, Ordering::Relaxed);
+                    ctx.cv.notify_all();
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn worker_loop(
+    ctx: Arc<EngineCtx>,
+    jobs: Arc<Mutex<VecDeque<Arc<DState>>>>,
+    cv: Arc<Condvar>,
+    alive: Arc<AtomicUsize>,
+) {
+    loop {
+        if ctx.finished.load(Ordering::Relaxed) || ctx.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let job = {
+            let mut g = match jobs.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            match g.pop_front() {
+                Some(j) => j,
+                None => {
+                    let _ = cv.wait_timeout(g, Duration::from_millis(150));
+                    continue;
+                }
+            }
+        };
+        // 已被优先扫描（或其他线程）完成 → 直接按记录值完成聚合，不重扫、不重复发事件
+        {
+            let known = ctx
+                .sizes
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&job.path.to_lowercase()).copied());
+            if let Some(sz) = known {
+                complete_dir(&ctx, &job, sz, true);
+                continue;
+            }
+        }
+        emit(
+            &ctx.app,
+            &NodeEvent {
+                path: job.path.clone(),
+                parent: job.parent_path.clone(),
+                name: job.name.clone(),
+                size: 0,
+                done: false,
+                file: false,
+            },
+        );
+        let mut pending: u64 = 0;
+        let mut n_items: u64 = 0;
+        let mut big_file_count: u64 = 0;
+        let mut last_flush = Instant::now();
+        if let Ok(rd) = fs::read_dir(&job.path) {
+            for entry in rd.flatten() {
+                if ctx.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                n_items += 1;
+                let got = (|| -> Option<u64> {
+                    let sm = fs::symlink_metadata(entry.path()).ok()?;
+                    if is_reparse(&sm) {
+                        return Some(0);
+                    }
+                    if sm.is_dir() {
+                        let child_name = entry.file_name().to_string_lossy().to_string();
+                        if is_deny(&child_name) {
+                            return Some(0);
+                        }
+                        if job.depth == 0 {
+                            return Some(0);
+                        }
+                        let child_path = entry.path().to_string_lossy().to_string();
+                        // 已由另一方完成的子树：体积直接并入，不入队
+                        {
+                            let m = ctx.sizes.lock();
+                            if let Ok(m) = &m {
+                                if let Some(sz) = m.get(&child_path.to_lowercase()) {
+                                    return Some(*sz);
+                                }
+                            }
+                        }
+                        let child = Arc::new(DState {
+                            path: child_path,
+                            parent_path: job.path.clone(),
+                            name: child_name,
+                            depth: job.depth - 1,
+                            remaining: AtomicUsize::new(0),
+                            size: Mutex::new(0),
+                            iter_done: AtomicBool::new(false),
+                            parent: Some(job.clone()),
+                        });
+                        job.remaining.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut g) = jobs.lock() {
+                            g.push_back(child);
+                        }
+                        cv.notify_one();
+                        return Some(0); // 子目录体积经完成级联上缴
+                    }
+                    let len = sm.len();
+                    if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
+                        big_file_count += 1;
+                        emit(
+                            &ctx.app,
+                            &NodeEvent {
+                                path: entry.path().to_string_lossy().to_string(),
+                                parent: job.path.clone(),
+                                name: entry.file_name().to_string_lossy().to_string(),
+                                size: len,
+                                done: true,
+                                file: true,
+                            },
+                        );
+                    }
+                    Some(len)
+                })();
+                if let Some(v) = got {
+                    pending += v;
+                }
+                if pending >= 32 * 1024 * 1024
+                    || n_items % 400 == 0
+                    || last_flush.elapsed() >= Duration::from_millis(250)
+                {
+                    {
+                        let mut s = job.size.lock().unwrap();
+                        *s += pending;
+                    }
+                    pending = 0;
+                    emit(
+                        &ctx.app,
+                        &NodeEvent {
+                            path: job.path.clone(),
+                            parent: job.parent_path.clone(),
+                            name: job.name.clone(),
+                            size: *job.size.lock().unwrap(),
+                            done: false,
+                            file: false,
+                        },
+                    );
+                    last_flush = Instant::now();
+                }
+            }
+        }
+        {
+            let mut s = job.size.lock().unwrap();
+            *s += pending;
+        }
+        job.iter_done.store(true, Ordering::Relaxed);
+        // 停止时强制完成（部分体积），让前端各目录状态收敛、不再永久转圈
+        if ctx.stop.load(Ordering::Relaxed) || job.remaining.load(Ordering::Relaxed) == 0 {
+            let total = *job.size.lock().unwrap();
+            complete_dir(&ctx, &job, total, false);
+        }
+    }
+    alive.fetch_sub(1, Ordering::Relaxed);
+    ctx.cv.notify_all();
 }
 
 /// 用户在扫描进行中点击了某个还没扫到的目录：立刻起一个线程优先扫这个子树。
@@ -1059,5 +1342,56 @@ mod tests {
         assert_eq!(fmt_bytes(2048), "2 KB");
         assert_eq!(fmt_bytes(2 * 1073741824), "2.00 GB");
         assert_eq!(fmt_bytes(2 * 1048576), "2.0 MB");
+    }
+
+    fn dstate(path: &str, parent: Option<Arc<DState>>) -> Arc<DState> {
+        Arc::new(DState {
+            path: path.into(),
+            parent_path: String::new(),
+            name: String::new(),
+            depth: 48,
+            remaining: AtomicUsize::new(0),
+            size: Mutex::new(0),
+            iter_done: AtomicBool::new(false),
+            parent,
+        })
+    }
+
+    #[test]
+    fn settle_propagates_totals_up_the_chain() {
+        let sizes: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+        let root = dstate("C:\\r", None);
+        let child = dstate("C:\\r\\c", Some(root.clone()));
+        // 父目录有一个未完成的子目录任务
+        root.remaining.store(1, Ordering::Relaxed);
+        // 子目录完成（体积 100）→ 上缴父目录；但父目录还没读完目录项 → 不级联
+        let r = settle(&child, 100, &sizes);
+        assert!(r.is_none(), "父目录 iter_done=false 不应级联");
+        assert_eq!(*root.size.lock().unwrap(), 100);
+        assert_eq!(root.remaining.load(Ordering::Relaxed), 0);
+        assert_eq!(sizes.lock().unwrap().get("c:\\r\\c"), Some(&100));
+        // 父目录自己读完（自带 5 字节文件，总计 105）→ 级联条件满足但自身是根 → 返回 None
+        root.iter_done.store(true, Ordering::Relaxed);
+        let r = settle(&root, 105, &sizes);
+        assert!(r.is_none(), "根目录没有父级");
+        assert_eq!(sizes.lock().unwrap().get("c:\\r"), Some(&105));
+    }
+
+    #[test]
+    fn settle_cascades_when_parent_ready() {
+        let sizes: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+        let root = dstate("C:\\p", None);
+        let mid = dstate("C:\\p\\m", Some(root.clone()));
+        let leaf = dstate("C:\\p\\m\\l", Some(mid.clone()));
+        mid.remaining.store(1, Ordering::Relaxed);
+        mid.iter_done.store(true, Ordering::Relaxed);
+        // 叶子完成 → mid 减到 0 且已读完 → 级联返回 mid（总价 7 = 自身 0 + 叶子 7）
+        let r = settle(&leaf, 7, &sizes);
+        assert_eq!(r.map(|(s, t)| (s.path.clone(), t)), Some(("C:\\p\\m".into(), 7)));
+        // mid 再完成 → 上缴 root；root 未读完 → None
+        let r = settle(&mid, 7, &sizes);
+        assert!(r.is_none());
+        assert_eq!(*root.size.lock().unwrap(), 7);
+        assert_eq!(mid.remaining.load(Ordering::Relaxed), 0);
     }
 }
