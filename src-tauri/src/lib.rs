@@ -249,10 +249,11 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
         let jobs: Arc<Mutex<VecDeque<Arc<DState>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let cv: Arc<Condvar> = Arc::new(Condvar::new());
         jobs.lock().unwrap().push_back(root);
+        // 机械盘上几十个线程随机 read_dir 会互相 seek 抖动，8 个以内最稳
         let n_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .clamp(4, 16);
+            .clamp(4, 8);
         let alive = Arc::new(AtomicUsize::new(n_workers));
         let finished = Arc::new(AtomicBool::new(false));
         let st = app2.state::<ScanState>();
@@ -262,6 +263,7 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
             stop: st.stop.clone(),
             finished: finished.clone(),
             cv: cv.clone(),
+            out: Arc::new(Mutex::new(Vec::new())),
         });
         for _ in 0..n_workers {
             let ctx = ctx.clone();
@@ -277,6 +279,7 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
                 break;
             }
         }
+        flush_out(&ctx); // 排空残留事件批次
         let msg = if finished.load(Ordering::Relaxed) {
             format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32())
         } else {
@@ -331,6 +334,32 @@ struct EngineCtx {
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     cv: Arc<Condvar>,
+    /// 待发事件缓冲：攒批合并成 scan-batch 再发，避免并行时事件洪流淹没前端
+    out: Arc<Mutex<Vec<NodeEvent>>>,
+}
+
+/// 事件入批；满 256 条立即刷出。并行扫描时事件量是串行的几十倍，
+/// 必须合并成批量 IPC，否则前端 JS 线程被逐条事件淹没导致界面冻结。
+fn push_event(ctx: &EngineCtx, ev: NodeEvent) {
+    let full = {
+        let mut b = ctx.out.lock().unwrap_or_else(|e| e.into_inner());
+        b.push(ev);
+        b.len() >= 256
+    };
+    if full {
+        flush_out(ctx);
+    }
+}
+
+fn flush_out(ctx: &EngineCtx) {
+    let batch = {
+        let mut b = ctx.out.lock().unwrap_or_else(|e| e.into_inner());
+        if b.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *b)
+    };
+    let _ = ctx.app.emit("scan-batch", &batch);
 }
 
 /// 完成一步聚合：登记 sizes、向父目录上缴体积；父目录若因此完成则返回它及其总价。
@@ -347,10 +376,10 @@ fn settle(
         let mut ps = p.size.lock().ok()?;
         *ps += total;
     }
-    // fetch_sub 返回旧值 == 1 说明减到 0：目录项已读完 → 父目录级联完成
-    if p.remaining.fetch_sub(1, Ordering::Relaxed) == 1
-        && p.iter_done.load(Ordering::Relaxed)
-    {
+    // fetch_sub 返回旧值 == 1 说明减到 0：目录项已读完 → 父目录级联完成。
+    // 旧值为 0 说明已被人（停止时的强制完成）减过 → 不再动它，防回绕
+    let prev = p.remaining.fetch_sub(1, Ordering::Relaxed);
+    if prev == 1 && p.iter_done.load(Ordering::Relaxed) {
         let pt = *p.size.lock().ok()?;
         return Some((p.clone(), pt));
     }
@@ -364,9 +393,9 @@ fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, already_emitte
     let mut first = already_emitted; // true：done 事件已由别处发过，只做聚合
     loop {
         if !first {
-            emit(
-                &ctx.app,
-                &NodeEvent {
+            push_event(
+                ctx,
+                NodeEvent {
                     path: cur.path.clone(),
                     parent: cur.parent_path.clone(),
                     name: cur.name.clone(),
@@ -417,136 +446,157 @@ fn worker_loop(
                 }
             }
         };
-        // 已被优先扫描（或其他线程）完成 → 直接按记录值完成聚合，不重扫、不重复发事件
-        {
-            let known = ctx
-                .sizes
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&job.path.to_lowercase()).copied());
-            if let Some(sz) = known {
-                complete_dir(&ctx, &job, sz, true);
-                continue;
-            }
-        }
-        emit(
-            &ctx.app,
-            &NodeEvent {
-                path: job.path.clone(),
-                parent: job.parent_path.clone(),
-                name: job.name.clone(),
-                size: 0,
-                done: false,
-                file: false,
-            },
-        );
-        let mut pending: u64 = 0;
-        let mut n_items: u64 = 0;
-        let mut big_file_count: u64 = 0;
-        let mut last_flush = Instant::now();
-        if let Ok(rd) = fs::read_dir(&job.path) {
-            for entry in rd.flatten() {
-                if ctx.stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                n_items += 1;
-                let got = (|| -> Option<u64> {
-                    let sm = fs::symlink_metadata(entry.path()).ok()?;
-                    if is_reparse(&sm) {
-                        return Some(0);
-                    }
-                    if sm.is_dir() {
-                        let child_name = entry.file_name().to_string_lossy().to_string();
-                        if is_deny(&child_name) {
-                            return Some(0);
-                        }
-                        if job.depth == 0 {
-                            return Some(0);
-                        }
-                        let child_path = entry.path().to_string_lossy().to_string();
-                        // 已由另一方完成的子树：体积直接并入，不入队
-                        {
-                            let m = ctx.sizes.lock();
-                            if let Ok(m) = &m {
-                                if let Some(sz) = m.get(&child_path.to_lowercase()) {
-                                    return Some(*sz);
-                                }
-                            }
-                        }
-                        let child = Arc::new(DState {
-                            path: child_path,
-                            parent_path: job.path.clone(),
-                            name: child_name,
-                            depth: job.depth - 1,
-                            remaining: AtomicUsize::new(0),
-                            size: Mutex::new(0),
-                            iter_done: AtomicBool::new(false),
-                            parent: Some(job.clone()),
-                        });
-                        job.remaining.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(mut g) = jobs.lock() {
-                            g.push_back(child);
-                        }
-                        cv.notify_one();
-                        return Some(0); // 子目录体积经完成级联上缴
-                    }
-                    let len = sm.len();
-                    if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
-                        big_file_count += 1;
-                        emit(
-                            &ctx.app,
-                            &NodeEvent {
-                                path: entry.path().to_string_lossy().to_string(),
-                                parent: job.path.clone(),
-                                name: entry.file_name().to_string_lossy().to_string(),
-                                size: len,
-                                done: true,
-                                file: true,
-                            },
-                        );
-                    }
-                    Some(len)
-                })();
-                if let Some(v) = got {
-                    pending += v;
-                }
-                if pending >= 32 * 1024 * 1024
-                    || n_items % 400 == 0
-                    || last_flush.elapsed() >= Duration::from_millis(250)
-                {
-                    {
-                        let mut s = job.size.lock().unwrap();
-                        *s += pending;
-                    }
-                    pending = 0;
-                    emit(
-                        &ctx.app,
-                        &NodeEvent {
-                            path: job.path.clone(),
-                            parent: job.parent_path.clone(),
-                            name: job.name.clone(),
-                            size: *job.size.lock().unwrap(),
-                            done: false,
-                            file: false,
-                        },
-                    );
-                    last_flush = Instant::now();
-                }
-            }
-        }
-        {
-            let mut s = job.size.lock().unwrap();
-            *s += pending;
-        }
-        job.iter_done.store(true, Ordering::Relaxed);
-        // 停止时强制完成（部分体积），让前端各目录状态收敛、不再永久转圈
-        if ctx.stop.load(Ordering::Relaxed) || job.remaining.load(Ordering::Relaxed) == 0 {
-            let total = *job.size.lock().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_job(&ctx, &jobs, &cv, &job);
+        }));
+        // worker 意外崩溃时也要让该目录收敛完成（按已累计体积），
+        // 否则父目录 remaining 永远减不到 0，整棵树卡在"扫描中"
+        if !job.iter_done.load(Ordering::Relaxed) {
+            job.iter_done.store(true, Ordering::Relaxed);
+            let total = *job.size.lock().unwrap_or_else(|e| e.into_inner());
             complete_dir(&ctx, &job, total, false);
         }
     }
     alive.fetch_sub(1, Ordering::Relaxed);
     ctx.cv.notify_all();
+}
+
+fn process_job(
+    ctx: &EngineCtx,
+    jobs: &Mutex<VecDeque<Arc<DState>>>,
+    cv: &Condvar,
+    job: &Arc<DState>,
+) {
+    // 已被优先扫描（或其他线程）完成 → 直接按记录值完成聚合，不重扫、不重复发事件
+    {
+        let known = ctx
+            .sizes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&job.path.to_lowercase()).copied());
+        if let Some(sz) = known {
+            complete_dir(ctx, job, sz, true);
+            return;
+        }
+    }
+    push_event(
+        ctx,
+        NodeEvent {
+            path: job.path.clone(),
+            parent: job.parent_path.clone(),
+            name: job.name.clone(),
+            size: 0,
+            done: false,
+            file: false,
+        },
+    );
+    let mut pending: u64 = 0;
+    let mut n_items: u64 = 0;
+    let mut big_file_count: u64 = 0;
+    let mut last_flush = Instant::now();
+    if let Ok(rd) = fs::read_dir(&job.path) {
+        for entry in rd.flatten() {
+            if ctx.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            n_items += 1;
+            let got = (|| -> Option<u64> {
+                let sm = fs::symlink_metadata(entry.path()).ok()?;
+                if is_reparse(&sm) {
+                    return Some(0);
+                }
+                if sm.is_dir() {
+                    let child_name = entry.file_name().to_string_lossy().to_string();
+                    if is_deny(&child_name) {
+                        return Some(0);
+                    }
+                    if job.depth == 0 {
+                        return Some(0);
+                    }
+                    let child_path = entry.path().to_string_lossy().to_string();
+                    // 已由另一方完成的子树：体积直接并入，不入队
+                    {
+                        let m = ctx.sizes.lock();
+                        if let Ok(m) = &m {
+                            if let Some(sz) = m.get(&child_path.to_lowercase()) {
+                                return Some(*sz);
+                            }
+                        }
+                    }
+                    let child = Arc::new(DState {
+                        path: child_path,
+                        parent_path: job.path.clone(),
+                        name: child_name,
+                        depth: job.depth - 1,
+                        remaining: AtomicUsize::new(0),
+                        size: Mutex::new(0),
+                        iter_done: AtomicBool::new(false),
+                        parent: Some(job.clone()),
+                    });
+                    job.remaining.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut g) = jobs.lock() {
+                        g.push_back(child);
+                    }
+                    cv.notify_one();
+                    return Some(0); // 子目录体积经完成级联上缴
+                }
+                let len = sm.len();
+                if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
+                    big_file_count += 1;
+                    push_event(
+                        ctx,
+                        NodeEvent {
+                            path: entry.path().to_string_lossy().to_string(),
+                            parent: job.path.clone(),
+                            name: entry.file_name().to_string_lossy().to_string(),
+                            size: len,
+                            done: true,
+                            file: true,
+                        },
+                    );
+                }
+                Some(len)
+            })();
+            if let Some(v) = got {
+                pending += v;
+            }
+            // flush 节流：体积驱动（16MB）/ 条目驱动（2000 项）/ 定时（250ms 且确有进展）。
+            // 并行时几千个目录同时在线，无进展的定时 flush 会造成事件洪流
+            let due = pending >= 16 * 1024 * 1024
+                || n_items % 2000 == 0
+                || (last_flush.elapsed() >= Duration::from_millis(250) && pending > 0);
+            if due {
+                {
+                    let mut s = job.size.lock().unwrap_or_else(|e| e.into_inner());
+                    *s += pending;
+                }
+                pending = 0;
+                push_event(
+                    ctx,
+                    NodeEvent {
+                        path: job.path.clone(),
+                        parent: job.parent_path.clone(),
+                        name: job.name.clone(),
+                        size: *job.size.lock().unwrap_or_else(|e| e.into_inner()),
+                        done: false,
+                        file: false,
+                    },
+                );
+                last_flush = Instant::now();
+                flush_out(ctx); // 批量缓冲随节拍刷出，避免低事件量时期批积压延迟
+            }
+        }
+    }
+    {
+        let mut s = job.size.lock().unwrap_or_else(|e| e.into_inner());
+        *s += pending;
+    }
+    job.iter_done.store(true, Ordering::Relaxed);
+    // 停止时强制完成（部分体积），让前端各目录状态收敛、不再永久转圈
+    if ctx.stop.load(Ordering::Relaxed) || job.remaining.load(Ordering::Relaxed) == 0 {
+        let total = *job.size.lock().unwrap_or_else(|e| e.into_inner());
+        complete_dir(ctx, job, total, false);
+    }
 }
 
 /// 用户在扫描进行中点击了某个还没扫到的目录：立刻起一个线程优先扫这个子树。

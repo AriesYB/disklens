@@ -145,6 +145,11 @@ function autoExpandView(){
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
 function TauriFeed(){
   window.__TAURI__.event.listen('scan-update', function(ev){ applyEvent(ev.payload); });
+  // 并行引擎的批量事件：一批最多 256 条，一次 IPC 应用整批
+  window.__TAURI__.event.listen('scan-batch', function(ev){
+    var arr = ev.payload || [];
+    for(var i=0;i<arr.length;i++) applyEvent(arr[i]);
+  });
   window.__TAURI__.event.listen('scan-finished', function(ev){
     setStatus(ev.payload || '完成', 'done');
     setScanning(false);
