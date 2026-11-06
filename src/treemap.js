@@ -219,12 +219,15 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     if(expanded[pth]&&totKids>0){
       layoutInto(o.n,o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,seen);
     } else if(expanded[pth]&&!o.n.f&&!o.n.done){
-      // 展开了一个还没扫到/尚无体积的目录：显示"统计中"占位条（优先扫描已在调度）
+      // 展开了一个还没扫到/尚无体积的目录：整个内部显示"统计中"占位（优先扫描已在调度）
       var ck=getCell(pth+'|:counting');
       paintCell(ck,{n:{n:'',s:0,raw:0,done:false,f:0}},
-        o.x+2,o.y+16,Math.max(0,o.w-4),Math.min(22,Math.max(0,o.h-16)),pth,ck,seen,depth);
-      ck.style.backgroundColor='#2b3a4d';
-      ck.querySelector('.lbl').textContent='⟳ 统计中…（已优先调度扫描）';
+        o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,ck,seen,depth);
+      ck.style.backgroundColor='#223247';
+      var cl=ck.querySelector('.lbl');
+      cl.textContent='⟳ 统计中…（已优先调度，扫到即显示）';
+      cl.style.fontSize=(o.w>160&&o.h>56)?'14px':'11px';
+      cl.style.paddingTop=(o.h>56)?'18px':'2px';
     }
   }
   if(agg&&stripH>0){
