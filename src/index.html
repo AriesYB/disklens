@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.8" />
+    <link rel="stylesheet" href="/styles.css?v=0.11" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -41,6 +41,16 @@
       <span id="foot-hint"></span>
     </footer>
 
+    <div id="splash">
+      <div class="sp-inner">
+        <div class="sp-logo"><svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.6 15.6 21 21"/></svg></div>
+        <div class="sp-name">DiskLens <i>盘析</i></div>
+        <div class="sp-tag">看清每一寸磁盘</div>
+        <div class="sp-bar"><div class="sp-fill" id="sp-fill"></div></div>
+        <div class="sp-hint" id="sp-hint">正在启动…</div>
+      </div>
+    </div>
+
     <div id="tip"></div>
     <div id="ctx">
       <div id="ctxpath"></div>
@@ -78,9 +88,9 @@
       </div>
     </div>
 
-    <script src="/treemap.js?v=0.10"></script>
-    <script src="/listview.js?v=0.8"></script>
-    <script src="/migrate.js?v=0.8"></script>
-    <script src="/main.js?v=0.10"></script>
+    <script src="/treemap.js?v=0.13"></script>
+    <script src="/listview.js?v=0.11"></script>
+    <script src="/migrate.js?v=0.11"></script>
+    <script src="/main.js?v=0.11"></script>
   </body>
 </html>

@@ -153,9 +153,17 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   if(!items.length||tot<=0||w0<10||h0<10) return;
   var MINA=180;
   var k0=(w0*h0)/tot;
+  // 统计中（未 done）的目录永不折叠进"剩余"条，并给一块最小可见面积——
+  // 扫描进行中它们带着转圈动画占位，用户能直观看到"哪些正在统计"
+  var countingN=0;
+  for(var cq=0;cq<items.length;cq++){ if(!items[cq].done) countingN++; }
+  var visFrac=countingN>0?Math.min(0.03,0.15/countingN):0;
+  // 最小可见面积对应的字节等效：tot*visFrac（k0 是 px²/byte，量级 1e-6，不能用 max(1,k0) 缩放）
+  var minVisBytes=visFrac>0?tot*visFrac:0;
   var main=[],rest=0,restN=0;
   for(var q2=0;q2<items.length;q2++){
     var it=items[q2];
+    if(!it.done){ main.push(it); continue; }
     if(it.s*k0>=MINA){ main.push(it); }
     else { rest+=it.s; restN++; }
   }
@@ -168,28 +176,30 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     }
     return;
   }
+  function lsOf(it){ return (!it.done && it.s<minVisBytes) ? minVisBytes : it.s; }
   main=stableOrder(main,keyBase);
   var out=[];
   for(var pass=0;pass<4;pass++){
-    var goodSum=0; for(var g=0;g<main.length;g++) goodSum+=main[g].s;
+    var goodSum=0; for(var g=0;g<main.length;g++) goodSum+=lsOf(main[g]);
     if(goodSum<=0){ main=[]; break; }
     var stripH=agg?Math.max(18,Math.min(Math.round(h0*aggS/(goodSum+aggS)),Math.round(h0*0.4))):0;
     var availH=h0-stripH;
     if(availH<10){ break; }
     var k=(w0*availH)/goodSum;
-    var px=main.map(function(it,i2){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,idx:i2}; });
+    var px=main.map(function(it,i2){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,idx:i2}; });
     out=[]; squarify(px,x0,y0,w0,availH,out);
     var bad=false, keep={};
     for(var b=0;b<out.length;b++){
       var r=out[b];
       var mx=Math.max(r.w,r.h), mn=Math.min(r.w,r.h);
-      if(mn<5||mx/mn>7){ bad=true; agg=true; aggS+=r.n.raw; aggN++; }
+      // 统计中的块豁免形状折叠：可见性优先，完成后会被真实尺寸替换
+      if(r.n.done && (mn<5||mx/mn>7)){ bad=true; agg=true; aggS+=r.n.raw; aggN++; }
       else { keep[r.n.idx]=1; }
     }
     if(!bad) break;
     main=main.filter(function(it,i3){ return keep[i3]; });
   }
-  var goodSum=0; for(var g2=0;g2<main.length;g2++) goodSum+=main[g2].s;
+  var goodSum=0; for(var g2=0;g2<main.length;g2++) goodSum+=lsOf(main[g2]);
   if(goodSum<=0){
     if(agg){
       var d1=getCell(keyBase+'|:agg');
@@ -207,7 +217,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     return;
   }
   var k=(w0*availH)/goodSum;
-  var px=main.map(function(it){ return {n:it.n,s:it.s*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c}; });
+  var px=main.map(function(it){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c}; });
   out=[]; squarify(px,x0,y0,w0,availH,out);
   var depth=stack.length;
   var sep=(keyBase.charAt(keyBase.length-1)==='\\')?'':'\\';

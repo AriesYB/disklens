@@ -493,8 +493,7 @@ fn process_job(
     let mut pending: u64 = 0;
     let mut n_items: u64 = 0;
     let mut big_file_count: u64 = 0;
-    let mut last_flush = Instant::now();
-    if let Ok(rd) = fs::read_dir(&job.path) {
+    let mut last_flush = Instant::now();    if let Ok(rd) = fs::read_dir(&job.path) {
         for entry in rd.flatten() {
             if ctx.stop.load(Ordering::Relaxed) {
                 break;
@@ -524,9 +523,9 @@ fn process_job(
                         }
                     }
                     let child = Arc::new(DState {
-                        path: child_path,
+                        path: child_path.clone(),
                         parent_path: job.path.clone(),
-                        name: child_name,
+                        name: child_name.clone(),
                         depth: job.depth - 1,
                         remaining: AtomicUsize::new(0),
                         size: Mutex::new(0),
@@ -538,6 +537,19 @@ fn process_job(
                         g.push_back(child);
                     }
                     cv.notify_one();
+                    // 入队即发占位事件：父目录一迭代到子目录名，前端立刻出现
+                    // "统计中"块（配合前端最小可见面积，扫描中目录全程可见）
+                    push_event(
+                        ctx,
+                        NodeEvent {
+                            path: child_path,
+                            parent: job.path.clone(),
+                            name: child_name,
+                            size: 0,
+                            done: false,
+                            file: false,
+                        },
+                    );
                     return Some(0); // 子目录体积经完成级联上缴
                 }
                 let len = sm.len();

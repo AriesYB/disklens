@@ -151,11 +151,19 @@ function drillExpand(startPth, maxDepth){
   }
 }
 
-/* 扫描完成后自动展开当前视图，并沿单子链钻取，让用户立刻看到内部构成 */
+/* 扫描完成后只自动钻取最大的那条目录链：既有"看到内部展开"的效果，
+   又不把所有顶层目录都展开——其余目录保持收起，单击一次即展开 */
 function autoExpandView(){
   var node = store.get(curPath.toLowerCase());
   if(!node) return;
-  drillExpand(curPath, 6);
+  var best = null;
+  (node.c||[]).forEach(function(ch){
+    if(!ch.f && ch.s>0 && (!best || ch.s>best.s)) best = ch;
+  });
+  if(best){
+    expanded[best.p] = 1;
+    drillExpand(best.p, 5);
+  }
   markDirty();
 }
 
@@ -392,6 +400,22 @@ MockFeed.prototype.scanPriority = function(p){
   }, 600));
 };
 
+/* 启动屏淡出 + 原生窗口显示（窗口配置为启动时隐藏，页面就绪后才出现，避免白屏） */
+function hideSplash(){
+  var sp = document.getElementById('splash');
+  if(sp && !sp.classList.contains('hide')){
+    var h = document.getElementById('sp-hint');
+    if(h) h.textContent = '就绪';
+    sp.classList.add('hide');
+    setTimeout(function(){ if(sp.parentNode) sp.parentNode.removeChild(sp); }, 500);
+  }
+  try{
+    if(IN_TAURI && window.__TAURI__.window && window.__TAURI__.window.getCurrentWindow){
+      window.__TAURI__.window.getCurrentWindow().show();
+    }
+  }catch(e){}
+}
+
 /* ===== 启动 ===== */
 window.addEventListener('DOMContentLoaded', function(){
   window.map = document.getElementById('map');
@@ -426,4 +450,7 @@ window.addEventListener('DOMContentLoaded', function(){
     feed.start(window.ROOT);
   });
   document.getElementById('stop-btn').addEventListener('click', function(){ feed.stop(); });
+
+  // 页面与首帧渲染就绪：淡出启动屏、显示原生窗口
+  setTimeout(hideSplash, 350);
 });
