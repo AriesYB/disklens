@@ -3,10 +3,11 @@
 // 32MB / 400 项 / 250ms 任一触发即向前端推送部分大小；目录完成推 done 事件）。
 // 跳过 reparse point（junction/symlink，避免环与重复计数）与 deny 目录。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -17,6 +18,12 @@ use std::os::windows::fs::MetadataExt;
 pub struct ScanState {
     stop: AtomicBool,
     running: Mutex<bool>,
+    /// 未终结的扫描线程数（主 DFS 计 1，每个用户点击的优先扫描各计 1）；
+    /// 减到 0 的那个线程负责发 scan-finished
+    active: Mutex<usize>,
+    /// 已完成子树的字节数表：lower(path) -> 子树总大小。
+    /// 主 DFS 到达某目录时若表里已有（被优先扫描先行完成）则直接采用，不再重扫
+    sizes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -62,6 +69,8 @@ fn emit(app: &AppHandle, ev: &NodeEvent) {
 
 // 单个目录的 DFS：返回子树总大小。开始时推 size=0 占位事件，期间按阈值推部分大小，
 // 完成时推 done 事件。前端按 parent 链组装树、按 done 驱动折叠/特效。
+// sizes：已完成子树的大小表——若本目录已被优先扫描先行扫完，直接采用记录值、不再重扫
+// （跳过时不发任何事件，返回值供父目录聚合，总量保持一致）。
 fn scan_dir(
     app: &AppHandle,
     dir: &Path,
@@ -69,8 +78,18 @@ fn scan_dir(
     name: String,
     depth: u32,
     stop: &AtomicBool,
+    sizes: &Mutex<HashMap<String, u64>>,
 ) -> u64 {
     let path_str = dir.to_string_lossy().to_string();
+    let lower = path_str.to_lowercase();
+    {
+        let m = sizes.lock();
+        if let Ok(m) = m {
+            if let Some(sz) = m.get(&lower) {
+                return *sz;
+            }
+        }
+    }
     emit(
         app,
         &NodeEvent {
@@ -116,6 +135,7 @@ fn scan_dir(
                         child_name,
                         depth - 1,
                         stop,
+                        sizes,
                     ))
                 } else {
                     let len = sm.len();
@@ -173,6 +193,9 @@ fn scan_dir(
             file: false,
         },
     );
+    if let Ok(mut m) = sizes.lock() {
+        m.insert(lower, total);
+    }
     total
 }
 
@@ -190,6 +213,12 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
         *running = true;
     }
     state.stop.store(false, Ordering::Relaxed);
+    if let Ok(mut m) = state.sizes.lock() {
+        m.clear();
+    }
+    if let Ok(mut a) = state.active.lock() {
+        *a = 1; // 主 DFS 自己占 1 个名额，优先扫描线程各再 +1
+    }
 
     let app2 = app.clone();
     std::thread::spawn(move || {
@@ -202,20 +231,97 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let t0 = Instant::now();
-        scan_dir(
-            &app2,
-            &root_path,
-            parent,
-            root_name,
-            48,
-            &app2.state::<ScanState>().stop,
-        );
-        let _ = app2.emit(
-            "scan-finished",
-            format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32()),
-        );
-        if let Ok(mut r) = app2.state::<ScanState>().running.lock() {
-            *r = false;
+        {
+            let st = app2.state::<ScanState>();
+            scan_dir(
+                &app2,
+                &root_path,
+                parent,
+                root_name,
+                48,
+                &st.stop,
+                &st.sizes,
+            );
+        }
+        // 最后一个结束的线程（主 DFS 或任一优先扫描）负责宣布完成
+        let mut announce = String::new();
+        {
+            let st = app2.state::<ScanState>();
+            if let Ok(mut a) = st.active.lock() {
+                if *a > 0 {
+                    *a -= 1;
+                }
+                if *a == 0 {
+                    announce = format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32());
+                }
+            }
+        }
+        if !announce.is_empty() {
+            let _ = app2.emit("scan-finished", announce);
+            if let Ok(mut r) = app2.state::<ScanState>().running.lock() {
+                *r = false;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 用户在扫描进行中点击了某个还没扫到的目录：立刻起一个线程优先扫这个子树。
+/// 主 DFS 之后到达该目录时会从共享 sizes 表取结果直接跳过，不重复耗 IO。
+#[tauri::command]
+fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> Result<(), String> {
+    let running = match state.running.lock() {
+        Ok(g) => *g,
+        Err(_) => false,
+    };
+    if !running {
+        return Err("当前没有进行中的扫描".into());
+    }
+    if state.stop.load(Ordering::Relaxed) {
+        return Err("扫描正在停止".into());
+    }
+    let p = norm_path(&path);
+    let bp = Path::new(&p);
+    if !bp.is_dir() {
+        return Err(format!("目录不存在：{}", p));
+    }
+    {
+        let m = state.sizes.lock().map_err(|e| e.to_string())?;
+        if m.contains_key(&p.to_lowercase()) {
+            return Ok(()); // 已扫完，无需优先
+        }
+    }
+    let app2 = app.clone();
+    {
+        let st = app2.state::<ScanState>();
+        if let Ok(mut a) = st.active.lock() {
+            *a += 1;
+        }
+    }
+    let name = bp
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.clone());
+    let parent = bp
+        .parent()
+        .map(|x| x.to_string_lossy().to_string())
+        .unwrap_or_default();
+    std::thread::spawn(move || {
+        let st2 = app2.state::<ScanState>();
+        let bp2 = Path::new(&p);
+        scan_dir(&app2, bp2, parent, name, 48, &st2.stop, &st2.sizes);
+        let mut announce = false;
+        if let Ok(mut a) = st2.active.lock() {
+            if *a > 0 {
+                *a -= 1;
+            }
+            announce = *a == 0;
+        }
+        if announce {
+            let _ = app2.emit("scan-finished", "扫描完成".to_string());
+            if let Ok(mut r) = st2.running.lock() {
+                *r = false;
+            }
         }
     });
     Ok(())
@@ -866,6 +972,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_start,
             scan_stop,
+            scan_priority,
             scan_status,
             open_in_explorer,
             list_volumes,

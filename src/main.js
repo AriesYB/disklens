@@ -128,12 +128,27 @@ function setScanning(on){
   if(!on) document.body.classList.remove('scanning');
 }
 
+/* 扫描完成后自动展开当前视图的一级目录（有子项的），让用户立刻看到内部构成 */
+function autoExpandView(){
+  var node = store.get(curPath.toLowerCase());
+  if(!node) return;
+  var changed = false;
+  (node.c||[]).forEach(function(ch){
+    if(!ch.f && ch.s>0 && ch.c && ch.c.length && !expanded[ch.p]){
+      expanded[ch.p] = 1;
+      changed = true;
+    }
+  });
+  if(changed) markDirty();
+}
+
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
 function TauriFeed(){
   window.__TAURI__.event.listen('scan-update', function(ev){ applyEvent(ev.payload); });
   window.__TAURI__.event.listen('scan-finished', function(ev){
     setStatus(ev.payload || '完成', 'done');
     setScanning(false);
+    autoExpandView();
   });
   window.__TAURI__.event.listen('migrate-update', function(ev){
     if(window.__migHandler) window.__migHandler(ev.payload);
@@ -170,6 +185,9 @@ TauriFeed.prototype.migrateStart = function(src, destRoot){
 };
 TauriFeed.prototype.migrateStop = function(){
   window.__TAURI__.core.invoke('migrate_stop').catch(function(){});
+};
+TauriFeed.prototype.scanPriority = function(p){
+  window.__TAURI__.core.invoke('scan_priority', { path: p }).catch(function(){});
 };
 
 /* ===== Mock Feed：浏览器直接打开时的合成数据（UI 开发 / 演示用） ===== */
@@ -272,7 +290,7 @@ MockFeed.prototype.start = function(root, onDone){
     }
     var msg = '模拟扫描完成';
     if(self.onDone) self.onDone(msg);
-    else { setStatus(msg, 'done'); setScanning(false); }
+    else { setStatus(msg, 'done'); setScanning(false); autoExpandView(); }
   }, 13200+(ticks2+1)*620));
 };
 MockFeed.prototype.stop = function(){ this._clear(); setStatus('已停止','done'); setScanning(false); };
@@ -334,6 +352,23 @@ MockFeed.prototype.migrateStart = function(src, destRoot){
   self.timers.push(setTimeout(tick, 200));
 };
 MockFeed.prototype.migrateStop = function(){ this._migStopped = true; };
+/* Mock 优先扫描：600ms 后把该目录补成 done 并造几个子项，让"优先调度"在浏览器里可演示 */
+MockFeed.prototype.scanPriority = function(p){
+  var self = this;
+  this.timers.push(setTimeout(function(){
+    var n = store.get(p.toLowerCase());
+    if(!n || n.done || n.f) return;
+    var GB = 1073741824;
+    var base = Math.max(n.s, 3*GB);
+    var root = p.replace(/\\+$/,'');
+    var kids = [['alpha-data',0.42],['cache-store',0.27],['logs-archive',0.11]];
+    kids.forEach(function(k,i){
+      applyEvent({ path:root+'\\'+k[0], parent:root, name:k[0],
+                   size:Math.round(base*k[1]), done:true, file:false });
+    });
+    applyEvent({ path:p, name:n.n, size:Math.round(base*1.08), done:true, file:false });
+  }, 600));
+};
 
 /* ===== 启动 ===== */
 window.addEventListener('DOMContentLoaded', function(){

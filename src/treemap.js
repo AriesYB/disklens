@@ -104,10 +104,16 @@ function getCell(kk){
     d.addEventListener('mouseleave',function(){ document.getElementById('tip').style.display='none'; });
     d.addEventListener('click',function(ev){ ev.stopPropagation();
       var el=ev.currentTarget, n=el.__n||{};
-      if(n.f) return;
+      if(n.f||n.agg) return;
       var p=el.__path; if(!p) return;
       if(expanded[p]){ delete expanded[p]; }
-      else { expanded[p]=1; }
+      else {
+        expanded[p]=1;
+        // 展开时还没扫完 → 请后端优先扫这个子树（已扫完的目录后端会直接忽略）
+        var sn=store.get(p.toLowerCase());
+        if(typeof scanning!=='undefined'&&scanning&&sn&&!sn.done&&
+           feed&&typeof feed.scanPriority==='function'){ feed.scanPriority(p); }
+      }
       render();
     });
     d.addEventListener('dblclick',function(ev){ ev.stopPropagation();
@@ -208,8 +214,17 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     var pth=o.n.p||(keyBase+sep+o.n.n);
     var d=getCell(kk);
     paintCell(d,o,o.x,o.y,o.w,o.h,pth,kk,seen,depth+i);
-    if(expanded[pth]&&o.n.c&&o.n.c.length){
+    var totKids=0;
+    for(var q3=0;q3<(o.n.c||[]).length;q3++) totKids+=o.n.c[q3].s;
+    if(expanded[pth]&&totKids>0){
       layoutInto(o.n,o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,seen);
+    } else if(expanded[pth]&&!o.n.f&&!o.n.done){
+      // 展开了一个还没扫到/尚无体积的目录：显示"统计中"占位条（优先扫描已在调度）
+      var ck=getCell(pth+'|:counting');
+      paintCell(ck,{n:{n:'',s:0,raw:0,done:false,f:0}},
+        o.x+2,o.y+16,Math.max(0,o.w-4),Math.min(22,Math.max(0,o.h-16)),pth,ck,seen,depth);
+      ck.style.backgroundColor='#2b3a4d';
+      ck.querySelector('.lbl').textContent='⟳ 统计中…（已优先调度扫描）';
     }
   }
   if(agg&&stripH>0){
@@ -244,7 +259,12 @@ function goUp(){
 }
 function navigate(path,isChild){
   if(isChild!==false && curPath && store.get(curPath.toLowerCase())){ stack.push({name:store.get(curPath.toLowerCase()).n,path:curPath}); }
-  curPath=path; divs={}; map.innerHTML=''; expanded={}; render();
+  curPath=path; divs={}; map.innerHTML=''; expanded={};
+  // 进入还没扫完的目录 → 优先调度扫描
+  var n=store.get(path.toLowerCase());
+  if(typeof scanning!=='undefined'&&scanning&&n&&!n.done&&
+     feed&&typeof feed.scanPriority==='function'){ feed.scanPriority(path); }
+  render();
 }
 
 /* ===== 菜单 ===== */
