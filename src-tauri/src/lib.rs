@@ -8,7 +8,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 #[derive(Default)]
 pub struct ScanState {
@@ -225,7 +228,10 @@ fn scan_stop(state: State<'_, ScanState>) {
 
 #[tauri::command]
 fn scan_status(state: State<'_, ScanState>) -> bool {
-    matches!(state.running.lock(), Ok(true))
+    match state.running.lock() {
+        Ok(g) => *g,
+        Err(_) => false,
+    }
 }
 
 #[tauri::command]
@@ -944,6 +950,7 @@ mod tests {
     fn fmt_bytes_units() {
         assert_eq!(fmt_bytes(512), "512 B");
         assert_eq!(fmt_bytes(2048), "2 KB");
-        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024 / 10), "0.30 GB");
+        assert_eq!(fmt_bytes(2 * 1073741824), "2.00 GB");
+        assert_eq!(fmt_bytes(2 * 1048576), "2.0 MB");
     }
 }

@@ -12,7 +12,10 @@ edition = "2024"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "disklens_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面端只需 rlib（bin 直接调 run()）。cdylib 会让 GNU ld 导出数万符号
+# （"export ordinal too large"），到 M2/M4 做 Android/iOS 时再加回
+# ["staticlib", "cdylib", "rlib"]（MSVC 目标无此限制）。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

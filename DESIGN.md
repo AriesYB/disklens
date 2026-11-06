@@ -79,6 +79,18 @@ cargo check            # 后端类型检查（在 src-tauri/ 下）
 浏览器模式与 Tauri 模式共享同一套事件协议（`scan-update` / `scan-finished` / `migrate-update`），
 前端通过 `window.__TAURI__` 自动探测运行环境。
 
+### Windows 工具链说明（windows-gnu 目标）
+
+`stable-x86_64-pc-windows-gnu` 目标需要完整 GNU binutils（as/dlltool/windres），
+且 dlltool/as 必须**支持 x86_64**（老版 32 位 MinGW 不行，报 "no compiled in support for x86_64"）。
+推荐二选一：
+
+1. **MSVC 目标**（推荐）：`rustup default stable-x86_64-pc-windows-msvc` + VS BuildTools（含 Windows SDK）
+2. **GNU 目标**：确保 PATH 中有 64 位 binutils（如 [w64devkit](https://github.com/skeeto/w64devkit)）
+
+桌面端构建 `crate-type` 只保留 `["rlib"]`：cdylib 会让 GNU ld 因导出符号过多而失败
+（"export ordinal too large"）；做 Android/iOS 时再加回 staticlib/cdylib（MSVC 无此限制）。
+
 ## 8. 迁移功能评估（v0.3，junction 方式）
 
 ### 8.1 原理
