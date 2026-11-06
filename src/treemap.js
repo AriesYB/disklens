@@ -24,6 +24,7 @@ function openContextMenu(ev,fp,isFile){
   document.getElementById('mi-enter').style.display=isFile?'none':'';
   document.getElementById('mi-expand').style.display=isFile?'none':'';
   document.getElementById('mi-migrate').style.display=isFile?'none':'';
+  document.getElementById('mi-ai').style.display=isFile?'none':'';
   document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
   document.getElementById('mi-copy-t').textContent='复制完整路径';
   document.getElementById('ctxpath').textContent=fp;
@@ -310,7 +311,12 @@ document.addEventListener('keydown',function(e){
     if(Object.keys(expanded).length){ expanded={}; render(); } }
 });
 map.addEventListener('click',function(){ goUp(); });
-window.addEventListener('resize',function(){ render(); });
+// 拖拽/缩放窗口时 resize 事件风暴会连环触发全量重绘造成卡顿：合并为最多 180ms 一次
+var _rsT=null;
+window.addEventListener('resize',function(){
+  if(_rsT) return;
+  _rsT=setTimeout(function(){ _rsT=null; render(); },180);
+});
 function copyPath(p,fbEl){
   function restore(){ if(fbEl) fbEl.textContent='复制完整路径'; }
   function ok(){ if(fbEl){ fbEl.textContent='✓ 已复制'; setTimeout(restore,900); } }

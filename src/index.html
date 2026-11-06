@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.11" />
+    <link rel="stylesheet" href="/styles.css?v=0.12" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -60,6 +60,25 @@
       <div class="mi" id="mi-enter"><span class="ic">↯</span><span>进入此目录</span></div>
       <div class="mi" id="mi-expand"><span class="ic">⊞</span><span id="mi-expand-t">展开</span></div>
       <div class="mi" id="mi-migrate"><span class="ic">📦</span><span>迁移此目录（junction）…</span></div>
+      <div class="mi" id="mi-ai"><span class="ic">🤖</span><span>AI 辅助迁移 / 清理（c-relocator）…</span></div>
+    </div>
+
+    <div id="ai-mask" style="display:none">
+      <div id="ai">
+        <div id="ai-title">AI 辅助迁移 / 清理 <button id="ai-close" title="关闭">✕</button></div>
+        <div id="ai-src"></div>
+        <div id="ai-body"></div>
+        <div id="ai-prompt-wrap">
+          <div class="ai-lab">复制下面的指令，发给已安装 c-relocator skill 的 AI 助手（ZCode / Claude Code 等）：</div>
+          <div id="ai-prompt"></div>
+          <div id="ai-actions">
+            <button id="ai-copy" class="primary">📋 复制 AI 指令</button>
+            <button id="ai-github">GitHub 仓库</button>
+            <button id="ai-migrate">直接 junction 迁移…</button>
+          </div>
+          <div class="ai-install">还没装 skill？一条命令安装：<code>npx skills add AriesYB/c-relocator</code></div>
+        </div>
+      </div>
     </div>
 
     <div id="mig-mask" style="display:none">
@@ -88,9 +107,10 @@
       </div>
     </div>
 
-    <script src="/treemap.js?v=0.13"></script>
+    <script src="/treemap.js?v=0.14"></script>
     <script src="/listview.js?v=0.11"></script>
     <script src="/migrate.js?v=0.11"></script>
-    <script src="/main.js?v=0.11"></script>
+    <script src="/aiassist.js?v=0.12"></script>
+    <script src="/main.js?v=0.12"></script>
   </body>
 </html>

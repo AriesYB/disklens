@@ -1,6 +1,6 @@
 [package]
 name = "disklens"
-version = "0.4.1"
+version = "0.5.0"
 description = "DiskLens —— 看清每一寸磁盘：实时 treemap + 列表 + 大文件榜 + junction 迁移"
 authors = ["AriesYB"]
 edition = "2024"

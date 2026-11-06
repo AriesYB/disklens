@@ -25,6 +25,10 @@
 - **📦 一键迁移（junction 方式）** —— 右键任意目录迁移到其他盘：预检（空间/占用/系统目录）→
   复制 → 校验 → 切换，原位置创建目录联接，程序无感；同卷秒迁，跨卷断点续传，任何失败源目录原样保留。
   不能自动迁移的（虚拟内存、Docker、WSL、被占用文件等）直接告诉你要去哪个软件里改
+- **🤖 AI 辅助迁移/清理（c-relocator 联动）** —— 右键 → AI 辅助：自动识别目录属于哪个工具
+  （Gradle/Maven/cargo/pip/Go/JetBrains/Docker/WSL 等 20+ 规则），给出推荐动作（官方配置重定向 /
+  junction / 清理缓存），并生成一条可直接发给 AI 助手的现成指令。
+  skill 安装：`npx skills add AriesYB/c-relocator`（[GitHub](https://github.com/AriesYB/c-relocator)）
 - **交互细节打磨**
   - 排序迟滞：方块平滑生长，大小超越相邻 12% 才换位，不跳变
   - 两道防细条：极小项自动折叠为"剩余 N 项"聚合条，杜绝不可读的细条
