@@ -109,8 +109,10 @@ function getCell(kk){
       if(expanded[p]){ delete expanded[p]; }
       else {
         expanded[p]=1;
-        // 展开时还没扫完 → 请后端优先扫这个子树（已扫完的目录后端会直接忽略）
         var sn=store.get(p.toLowerCase());
+        // 单子链钻取：若内部只有一条大子目录链，继续展开下去，保证点击必有可见变化
+        if(typeof drillExpand==='function' && sn && sn.done){ drillExpand(p, 3); }
+        // 展开时还没扫完 → 请后端优先扫这个子树（已扫完的目录后端会直接忽略）
         if(typeof scanning!=='undefined'&&scanning&&sn&&!sn.done&&
            feed&&typeof feed.scanPriority==='function'){ feed.scanPriority(p); }
       }

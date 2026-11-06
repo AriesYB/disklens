@@ -128,18 +128,35 @@ function setScanning(on){
   if(!on) document.body.classList.remove('scanning');
 }
 
-/* 扫描完成后自动展开当前视图的一级目录（有子项的），让用户立刻看到内部构成 */
+/* 沿"单一大子目录"链钻取展开：把 start 的子目录展开后，若其下只有一条
+   有内容的子目录链（如 C:\Users → 唯一用户目录），继续向下展开，
+   直到出现多样内容为止——保证展开在视觉上可见，让用户感知到内部在展开 */
+function drillExpand(startPth, maxDepth){
+  var pth = startPth;
+  var node = store.get(pth.toLowerCase());
+  if(!node) return;
+  (node.c||[]).forEach(function(ch){ if(!ch.f && ch.s>0) expanded[ch.p]=1; });
+  for(var d=0; d<maxDepth; d++){
+    var kids = (node.c||[]).filter(function(k){ return !k.f && k.s>0; });
+    var tot = 0; kids.forEach(function(k){ tot += k.s; });
+    var dominant = null;
+    if(kids.length===1){ dominant = kids[0]; }
+    else {
+      for(var i=0;i<kids.length;i++){ if(kids[i].s >= tot*0.85) { dominant = kids[i]; break; } }
+    }
+    if(!dominant) break;
+    node = store.get(dominant.p.toLowerCase());
+    if(!node) break;
+    (node.c||[]).forEach(function(ch){ if(!ch.f && ch.s>0) expanded[ch.p]=1; });
+  }
+}
+
+/* 扫描完成后自动展开当前视图，并沿单子链钻取，让用户立刻看到内部构成 */
 function autoExpandView(){
   var node = store.get(curPath.toLowerCase());
   if(!node) return;
-  var changed = false;
-  (node.c||[]).forEach(function(ch){
-    if(!ch.f && ch.s>0 && ch.c && ch.c.length && !expanded[ch.p]){
-      expanded[ch.p] = 1;
-      changed = true;
-    }
-  });
-  if(changed) markDirty();
+  drillExpand(curPath, 6);
+  markDirty();
 }
 
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
