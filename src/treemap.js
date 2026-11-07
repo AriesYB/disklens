@@ -310,7 +310,16 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){ hideCtx();
     if(Object.keys(expanded).length){ expanded={}; render(); } }
 });
-map.addEventListener('click',function(){ goUp(); });
+// 空白处单击返回上一级。必须核对 mousedown 的起点：扫描中方块随数据不停位移/缩放，
+// 按在方块上、抬起时方块已滑走 → click 落在 map 上，若不加甄别就会误触发 goUp，
+// 表现为"扫描时要单击两次才展开"（第一次被吞掉）。
+// 注意：本文件顶层执行时 main.js 还没给全局 map 赋值（var map 仍是 undefined，
+// 顶层 map.addEventListener 曾在此处抛 TypeError，导致本行之后所有注册全部失效），
+// 所以这里必须用 getElementById 直接取节点。
+var _downOnMap = false;
+var mapEl = document.getElementById('map');
+mapEl.addEventListener('mousedown',function(ev){ _downOnMap = (ev.target === mapEl); });
+mapEl.addEventListener('click',function(){ if(_downOnMap) goUp(); });
 // 拖拽/缩放窗口时 resize 事件风暴会连环触发全量重绘造成卡顿：合并为最多 180ms 一次
 var _rsT=null;
 window.addEventListener('resize',function(){

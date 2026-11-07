@@ -29,6 +29,8 @@
   （Gradle/Maven/cargo/pip/Go/JetBrains/Docker/WSL 等 20+ 规则），给出推荐动作（官方配置重定向 /
   junction / 清理缓存），并生成一条可直接发给 AI 助手的现成指令。
   skill 安装：`npx skills add AriesYB/c-relocator`（[GitHub](https://github.com/AriesYB/c-relocator)）
+- **🔄 应用内自动更新** —— 启动静默检查 + 顶栏手动「检查更新」，发现新版本弹窗后应用内
+  下载安装并自动重启（双源：服务器清单优先，GitHub Releases 回退，minisign 签名校验）
 - **交互细节打磨**
   - 排序迟滞：方块平滑生长，大小超越相邻 12% 才换位，不跳变
   - 两道防细条：极小项自动折叠为"剩余 N 项"聚合条，杜绝不可读的细条
@@ -74,6 +76,33 @@ npm run build        # = tauri build
 
 - 免安装单文件：`src-tauri/target/release/disklens.exe`
 - NSIS 安装包：`src-tauri/target/release/bundle/nsis/*.exe`
+
+## 🔄 自动更新（v1.0.0 起）
+
+客户端内置更新检查（[tauri-plugin-updater](https://v2.tauri.app/plugin/updater/)）：启动后静默检查一次（失败不打扰），
+顶栏「⟳ 检查更新」可手动触发；发现新版本弹窗展示更新说明 → 应用内下载（进度条）→ 被动模式安装 → 自动重启。
+更新包经 minisign 签名，客户端内置公钥校验，签名不匹配的包无法安装。
+
+更新源按顺序尝试（前一个非 2XX 才落到下一个）：
+
+1. `https://ikanp.top/downloads/disklens/latest.json` —— 服务器清单
+2. `https://github.com/AriesYB/disklens/releases/latest/download/latest.json` —— GitHub 最新 Release 附件
+
+### 发布新版本
+
+```bash
+# 1. 升版本号：package.json / package-lock.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json
+# 2. 签名构建（TAURI_SIGNING_PRIVATE_KEY 传密钥“内容”而非路径；私钥在 .tauri/ 下不入库，
+#    丢失将无法再向已装用户推更新）
+TAURI_SIGNING_PRIVATE_KEY=$(cat .tauri/disklens-updater.key) npm run build
+# 3. 生成更新清单
+node scripts/gen-updater-manifest.mjs "一句话更新说明"
+# 4. 发布：GitHub Release 上传 setup.exe 与 dist/latest.json；
+#    服务器把 dist/latest.json 上传到 /usr/share/nginx/ikanp-home/downloads/disklens/latest.json
+```
+
+> 服务器 nginx 注意：latest.json 是固定文件名、内容随版本更新，缓存策略须为 no-cache
+> （参考 `ikanp-home.conf` 对 HTML 的 `expires -1` 约定），否则老客户端可能长时间读到旧清单。
 
 ## 🧪 测试
 

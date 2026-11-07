@@ -151,18 +151,38 @@ function drillExpand(startPth, maxDepth){
   }
 }
 
-/* 扫描完成后只自动钻取最大的那条目录链：既有"看到内部展开"的效果，
-   又不把所有顶层目录都展开——其余目录保持收起，单击一次即展开 */
+/* 扫描完成后自动展开：按估算渲染面积逐层下钻——块还大到足以看清内部
+   （≥EXPAND_MIN_AREA，且确有子目录）就继续展开；小到阈值以下或到达层深
+   上限就停。大目录的内部构成一眼可见，小块保持收起、单击即展开 */
+var EXPAND_MIN_AREA = 6400;    // ≈80×80 px，低于此面积内部已不可读，不再展开
+var EXPAND_MAX_DEPTH = 3;      // 自动下钻层数上限（再深留给用户单击）
 function autoExpandView(){
   var node = store.get(curPath.toLowerCase());
   if(!node) return;
-  var best = null;
-  (node.c||[]).forEach(function(ch){
-    if(!ch.f && ch.s>0 && (!best || ch.s>best.s)) best = ch;
-  });
-  if(best){
-    expanded[best.p] = 1;
-    drillExpand(best.p, 5);
+  var full = (map.clientWidth||800) * (map.clientHeight||500);
+  function walk(n, area, depth){
+    expanded[n.p] = 1;
+    if(depth >= EXPAND_MAX_DEPTH) return;
+    var kids = n.c || [];
+    var tot = 0; for(var i=0;i<kids.length;i++) tot += kids[i].s;
+    if(tot <= 0) return;
+    for(var j=0;j<kids.length;j++){
+      var k = kids[j];
+      if(k.f || !k.c || !k.c.length) continue;   // 文件/尚无已知子项的不展开
+      // 每层标题条+内边距约吃掉两成可用面积，估算时先打八折
+      var ka = area * (k.s / tot) * 0.8;
+      if(ka >= EXPAND_MIN_AREA) walk(k, ka, depth+1);
+    }
+  }
+  var kids = node.c || [];
+  var tot = 0; for(var q=0;q<kids.length;q++) tot += kids[q].s;
+  if(tot > 0){
+    for(var w=0;w<kids.length;w++){
+      var ch = kids[w];
+      if(ch.f || !ch.c || !ch.c.length) continue;
+      var ca = (ch.s / tot) * full;
+      if(ca >= EXPAND_MIN_AREA) walk(ch, ca, 0);
+    }
   }
   markDirty();
 }

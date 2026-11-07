@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.12" />
+    <link rel="stylesheet" href="/styles.css?v=0.15" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -81,6 +81,22 @@
       </div>
     </div>
 
+    <div id="upd-mask" style="display:none">
+      <div id="upd">
+        <div id="upd-title">发现新版本 <span id="upd-ver"></span> <button id="upd-close" title="关闭">✕</button></div>
+        <div id="upd-notes"></div>
+        <div id="upd-prog" style="display:none">
+          <div id="upd-stage"></div>
+          <div class="mig-track"><div id="upd-fill"></div></div>
+        </div>
+        <div id="upd-err" style="display:none"></div>
+        <div id="upd-actions">
+          <button id="upd-go" class="primary">立即更新</button>
+          <button id="upd-later">以后再说</button>
+        </div>
+      </div>
+    </div>
+
     <div id="mig-mask" style="display:none">
       <div id="mig">
         <div id="mig-title">迁移目录 <button id="mig-close" title="关闭">✕</button></div>
@@ -107,10 +123,11 @@
       </div>
     </div>
 
-    <script src="/treemap.js?v=0.14"></script>
+    <script src="/treemap.js?v=0.15"></script>
     <script src="/listview.js?v=0.11"></script>
     <script src="/migrate.js?v=0.11"></script>
     <script src="/aiassist.js?v=0.12"></script>
-    <script src="/main.js?v=0.12"></script>
+    <script src="/main.js?v=0.13"></script>
+    <script src="/update.js?v=0.13"></script>
   </body>
 </html>

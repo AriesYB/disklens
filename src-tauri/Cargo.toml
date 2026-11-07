@@ -1,6 +1,6 @@
 [package]
 name = "disklens"
-version = "0.5.0"
+version = "1.0.0"
 description = "DiskLens —— 看清每一寸磁盘：实时 treemap + 列表 + 大文件榜 + junction 迁移"
 authors = ["AriesYB"]
 edition = "2024"
@@ -29,6 +29,11 @@ serde_json = "1"
 # 枚举本地卷（盘符/文件系统/剩余空间）供迁移目标选择
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+# 应用内自动更新（检查/下载/安装签名更新包）+ 更新后重启；仅桌面端
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

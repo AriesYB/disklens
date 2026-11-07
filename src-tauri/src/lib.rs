@@ -1325,6 +1325,15 @@ pub fn run() {
             migrate_start,
             migrate_stop
         ])
+        .setup(|app| {
+            // 应用内自动更新（updater + 重启）：仅桌面端，移动端走应用商店
+            #[cfg(desktop)]
+            {
+                app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+                app.handle().plugin(tauri_plugin_process::init())?;
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
