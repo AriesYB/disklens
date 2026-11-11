@@ -7,6 +7,7 @@ var migSrc = '';          // 当前迁移源路径
 var migVolumes = [];
 var migChecking = false;
 var migRunning = false;
+var migDestDir = '';      // 用户具体选择的目标文件夹；空 = 用 mig-vol 选中的卷根
 var migGuidanceMap = [
   { re: /pagefile\.sys|swapfile\.sys/i, t: '虚拟内存文件', s: '这是系统页面文件，不能搬也不能删。请在「系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存 → 更改」里把它设置到其他盘。' },
   { re: /hiberfil\.sys/i, t: '休眠文件', s: '这是休眠/快速启动文件，请在管理员命令行执行 powercfg /h /size 50 缩小，或 powercfg /h off 关闭后自行删除。' },
@@ -68,7 +69,8 @@ function openMigrate(path) {
       html += '<option value="' + escAttr(v.mount) + '">' + esc(v.mount) +
         '  ' + esc(v.fs || '?') + '  剩余 ' + fmt(v.free_bytes) + '</option>';
     }
-    el('mig-vol').innerHTML = html;
+      el('mig-vol').innerHTML = html;
+    migDestDir = '';   // 重开对话框回到卷根选择
     // 默认选中一个与源不同且有空间的 NTFS 卷
     var pick = -1;
     for (var k = 0; k < migVolumes.length; k++) {
@@ -82,8 +84,24 @@ function openMigrate(path) {
 }
 
 function migSelectedRoot() {
-  var i = el('mig-vol').selectedIndex;
-  return i >= 0 && migVolumes[i] ? migVolumes[i].mount : '';
+  // 用户用「选择文件夹」指定了具体目录时优先；否则用卷下拉选中的卷根
+  return migDestDir || (function () {
+    var i = el('mig-vol').selectedIndex;
+    return i >= 0 && migVolumes[i] ? migVolumes[i].mount : '';
+  })();
+}
+
+/* 原生对话框选择目标文件夹（仅 Tauri；浏览器模式隐藏按钮）。
+   选完后目标父目录 = 所选文件夹，目标位置 = 所选文件夹\\源目录名 */
+function pickMigrateFolder() {
+  if (migChecking || migRunning) return;
+  var dlg = window.__TAURI__ && window.__TAURI__.dialog;
+  if (!dlg || !dlg.open) return;
+  dlg.open({ directory: true, multiple: false, title: '选择迁移目标文件夹' }).then(function (picked) {
+    if (!picked) return;   // 用户取消
+    migDestDir = picked.replace(/\\+$/, '');
+    runMigrateCheck();
+  }).catch(function () {});
 }
 
 function runMigrateCheck() {
@@ -203,8 +221,12 @@ function closeMigrate() {
     if (p) openMigrate(p);
   });
   el('mig-vol').addEventListener('change', function () {
-    if (!migChecking) runMigrateCheck();
+    if (migChecking) return;
+    migDestDir = '';   // 换卷 = 回到卷根；之前选的具体文件夹作废
+    runMigrateCheck();
   });
+  el('mig-pick').addEventListener('click', pickMigrateFolder);
+  if (!window.__TAURI__) el('mig-pick').style.display = 'none';
   el('mig-start').addEventListener('click', function () {
     if (migRunning || migChecking || el('mig-start').disabled) return;
     el('mig-start').style.display = 'none';

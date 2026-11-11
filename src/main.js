@@ -8,6 +8,9 @@ var viewMode = 'treemap';
 var fileIndex = new Map();   // lower(path) -> 文件节点（供大文件榜使用）
 var scanning = false;
 var scanT0 = 0;
+var watchActive = false;     // 扫描完成后的实时监视（fs-batch 增量应用）
+var watchChanges = 0;        // 本次监视会话累计收到的变更条数
+var BIG_FILE_MIN = 10 * 1024 * 1024;   // 与后端 MIN_BIG_FILE 一致：小于此值的文件扫描时不入树
 
 var VIEW_HINTS = {
   treemap: '单击展开/收起 · 双击进入 · 右键更多操作',
@@ -36,6 +39,7 @@ function applyEvent(ev){
   var n = ensureChain(ev.path);          // 自身 + 祖先链全部就位（事件乱序到达也健壮）
   if(ev.name) n.n = ev.name;             // 空名（盘根 growth 事件）不覆盖
   n.f = ev.file || n.f;
+  var oldS = n.s || 0;
   n.s = ev.size;
   n.done = ev.done;
   var idx = ev.path.lastIndexOf('\\');
@@ -44,8 +48,134 @@ function applyEvent(ev){
     var pn = store.get(parentPath.toLowerCase());
     if(pn && !pn.c.includes(n)) pn.c.push(n);   // 时序原因成孤儿的自动回挂
   }
+  // 监视模式下优先扫描把体积带回来：差值沿祖先传播（子目录 done 只补差值，
+  // 级联天然自洽）。扫描期间严禁传播——祖先体积由引擎统一结算
+  if(!scanning && watchActive) propDelta(ev.path, (n.s||0) - oldS);
   if(n.f) fileIndex.set(ev.path.toLowerCase(), n);   // 文件入索引，大文件榜用
   markDirty();
+}
+
+/* ===== 实时监视：扫描完成后 fs-batch 增量应用 ===== */
+// 父路径解析：'C:\Users'→'C:\'，'C:\a\b'→'C:\a'，'C:\'→''（盘根即顶）。
+// 注意 store 键不带尾反斜杠（盘根除外），切完不能再带
+function parentPathOf(path) {
+  var idx = path.lastIndexOf('\\');
+  if (idx <= 0) return '';
+  var p = path.slice(0, idx);
+  if (p.length <= 3) p += '\\';   // 'C:' → 'C:\'
+  return p === path ? '' : p;
+}
+// 体积差值沿祖先链传播（仅监视模式用；扫描时祖先体积由引擎统一结算，不能传播）
+function propDelta(path, delta) {
+  if (!delta) return;
+  var p = parentPathOf(path);
+  while (p) {
+    var pn = store.get(p.toLowerCase());
+    if (!pn) break;
+    pn.s = Math.max(0, pn.s + delta);
+    p = parentPathOf(p);
+  }
+}
+// 删除节点及其整个子树（store/fileIndex/expanded），返回被删子树总体积
+function removeSubtree(path) {
+  var lower = path.toLowerCase();
+  var n = store.get(lower);
+  if (!n) return 0;
+  var total = n.s || 0;
+  (function walk(x) {
+    var kids = x.c || [];
+    for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    store.delete(x.p.toLowerCase());
+    if (x.f) fileIndex.delete(x.p.toLowerCase());
+    delete expanded[x.p];
+  })(n);
+  store.delete(lower);
+  fileIndex.delete(lower);
+  delete expanded[path];
+  var pp = parentPathOf(path);
+  var pn = pp && store.get(pp.toLowerCase());
+  if (pn) {
+    var idx = pn.c.indexOf(n);
+    if (idx >= 0) pn.c.splice(idx, 1);
+  }
+  return total;
+}
+// 新目录出现：占位（统计中）并排队优先扫描，扫完 done 事件把真实体积带回来
+var priQueue = [], priQueued = {}, priInflight = [], PRI_MAX = 2;
+function queuePriority(path) {
+  var k = path.toLowerCase();
+  if (priQueued[k]) return;
+  priQueued[k] = 1;
+  priQueue.push(path);
+  pumpPriority();
+}
+function pumpPriority() {
+  while (priInflight.length < PRI_MAX && priQueue.length) {
+    var p = priQueue.shift();
+    priInflight.push(p);
+    feed.scanPriority(p);
+  }
+}
+// 渲染循环每帧调：在飞的优先扫描对应节点 done 即释放并发额度
+function checkPriorityDone() {
+  for (var i = 0; i < priInflight.length; i++) {
+    var n = store.get(priInflight[i].toLowerCase());
+    if (n && n.done) {
+      delete priQueued[priInflight[i].toLowerCase()];
+      priInflight.splice(i, 1);
+      i--;
+      pumpPriority();
+    }
+  }
+}
+function applyFsBatch(batch) {
+  if (!watchActive || !Array.isArray(batch) || !batch.length) return;
+  var changed = 0;
+  for (var i = 0; i < batch.length; i++) {
+    var ev = batch[i];
+    if (!ev || !ev.path) continue;
+    var lower = ev.path.toLowerCase();
+    if (ev.kind === 'remove') {
+      var total = removeSubtree(ev.path);
+      propDelta(ev.path, -total);   // 未入树的路径 total=0，传播 0 无副作用
+      changed++;
+    } else if (ev.kind === 'upsert') {
+      var n = store.get(lower);
+      if (ev.is_dir) {
+        if (!n) {
+          // 新目录：入树占位（统计中），祖先体积不变（其内容体积随后由优先扫描结算）
+          applyEvent({ path: ev.path, size: 0, done: false, file: false });
+          queuePriority(ev.path);
+          changed++;
+        } else if (!n.done) {
+          queuePriority(ev.path);   // 之前占位还没扫完（或上次队列没轮到），再排一次
+        }
+      } else {
+        // 文件：与扫描同语义，只关心 ≥10MB 的大文件或已在树里的（小文件本就不入树）
+        if (!n && ev.size < BIG_FILE_MIN) continue;
+        // 体积差值由 applyEvent 统一传播（监视模式下），这里不再手动传播以免重复
+        applyEvent({ path: ev.path, size: ev.size, done: true, file: true });
+        changed++;
+      }
+    }
+  }
+  if (changed) {
+    watchChanges += changed;
+    markDirty();
+  }
+}
+function setWatch(on, root) {
+  if (on) {
+    watchActive = true;
+    watchChanges = 0;
+    document.body.classList.add('watching');
+    feed.watchStart(root);
+  } else {
+    watchActive = false;
+    priQueue = []; priQueued = {}; priActive = 0; priInflight = [];
+    document.body.classList.remove('watching');
+    feed.watchStop();
+  }
 }
 (function loop(){
   if(dirty){
@@ -57,6 +187,7 @@ function applyEvent(ev){
       try { setStatus('渲染异常：' + e.message, 'err'); } catch(_) {}
     }
   }
+  try { checkPriorityDone(); } catch(_) {}
   setTimeout(loop, 120);
 })();
 
@@ -107,6 +238,7 @@ function updateSummary(node){
   var parts=[];
   if(root&&root.s>0) parts.push((scanning?'已扫描 ':'根目录总计 ')+'<b>'+fmt(root.s)+'</b>');
   if(scanning&&scanT0) parts.push('用时 '+((Date.now()-scanT0)/1000).toFixed(1)+'s');
+  if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?' · 已感知 '+watchChanges+' 项变更':'')+'</span>');
   document.getElementById('summary').innerHTML=parts.join(' · ');
   var st=document.getElementById('foot-stats');
   if(node) st.innerHTML='当前 <b>'+esc(node.n)+'</b> · '+node.c.length+' 项';
@@ -196,9 +328,20 @@ function TauriFeed(){
     for(var i=0;i<arr.length;i++) applyEvent(arr[i]);
   });
   window.__TAURI__.event.listen('scan-finished', function(ev){
-    setStatus(ev.payload || '完成', 'done');
+    var msg = ev.payload || '完成';
+    setStatus(msg, 'done');
     setScanning(false);
     autoExpandView();
+    // 完整扫描结束后进入实时监视：文件增删改即时反映到视图
+    if (!watchActive && String(msg).indexOf('扫描完成') >= 0 && window.ROOT) {
+      setWatch(true, window.ROOT);
+    }
+  });
+  window.__TAURI__.event.listen('fs-batch', function(ev){
+    try { applyFsBatch(ev.payload); } catch(e) {
+      window.__errs = window.__errs || [];
+      window.__errs.push('fs-batch: ' + e.message);
+    }
   });
   window.__TAURI__.event.listen('migrate-update', function(ev){
     if(window.__migHandler) window.__migHandler(ev.payload);
@@ -238,6 +381,16 @@ TauriFeed.prototype.migrateStop = function(){
 };
 TauriFeed.prototype.scanPriority = function(p){
   window.__TAURI__.core.invoke('scan_priority', { path: p }).catch(function(){});
+};
+TauriFeed.prototype.watchStart = function(root){
+  window.__TAURI__.core.invoke('watch_start', { root: root }).catch(function(e){
+    // 监视失败不打扰（如网络盘不支持），只把状态回退
+    watchActive = false;
+    document.body.classList.remove('watching');
+  });
+};
+TauriFeed.prototype.watchStop = function(){
+  window.__TAURI__.core.invoke('watch_stop').catch(function(){});
 };
 
 /* ===== Mock Feed：浏览器直接打开时的合成数据（UI 开发 / 演示用） ===== */
@@ -419,6 +572,9 @@ MockFeed.prototype.scanPriority = function(p){
     applyEvent({ path:p, name:n.n, size:Math.round(base*1.08), done:true, file:false });
   }, 600));
 };
+/* 浏览器模式无文件系统监视：no-op（模拟扫描完成不触发 setWatch） */
+MockFeed.prototype.watchStart = function(){};
+MockFeed.prototype.watchStop = function(){};
 
 /* 启动屏淡出 + 原生窗口显示（窗口配置为启动时隐藏，页面就绪后才出现，避免白屏） */
 function hideSplash(){
@@ -460,6 +616,7 @@ window.addEventListener('DOMContentLoaded', function(){
   document.getElementById('scan-btn').addEventListener('click', function(){
     window.ROOT = window.rootInput.value || 'C:\\';
     window.curPath = window.ROOT;
+    if (watchActive) setWatch(false);   // 换盘重扫前先停掉旧根的监视
     store.clear(); fileIndex.clear(); window.divs = {}; window.map.innerHTML = '';
     document.getElementById('list').innerHTML = '';
     document.getElementById('files').innerHTML = '';

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use notify::Watcher as _;
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -24,6 +25,26 @@ pub struct ScanState {
     /// 已完成子树的字节数表：lower(path) -> 子树总大小。
     /// 并行工作线程/优先扫描到达某目录时若表里已有（被另一方先行完成）则直接采用，不再重扫
     sizes: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+/// 扫描完成后的实时监视状态：watcher 与其合批线程的生命周期句柄
+#[derive(Default)]
+pub struct WatchState {
+    inner: Mutex<Option<WatchRun>>,
+}
+
+struct WatchRun {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// 监视事件合批后发给前端的一条变更：upsert（新建/修改，带类型与大小）或 remove
+#[derive(Clone, serde::Serialize)]
+struct FsEvent {
+    path: String,
+    kind: String, // "upsert" | "remove"
+    is_dir: bool,
+    size: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -611,18 +632,16 @@ fn process_job(
     }
 }
 
-/// 用户在扫描进行中点击了某个还没扫到的目录：立刻起一个线程优先扫这个子树。
-/// 主 DFS 之后到达该目录时会从共享 sizes 表取结果直接跳过，不重复耗 IO。
+/// 用户在扫描进行中（或扫描完成后的监视模式下）点击/自动调度了一个还没扫到的目录：
+/// 立刻起一个线程优先扫这个子树。主 DFS 之后到达该目录时会从共享 sizes 表取结果直接跳过，
+/// 不重复耗 IO。监视模式下（无主扫描）同样可用：新出现的目录点开即扫。
 #[tauri::command]
 fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> Result<(), String> {
     let running = match state.running.lock() {
         Ok(g) => *g,
         Err(_) => false,
     };
-    if !running {
-        return Err("当前没有进行中的扫描".into());
-    }
-    if state.stop.load(Ordering::Relaxed) {
+    if running && state.stop.load(Ordering::Relaxed) {
         return Err("扫描正在停止".into());
     }
     let p = norm_path(&path);
@@ -640,7 +659,12 @@ fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> R
     {
         let st = app2.state::<ScanState>();
         if let Ok(mut a) = st.active.lock() {
-            *a += 1;
+            if running {
+                *a += 1;
+            } else {
+                // 监视模式：没有主扫描占名额，本线程自己占 1，扫完后负责宣布完成
+                *a = 1;
+            }
         }
     }
     let name = bp
@@ -676,6 +700,193 @@ fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> R
 fn scan_stop(state: State<'_, ScanState>) {
     state.stop.store(true, Ordering::Relaxed);
 }
+
+// ======================== 扫描完成后的实时监视 ========================
+// notify 递归 watcher → 原始事件 channel → 合批线程：静默 300ms 或攒满 256 条即
+// emit "fs-batch"。前端按 upsert/remove 增量应用并沿祖先链传播体积差值。
+// 与扫描引擎同一套语义：跳过 reparse point 与 deny 目录，大文件阈值同 MIN_BIG_FILE。
+
+#[derive(Clone)]
+enum RawOp {
+    Upsert,
+    Remove,
+}
+
+fn watch_allowed(root_lower: &str, path_lower: &str) -> bool {
+    if !path_lower.starts_with(root_lower) || path_lower == root_lower {
+        return false;
+    }
+    let rel = &path_lower[root_lower.len()..];
+    let depth = rel.split('\\').filter(|s| !s.is_empty()).count();
+    if depth > 48 {
+        return false;
+    }
+    !rel.split('\\').any(is_deny)
+}
+
+#[tauri::command]
+fn watch_start(
+    app: AppHandle,
+    wstate: State<'_, WatchState>,
+    root: String,
+) -> Result<(), String> {
+    let root_n = norm_path(&root);
+    if !Path::new(&root_n).is_dir() {
+        return Err(format!("目录不存在：{}", root_n));
+    }
+    // 停掉旧监视线程（换根重开时）
+    {
+        let mut g = wstate.inner.lock().map_err(|e| e.to_string())?;
+        if let Some(run) = g.take() {
+            run.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = run.join {
+                let _ = h.join();
+            }
+        }
+    }
+
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(String, RawOp)>();
+    // notify 回调只做转投递，绝不做重活（它在 notify 自己的线程上跑）
+    let mut watcher = notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            let ev = match res {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let op = match ev.kind {
+                notify::EventKind::Create(_) => Some(RawOp::Upsert),
+                notify::EventKind::Remove(_) => Some(RawOp::Remove),
+                notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From,
+                )) => Some(RawOp::Remove),
+                notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To,
+                )) => Some(RawOp::Upsert),
+                notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both,
+                )) => {
+                    // paths = [from, to]：旧路径删、新路径增
+                    if let Some(p) = ev.paths.first() {
+                        let _ = raw_tx.send((p.to_string_lossy().to_string(), RawOp::Remove));
+                    }
+                    if let Some(p) = ev.paths.get(1) {
+                        let _ = raw_tx.send((p.to_string_lossy().to_string(), RawOp::Upsert));
+                    }
+                    None
+                }
+                notify::EventKind::Modify(
+                    notify::event::ModifyKind::Data(_)
+                    | notify::event::ModifyKind::Metadata(_)
+                    | notify::event::ModifyKind::Other,
+                ) => Some(RawOp::Upsert),
+                _ => None, // Access 等噪音
+            };
+            if let Some(op) = op {
+                for p in &ev.paths {
+                    let _ = raw_tx.send((p.to_string_lossy().to_string(), op.clone()));
+                }
+            }
+        },
+    )
+    .map_err(|e| format!("无法启动文件监视：{}", e))?;
+    watcher
+        .watch(Path::new(&root_n), notify::RecursiveMode::Recursive)
+        .map_err(|e| format!("无法监视该目录：{}", e))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let root_lower = root_n.to_lowercase();
+    let stop2 = stop.clone();
+    let app2 = app.clone();
+    let join = std::thread::spawn(move || {
+        let _keep = watcher; // watcher 必须活到线程结束，drop 即停止监视
+        let mut pending: HashMap<String, (String, RawOp, u64)> = HashMap::new(); // lower → (原始路径, op, seq)
+        let mut seq: u64 = 0;
+        loop {
+            if stop2.load(Ordering::Relaxed) {
+                return;
+            }
+            // 静默 300ms 出一批：recv 超时即认为暂无新事件
+            match raw_rx.recv_timeout(Duration::from_millis(300)) {
+                Ok((path, op)) => {
+                    let lower = path.to_lowercase();
+                    if !watch_allowed(&root_lower, &lower) {
+                        continue;
+                    }
+                    seq += 1;
+                    pending.insert(lower, (path, op, seq));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return, // sender 全部关闭
+            }
+            if pending.is_empty() {
+                continue;
+            }
+            // 有静默窗口或积压过多才发
+            let due = raw_rx.try_recv().is_err() || pending.len() >= 256;
+            if !due {
+                continue;
+            }
+            // 按事件顺序合并（同一路径后到者覆盖）：先收集排序再定型
+            let mut items: Vec<(u64, String, String, RawOp)> = pending
+                .drain()
+                .map(|(lower, (path, op, s))| (s, lower, path, op))
+                .collect();
+            items.sort_by_key(|(s, _, _, _)| *s);
+            let mut batch: Vec<FsEvent> = Vec::with_capacity(items.len());
+            for (_, lower, path, op) in items {
+                let _ = lower;
+                match op {
+                    RawOp::Remove => batch.push(FsEvent {
+                        path,
+                        kind: "remove".into(),
+                        is_dir: false,
+                        size: 0,
+                    }),
+                    RawOp::Upsert => {
+                        // 事件与 stat 之间文件可能已消失：拿不到元数据就跳过（真删了会有 Remove 事件）
+                        let sm = match fs::symlink_metadata(&path) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        if is_reparse(&sm) {
+                            continue; // junction/symlink 与扫描同语义：不计
+                        }
+                        let is_dir = sm.is_dir();
+                        batch.push(FsEvent {
+                            path,
+                            kind: "upsert".into(),
+                            is_dir,
+                            size: if is_dir { 0 } else { sm.len() },
+                        });
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = app2.emit("fs-batch", &batch);
+            }
+        }
+    });
+
+    let mut g = wstate.inner.lock().map_err(|e| e.to_string())?;
+    *g = Some(WatchRun {
+        stop,
+        join: Some(join),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn watch_stop(wstate: State<'_, WatchState>) {
+    if let Ok(mut g) = wstate.inner.lock() {
+        if let Some(run) = g.take() {
+            run.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = run.join {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
 
 #[tauri::command]
 fn scan_status(state: State<'_, ScanState>) -> bool {
@@ -948,6 +1159,9 @@ fn migrate_check(src: String, dest_root: String) -> Result<CheckResult, String> 
     if volume_prefix(&dest_root_n).is_empty() {
         blockers.push("目标需为本地盘符路径（如 D:\\）".into());
     }
+    if !Path::new(&dest_root_n).is_dir() {
+        blockers.push(format!("目标文件夹不存在：{}", dest_root_n));
+    }
     if let Some(g) = system_guard(&src_n) {
         blockers.push(g.into());
     }
@@ -1217,7 +1431,14 @@ fn migrate_start(
         let mut aborted = false;
 
         if same_volume {
-            // 同卷快速路径：rename 瞬时完成，再回原位建 junction
+            // 同卷快速路径：rename 瞬时完成，再回原位建 junction。
+            // 目标父目录必须存在 rename 才能成功（用户可能选了一个待创建的层级）
+            if let Some(parent) = Path::new(&dest_path).parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    emit_mig(&app2, "error", &format!("无法创建目标父目录 {}：{}", parent.display(), e), "", 0, 0, 0, 0, &[]);
+                    return;
+                }
+            }
             emit_mig(&app2, "switch", "同卷迁移：重命名（瞬时）…", "", 0, 0, 0, 0, &[]);
             if let Err(e) = fs::rename(&src_n, &dest_path) {
                 emit_mig(&app2, "error", &format!("重命名失败（可能有程序占用目录）：{}", e), "", 0, 0, 0, 0, &[]);
@@ -1314,6 +1535,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(ScanState::default())
         .manage(MigrateState::default())
+        .manage(WatchState::default())
         .invoke_handler(tauri::generate_handler![
             scan_start,
             scan_stop,
@@ -1323,14 +1545,17 @@ pub fn run() {
             list_volumes,
             migrate_check,
             migrate_start,
-            migrate_stop
+            migrate_stop,
+            watch_start,
+            watch_stop
         ])
         .setup(|app| {
-            // 应用内自动更新（updater + 重启）：仅桌面端，移动端走应用商店
+            // 应用内自动更新（updater + 重启）+ 原生文件夹选择对话框：仅桌面端
             #[cfg(desktop)]
             {
                 app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
                 app.handle().plugin(tauri_plugin_process::init())?;
+                app.handle().plugin(tauri_plugin_dialog::init())?;
             }
             Ok(())
         })

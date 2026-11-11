@@ -113,9 +113,9 @@ function getCell(kk){
         var sn=store.get(p.toLowerCase());
         // 单子链钻取：若内部只有一条大子目录链，继续展开下去，保证点击必有可见变化
         if(typeof drillExpand==='function' && sn && sn.done){ drillExpand(p, 3); }
-        // 展开时还没扫完 → 请后端优先扫这个子树（已扫完的目录后端会直接忽略）
-        if(typeof scanning!=='undefined'&&scanning&&sn&&!sn.done&&
-           feed&&typeof feed.scanPriority==='function'){ feed.scanPriority(p); }
+        // 展开时还没扫完 → 请后端优先扫这个子树（扫描中或监视模式下；已扫完的目录后端会直接忽略）
+        if(typeof feed!=='undefined'&&feed&&typeof feed.scanPriority==='function'&&
+           sn&&!sn.done&&(scanning||watchActive)){ feed.scanPriority(p); }
       }
       render();
     });
@@ -276,10 +276,10 @@ function goUp(){
 function navigate(path,isChild){
   if(isChild!==false && curPath && store.get(curPath.toLowerCase())){ stack.push({name:store.get(curPath.toLowerCase()).n,path:curPath}); }
   curPath=path; divs={}; map.innerHTML=''; expanded={};
-  // 进入还没扫完的目录 → 优先调度扫描
+  // 进入还没扫完的目录 → 优先调度扫描（扫描中或监视模式下）
   var n=store.get(path.toLowerCase());
-  if(typeof scanning!=='undefined'&&scanning&&n&&!n.done&&
-     feed&&typeof feed.scanPriority==='function'){ feed.scanPriority(path); }
+  if(typeof feed!=='undefined'&&feed&&typeof feed.scanPriority==='function'&&
+     n&&!n.done&&(scanning||watchActive)){ feed.scanPriority(path); }
   render();
 }
 
