@@ -25,6 +25,11 @@ body{font:13px/1.5 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
 #root-input{flex:0 1 380px;min-width:120px;background:#0f141d;border:1px solid var(--line);border-radius:8px;
   color:var(--text);padding:7px 12px;font:13px var(--mono);outline:none;transition:border-color .15s,box-shadow .15s}
 #root-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(76,194,255,.14)}
+#root-drives{flex:none;max-width:250px;background:#0f141d;border:1px solid var(--line);border-radius:8px;
+  color:var(--text);padding:7px 8px;font:13px var(--mono);outline:none;cursor:pointer;
+  transition:border-color .15s,box-shadow .15s}
+#root-drives:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(76,194,255,.14)}
+#root-drives option{background:#0f141d;color:var(--text)}
 button{font:12.5px/1 "Segoe UI",system-ui,sans-serif;border-radius:8px;border:1px solid var(--line);
   background:#1b2330;color:#cfd8e3;padding:8px 14px;cursor:pointer;transition:background .15s,color .15s,filter .15s}
 button:hover{background:#232e40;color:#fff}

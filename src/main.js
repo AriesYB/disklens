@@ -613,21 +613,64 @@ window.addEventListener('DOMContentLoaded', function(){
     var seg = ev.target.closest('.seg');
     if(seg) setView(seg.dataset.view);
   });
-  document.getElementById('scan-btn').addEventListener('click', function(){
-    window.ROOT = window.rootInput.value || 'C:\\';
-    window.curPath = window.ROOT;
-    if (watchActive) setWatch(false);   // 换盘重扫前先停掉旧根的监视
-    store.clear(); fileIndex.clear(); window.divs = {}; window.map.innerHTML = '';
-    document.getElementById('list').innerHTML = '';
-    document.getElementById('files').innerHTML = '';
-    window.expanded = {}; window.stack = []; selectedRow = '';
-    setScanning(true);
-    setStatus('扫描中…', 'scanning');
-    render();
-    feed.start(window.ROOT);
-  });
+  document.getElementById('scan-btn').addEventListener('click', startScan);
   document.getElementById('stop-btn').addEventListener('click', function(){ feed.stop(); });
+
+  /* 盘符下拉：列出本地卷，选中即填入输入框并直接开始扫描 */
+  var drivesSel = document.getElementById('root-drives');
+  drivesSel.addEventListener('change', function(){
+    if(!this.value) return;
+    window.rootInput.value = this.value;
+    startScan();
+  });
+  window.addEventListener('focus', loadDrives);   // 插拔 U 盘等场景重新枚举
+  loadDrives();
 
   // 页面与首帧渲染就绪：淡出启动屏、显示原生窗口
   setTimeout(hideSplash, 350);
 });
+
+/* ===== 开始扫描：输入框/盘符下拉共用 ===== */
+function startScan(){
+  window.ROOT = window.rootInput.value || 'C:\\';
+  window.curPath = window.ROOT;
+  if (watchActive) setWatch(false);   // 换盘重扫前先停掉旧根的监视
+  store.clear(); fileIndex.clear(); window.divs = {}; window.map.innerHTML = '';
+  document.getElementById('list').innerHTML = '';
+  document.getElementById('files').innerHTML = '';
+  window.expanded = {}; window.stack = []; selectedRow = '';
+  setScanning(true);
+  setStatus('扫描中…', 'scanning');
+  syncDrivesSelect();
+  render();
+  feed.start(window.ROOT);
+}
+
+/* ===== 盘符下拉：枚举本地卷（复用迁移对话框的 list_volumes） ===== */
+function loadDrives(){
+  feed.listVolumes(function (vols) {
+    var sel = document.getElementById('root-drives');
+    if(!sel) return;
+    var list = (vols || []).filter(function (v) { return v.mount && v.mount.length >= 3; });
+    if(!list.length){ sel.style.display = 'none'; return; }   // 枚举失败则隐藏，不占顶栏位置
+    var html = '<option value="">磁盘…</option>';
+    for (var i = 0; i < list.length; i++) {
+      var v = list[i];
+      html += '<option value="' + escAttr(v.mount) + '">' + esc(v.mount + (v.label ? ' ' + v.label : '') +
+        ' · 剩余 ' + fmt(v.free_bytes)) + '</option>';
+    }
+    sel.innerHTML = html;
+    syncDrivesSelect();
+  });
+}
+
+/* 输入框路径与下拉选中项保持一致；自定义路径时回落到占位项 */
+function syncDrivesSelect(){
+  var sel = document.getElementById('root-drives');
+  if(!sel || sel.style.display === 'none') return;
+  var cur = (window.ROOT || '').toUpperCase();
+  sel.selectedIndex = 0;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value.toUpperCase() === cur) { sel.selectedIndex = i; break; }
+  }
+}
