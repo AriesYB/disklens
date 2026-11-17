@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.18" />
+    <link rel="stylesheet" href="/styles.css?v=0.22" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -16,6 +16,7 @@
       <input id="root-input" value="C:\" spellcheck="false" />
       <button id="scan-btn" class="primary">开始扫描</button>
       <button id="stop-btn" disabled>停止</button>
+      <button id="ai-bar-btn" title="让 AI 拉取实时扫描数据，给出迁移/清理提案，确认后自动执行迁移">🤖 AI 分析</button>
       <span id="status">就绪</span>
     </header>
 
@@ -24,6 +25,7 @@
         <button class="seg active" data-view="treemap">方块视图</button>
         <button class="seg" data-view="list">列表视图</button>
         <button class="seg" data-view="files">大文件榜</button>
+        <button class="seg" data-view="types">类型统计</button>
       </nav>
       <span id="summary"></span>
     </div>
@@ -33,7 +35,21 @@
     <main id="content">
       <div id="map"></div>
       <div id="list"></div>
-      <div id="files"></div>
+      <div id="files">
+        <div id="files-bar">
+          <input id="file-search" placeholder="搜索名称，支持 * ? 通配（含目录名）" spellcheck="false" />
+          <span id="file-search-count"></span>
+          <button id="files-export" title="导出当前榜单（含搜索结果）为 CSV">📤 导出 CSV</button>
+        </div>
+        <div id="files-body"></div>
+      </div>
+      <div id="types">
+        <div id="types-bar">
+          <span id="types-meta"></span>
+          <button id="types-export" title="导出类型统计为 CSV">📤 导出 CSV</button>
+        </div>
+        <div id="types-body"></div>
+      </div>
       <div id="wait"><div><div class="spin"></div><div style="margin-top:12px">等待扫描开始…</div></div></div>
     </main>
 
@@ -54,6 +70,18 @@
     </div>
 
     <div id="tip"></div>
+
+    <div id="denied-mask" style="display:none">
+      <div id="denied">
+        <div id="denied-title">无权限目录 <span id="denied-n"></span> <button id="denied-close" title="关闭">✕</button></div>
+        <div class="denied-note">下列目录无法读取（ACL 受限），体积只含已读到的部分。可提升权限（以管理员运行）后重扫获得完整数据。</div>
+        <div id="denied-list"></div>
+        <div id="denied-actions">
+          <button id="denied-copy">📋 复制全部路径</button>
+          <button id="denied-cancel">关闭</button>
+        </div>
+      </div>
+    </div>
     <div id="ctx">
       <div id="ctxpath"></div>
       <div class="mi" id="mi-open"><span class="ic">📂</span><span id="mi-open-t">在资源管理器中打开</span></div>
@@ -69,16 +97,45 @@
       <div id="ai">
         <div id="ai-title">AI 辅助迁移 / 清理 <button id="ai-close" title="关闭">✕</button></div>
         <div id="ai-src"></div>
+        <div id="ai-modes">
+          <button class="ai-mode" data-mode="scan">🔍 全盘分析<small>AI 出方案 · 应用内执行</small></button>
+          <button class="ai-mode" data-mode="skill">🔧 深度处理此目录<small>AI 自己动手 · 需装 skill</small></button>
+        </div>
+        <div id="ai-channel">
+          <span class="ai-ch-status" id="ai-ch-status">—</span>
+          <details class="ai-ch-adv">
+            <summary>高级</summary>
+            <div class="ai-ch-row"><span>端点</span><code id="ai-ch-url">—</code><button id="ai-ch-copy">📋 复制</button></div>
+            <div class="ai-ch-row"><span>令牌</span><code id="ai-ch-token">—</code></div>
+            <label class="ai-ch-tgl"><input type="checkbox" id="ai-ch-enabled" checked> 允许 AI 访问本机数据（仅 127.0.0.1 + 令牌校验）</label>
+          </details>
+        </div>
         <div id="ai-body"></div>
         <div id="ai-prompt-wrap">
-          <div class="ai-lab">复制下面的指令，发给已安装 c-relocator skill 的 AI 助手（ZCode / Claude Code 等）：</div>
-          <div id="ai-prompt"></div>
+          <div class="ai-lab" id="ai-prompt-label"></div>
           <div id="ai-actions">
             <button id="ai-copy" class="primary">📋 复制 AI 指令</button>
             <button id="ai-github">GitHub 仓库</button>
             <button id="ai-migrate">直接 junction 迁移…</button>
           </div>
+          <details class="ai-prompt-view"><summary>查看指令内容</summary><div id="ai-prompt"></div></details>
           <div class="ai-install">还没装 skill？一条命令安装：<code>npx skills add AriesYB/c-relocator</code></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="prop-mask" style="display:none">
+      <div id="prop">
+        <div id="prop-title">🤖 AI 提案 <span id="prop-summary"></span> <button id="prop-close" title="关闭">✕</button></div>
+        <div class="prop-note">来自 AI 助手的建议清单。勾选要执行的<b>迁移</b>项后点击执行——
+          复制 → 校验 → junction 切换全程由 DiskLens 完成，任何失败源目录原样保留。
+          清理类建议只做展示与定位（删除请自行确认）。</div>
+        <div id="prop-list"></div>
+        <div id="prop-foot">
+          <span id="prop-progress"></span>
+          <button id="prop-stop" style="display:none">停止</button>
+          <button id="prop-reject">全部忽略</button>
+          <button id="prop-run" class="primary">执行选中的迁移</button>
         </div>
       </div>
     </div>
@@ -151,12 +208,12 @@
       </div>
     </div>
 
-    <script src="/treemap.js?v=0.16"></script>
-    <script src="/listview.js?v=0.11"></script>
+    <script src="/treemap.js?v=0.18"></script>
+    <script src="/listview.js?v=0.13"></script>
     <script src="/migrate.js?v=0.13"></script>
-    <script src="/aiassist.js?v=0.12"></script>
-    <script src="/main.js?v=0.16"></script>
+    <script src="/aiassist.js?v=0.15"></script>
+    <script src="/main.js?v=0.20"></script>
     <script src="/about.js?v=0.13"></script>
-    <script src="/update.js?v=0.13"></script>
+    <script src="/update.js?v=0.14"></script>
   </body>
 </html>

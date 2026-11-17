@@ -22,9 +22,9 @@ pub struct ScanState {
     /// 未终结的扫描线程数（主扫描计 1，每个用户点击的优先扫描各计 1）；
     /// 减到 0 的那个线程负责发 scan-finished
     active: Mutex<usize>,
-    /// 已完成子树的字节数表：lower(path) -> 子树总大小。
+    /// 已完成子树的大小表：lower(path) -> (逻辑字节, 磁盘占用)。
     /// 并行工作线程/优先扫描到达某目录时若表里已有（被另一方先行完成）则直接采用，不再重扫
-    sizes: Arc<Mutex<HashMap<String, u64>>>,
+    sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
 
 /// 扫描完成后的实时监视状态：watcher 与其合批线程的生命周期句柄
@@ -45,6 +45,8 @@ struct FsEvent {
     kind: String, // "upsert" | "remove"
     is_dir: bool,
     size: u64,
+    /// 磁盘占用口径（簇对齐近似；云占位文件为 0）
+    al: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -53,8 +55,20 @@ struct NodeEvent {
     parent: String,
     name: String,
     size: u64,
+    /// 磁盘占用口径：普通文件按簇取整，≥DEDUP_MIN 文件取精确 AllocationSize；
+    /// 云占位文件为 0；硬链接副本计 0（字节只记在首见路径）
+    al: u64,
     done: bool,
     file: bool,
+    /// 硬链接副本：同一数据已在另一路径计数，本节点字节/占用计 0
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dup: bool,
+    /// 云端占位文件（OneDrive 按需下载等）：本地无完整数据
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cloud: bool,
+    /// 目录无权限 / 部分条目读失败：体积为已读到的部分
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    denied: bool,
 }
 
 const DENY_DIRS: &[&str] = &["system volume information", "$winreagent", "recovery"];
@@ -63,10 +77,22 @@ const DENY_DIRS: &[&str] = &["system volume information", "$winreagent", "recove
 const MIN_BIG_FILE: u64 = 10 * 1024 * 1024;
 /// 单目录最多独立上报的大文件数（超出的并入目录大小，防止海量大文件刷爆事件流）
 const MAX_BIG_FILES_PER_DIR: u64 = 200;
+/// ≥ 此大小的文件才开句柄查硬链接身份与精确磁盘占用；小文件用簇对齐近似
+/// （≥1MB 的文件占条目数极小却贡献绝大部分字节，WinSxS 的中大型 DLL 全覆盖）
+#[cfg(windows)]
+const DEDUP_MIN: u64 = 1024 * 1024;
 
 // FILE_ATTRIBUTE_REPARSE_POINT
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+// 以下属性位只用于位运算判定（读自 file_attributes()），不依赖平台 API，
+// 常量不带 cfg 以便测试在任意平台编译
+#[allow(dead_code)] // 仅单测用作"与 recall 无关的属性位"样本
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
 
 fn is_deny(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -84,14 +110,176 @@ fn is_reparse(sm: &fs::Metadata) -> bool {
     }
 }
 
+/// 云端占位（OneDrive 按需下载等）：本地无完整数据，磁盘占用视为 0
+fn is_cloud_placeholder(attrs: u32) -> bool {
+    attrs & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+}
+
+/// 磁盘占用（allocated 口径）近似：普通文件按簇取整；压缩/稀疏文件的真实占用
+/// 无法便宜地取到，直接用逻辑大小（不取整，避免对压缩文件严重高估）
+fn approx_alloc(len: u64, cluster: u32, attrs: u32) -> u64 {
+    if len == 0 || cluster == 0 {
+        return len;
+    }
+    if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
+        return len;
+    }
+    len.div_ceil(cluster as u64) * cluster as u64
+}
+
+/// 簇大小缓存：lower(盘根如 "c:") -> 簇字节数。API 很快，但没必要每文件查一次
+#[cfg(windows)]
+fn cluster_for(path: &str) -> u32 {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+    static CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let lower = path.to_lowercase();
+    let key: String = if lower.len() > 3 { lower[..3].to_string() } else { lower };
+    if let Ok(m) = cache.lock() {
+        if let Some(v) = m.get(&key) {
+            return *v;
+        }
+    }
+    let mut wide: Vec<u16> = key.encode_utf16().collect();
+    if !wide.ends_with(&[b'\\' as u16]) {
+        wide.push(b'\\' as u16);
+    }
+    wide.push(0);
+    let (mut spc, mut bps): (u32, u32) = (0, 0);
+    let (mut free_clusters, mut total_clusters): (u32, u32) = (0, 0);
+    let ok = unsafe {
+        GetDiskFreeSpaceW(wide.as_ptr(), &mut spc, &mut bps, &mut free_clusters, &mut total_clusters)
+    } != 0;
+    let v = if ok { spc * bps } else { 0 };
+    if let Ok(mut m) = cache.lock() {
+        m.insert(key, v);
+    }
+    v
+}
+
+#[cfg(not(windows))]
+fn cluster_for(_path: &str) -> u32 {
+    0
+}
+
+// 已计数的硬链接文件 ID（仅链接数>1 且 ≥DEDUP_MIN 的文件入集，内存只有几万条）。
+// 全局集合：主扫描、优先扫描、监视补扫共用，保证同一数据只在首见路径计数一次
+#[cfg(windows)]
+static HL_SEEN: std::sync::LazyLock<Mutex<std::collections::HashSet<(u32, u64)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// 返回 true = 首次见到（应当计数）；false = 已在别处计数（本路径计 0）
+#[cfg(windows)]
+fn hl_seen_insert(id: (u32, u64)) -> bool {
+    let mut g = HL_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(id)
+}
+
+#[cfg(windows)]
+fn hl_seen_clear() {
+    let mut g = HL_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    g.clear();
+}
+
+/// ≥DEDUP_MIN 文件的一次句柄查询结果：精确磁盘占用 + 硬链接数 + 全局唯一身份
+#[cfg(windows)]
+struct FileIdentity {
+    alloc: u64,
+    links: u32,
+    id: (u32, u64),
+}
+
+/// 只读属性方式打开文件（不取数据流、不与占用冲突），一次拿到
+/// AllocationSize / nNumberOfLinks / (卷序列号, 文件索引)
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileStandardInfo, OPEN_EXISTING, BY_HANDLE_FILE_INFORMATION,
+        FILE_STANDARD_INFO,
+    };
+    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
+    let h = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h.is_null() || h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(h, &mut info) } != 0;
+    let mut stdi: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    let ok2 = unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileStandardInfo,
+            &mut stdi as *mut FILE_STANDARD_INFO as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } != 0;
+    unsafe { CloseHandle(h) };
+    if !ok {
+        return None;
+    }
+    Some(FileIdentity {
+        alloc: if ok2 && stdi.AllocationSize > 0 { stdi.AllocationSize as u64 } else { 0 },
+        links: info.nNumberOfLinks,
+        id: (
+            info.dwVolumeSerialNumber,
+            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        ),
+    })
+}
+
+/// 单文件的口径判定：(计入逻辑字节, 磁盘占用, 云占位, 硬链接副本)。
+/// dup 时字节/占用计 0（已记在首见路径）；云占位逻辑字节照常、占用为 0
+#[cfg(windows)]
+fn file_metrics(path: &Path, sm: &fs::Metadata, cluster: u32) -> (u64, u64, bool, bool) {
+    let len = sm.len();
+    let attrs = sm.file_attributes();
+    if is_cloud_placeholder(attrs) {
+        return (len, 0, true, false);
+    }
+    if len >= DEDUP_MIN {
+        if let Some(id) = file_identity(path) {
+            let dup = id.links > 1 && !hl_seen_insert(id.id);
+            let al = if dup {
+                0
+            } else if id.alloc > 0 {
+                id.alloc
+            } else {
+                approx_alloc(len, cluster, attrs)
+            };
+            return (if dup { 0 } else { len }, al, false, dup);
+        }
+    }
+    (len, approx_alloc(len, cluster, attrs), false, false)
+}
+
+#[cfg(not(windows))]
+fn file_metrics(_path: &Path, sm: &fs::Metadata, _cluster: u32) -> (u64, u64, bool, bool) {
+    (sm.len(), sm.len(), false, false)
+}
+
 fn emit(app: &AppHandle, ev: &NodeEvent) {
     let _ = app.emit("scan-update", ev);
 }
 
-// 单个目录的 DFS：返回子树总大小。开始时推 size=0 占位事件，期间按阈值推部分大小，
-// 完成时推 done 事件。前端按 parent 链组装树、按 done 驱动折叠/特效。
+// 单个目录的 DFS：返回子树 (逻辑字节, 磁盘占用)。开始时推 size=0 占位事件，期间按阈值推
+// 部分大小，完成时推 done 事件。前端按 parent 链组装树、按 done 驱动折叠/特效。
 // sizes：已完成子树的大小表——若本目录已被优先扫描先行扫完，直接采用记录值、不再重扫
 // （跳过时不发任何事件，返回值供父目录聚合，总量保持一致）。
+// 目录打不开（无权限）或条目读失败时照常 done，但事件带 denied:true，体积为已读到的部分。
 fn scan_dir(
     app: &AppHandle,
     dir: &Path,
@@ -99,8 +287,8 @@ fn scan_dir(
     name: String,
     depth: u32,
     stop: &AtomicBool,
-    sizes: &Mutex<HashMap<String, u64>>,
-) -> u64 {
+    sizes: &Mutex<HashMap<String, (u64, u64)>>,
+) -> (u64, u64) {
     let path_str = dir.to_string_lossy().to_string();
     let lower = path_str.to_lowercase();
     {
@@ -118,36 +306,44 @@ fn scan_dir(
             parent: parent.clone(),
             name: name.clone(),
             size: 0,
+            al: 0,
             done: false,
             file: false,
+            dup: false,
+            cloud: false,
+            denied: false,
         },
     );
 
+    let cluster = cluster_for(&path_str);
     let mut pending: u64 = 0;
+    let mut pending_al: u64 = 0;
     let mut n_items: u64 = 0;
     let mut last_flush = Instant::now();
     let mut big_file_count: u64 = 0;
 
     let rd = fs::read_dir(dir);
     let mut total: u64 = 0;
+    let mut total_al: u64 = 0;
+    let mut had_err = false;
     if let Ok(rd) = rd {
         for entry in rd.flatten() {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             n_items += 1;
-            let got = (|| -> Option<u64> {
+            let got = (|| -> Option<(u64, u64)> {
                 let sm = fs::symlink_metadata(entry.path()).ok()?;
                 if is_reparse(&sm) {
-                    return Some(0); // junction/symlink 计 0：不重复计数、不成环
+                    return Some((0, 0)); // junction/symlink 计 0：不重复计数、不成环
                 }
                 if sm.is_dir() {
                     let child_name = entry.file_name().to_string_lossy().to_string();
                     if is_deny(&child_name) {
-                        return Some(0);
+                        return Some((0, 0));
                     }
                     if depth == 0 {
-                        return Some(0); // 深度兜底（防异常深树爆栈）
+                        return Some((0, 0)); // 深度兜底（防异常深树爆栈）
                     }
                     Some(scan_dir(
                         app,
@@ -159,8 +355,8 @@ fn scan_dir(
                         sizes,
                     ))
                 } else {
-                    let len = sm.len();
-                    if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
+                    let (counted, al, cloud, dup) = file_metrics(&entry.path(), &sm, cluster);
+                    if sm.len() >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
                         big_file_count += 1;
                         emit(
                             app,
@@ -168,17 +364,25 @@ fn scan_dir(
                                 path: entry.path().to_string_lossy().to_string(),
                                 parent: path_str.clone(),
                                 name: entry.file_name().to_string_lossy().to_string(),
-                                size: len,
+                                size: counted,
+                                al,
                                 done: true,
                                 file: true,
+                                dup,
+                                cloud,
+                                denied: false,
                             },
                         );
                     }
-                    Some(len)
+                    Some((counted, al))
                 }
             })();
-            if let Some(v) = got {
-                pending += v;
+            match got {
+                Some((v, a)) => {
+                    pending += v;
+                    pending_al += a;
+                }
+                None => had_err = true, // 条目元数据拿不到（被删/被拒）：目录标记受限
             }
             // flush：32MB / 400 项 / 250ms 任一触发（时间驱动保证小目录也持续出数）
             if pending >= 32 * 1024 * 1024
@@ -186,7 +390,9 @@ fn scan_dir(
                 || last_flush.elapsed() >= Duration::from_millis(250)
             {
                 total += pending;
+                total_al += pending_al;
                 pending = 0;
+                pending_al = 0;
                 emit(
                     app,
                     &NodeEvent {
@@ -194,15 +400,22 @@ fn scan_dir(
                         parent: parent.clone(),
                         name: name.clone(),
                         size: total,
+                        al: total_al,
                         done: false,
                         file: false,
+                        dup: false,
+                        cloud: false,
+                        denied: false,
                     },
                 );
                 last_flush = Instant::now();
             }
         }
+    } else {
+        had_err = true; // read_dir 打不开：无权限
     }
     total += pending;
+    total_al += pending_al;
     emit(
         app,
         &NodeEvent {
@@ -210,18 +423,29 @@ fn scan_dir(
             parent,
             name,
             size: total,
+            al: total_al,
             done: true,
             file: false,
+            dup: false,
+            cloud: false,
+            denied: had_err,
         },
     );
     if let Ok(mut m) = sizes.lock() {
-        m.insert(lower, total);
+        m.insert(lower, (total, total_al));
     }
-    total
+    (total, total_al)
 }
 
 #[tauri::command]
-fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Result<(), String> {
+fn scan_start(app: AppHandle, root: String) -> Result<(), String> {
+    do_scan_start(&app, root)
+}
+
+/// 扫描启动主体：前端「开始扫描」按钮与 AI 联动通道（POST /api/scan）共用。
+/// 成功启动后向前端发 scan-started 事件（AI 触发时前端据此进入扫描 UI 态）
+fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
+    let state = app.state::<ScanState>();
     let root_path = Path::new(&root).to_path_buf();
     if !root_path.is_dir() {
         return Err(format!("目录不存在：{}", root));
@@ -237,6 +461,8 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
     if let Ok(mut m) = state.sizes.lock() {
         m.clear();
     }
+    #[cfg(windows)]
+    hl_seen_clear(); // 新扫描重新去重：同一数据仍然只计首见路径
     if let Ok(mut a) = state.active.lock() {
         *a = 1; // 主扫描占 1 个名额，优先扫描线程各再 +1
     }
@@ -264,6 +490,8 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
             depth: 48,
             remaining: AtomicUsize::new(0),
             size: Mutex::new(0),
+            alloc: Mutex::new(0),
+            denied: AtomicBool::new(false),
             iter_done: AtomicBool::new(false),
             parent: None,
         });
@@ -326,6 +554,8 @@ fn scan_start(app: AppHandle, state: State<'_, ScanState>, root: String) -> Resu
             }
         }
     });
+    // 通知前端进入扫描 UI 态（AI 经 POST /api/scan 触发时前端没有按钮上下文）
+    let _ = app.emit("scan-started", root.clone());
     Ok(())
 }
 
@@ -342,8 +572,12 @@ struct DState {
     depth: u32,
     /// 尚未完成的子目录任务数
     remaining: AtomicUsize,
-    /// 自身文件 + 已完成子目录的累计字节
+    /// 自身文件 + 已完成子目录的累计逻辑字节
     size: Mutex<u64>,
+    /// 同上口径的磁盘占用
+    alloc: Mutex<u64>,
+    /// read_dir 打不开 / 条目元数据读失败（体积为已读到的部分）
+    denied: AtomicBool,
     /// 目录项是否已读完（read_dir 迭代结束）
     iter_done: AtomicBool,
     parent: Option<Arc<DState>>,
@@ -351,7 +585,7 @@ struct DState {
 
 struct EngineCtx {
     app: AppHandle,
-    sizes: Arc<Mutex<HashMap<String, u64>>>,
+    sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     cv: Arc<Condvar>,
@@ -387,30 +621,35 @@ fn flush_out(ctx: &EngineCtx) {
 fn settle(
     state: &Arc<DState>,
     total: u64,
-    sizes: &Mutex<HashMap<String, u64>>,
-) -> Option<(Arc<DState>, u64)> {
+    alloc: u64,
+    sizes: &Mutex<HashMap<String, (u64, u64)>>,
+) -> Option<(Arc<DState>, u64, u64)> {
     if let Ok(mut m) = sizes.lock() {
-        m.insert(state.path.to_lowercase(), total);
+        m.insert(state.path.to_lowercase(), (total, alloc));
     }
     let p = state.parent.as_ref()?;
     {
         let mut ps = p.size.lock().ok()?;
         *ps += total;
+        let mut pa = p.alloc.lock().ok()?;
+        *pa += alloc;
     }
     // fetch_sub 返回旧值 == 1 说明减到 0：目录项已读完 → 父目录级联完成。
     // 旧值为 0 说明已被人（停止时的强制完成）减过 → 不再动它，防回绕
     let prev = p.remaining.fetch_sub(1, Ordering::Relaxed);
     if prev == 1 && p.iter_done.load(Ordering::Relaxed) {
         let pt = *p.size.lock().ok()?;
-        return Some((p.clone(), pt));
+        let pa = *p.alloc.lock().ok()?;
+        return Some((p.clone(), pt, pa));
     }
     None
 }
 
 /// 目录完成：发 done 事件并沿父链级联；根目录完成时置 finished 唤醒协调者。
-fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, already_emitted: bool) {
+fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, alloc: u64, already_emitted: bool) {
     let mut cur = state.clone();
     let mut t = total;
+    let mut ta = alloc;
     let mut first = already_emitted; // true：done 事件已由别处发过，只做聚合
     loop {
         if !first {
@@ -421,16 +660,21 @@ fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, already_emitte
                     parent: cur.parent_path.clone(),
                     name: cur.name.clone(),
                     size: t,
+                    al: ta,
                     done: true,
                     file: false,
+                    dup: false,
+                    cloud: false,
+                    denied: cur.denied.load(Ordering::Relaxed),
                 },
             );
         }
         first = false;
-        match settle(&cur, t, &ctx.sizes) {
-            Some((p, pt)) => {
+        match settle(&cur, t, ta, &ctx.sizes) {
+            Some((p, pt, pa)) => {
                 cur = p;
                 t = pt;
+                ta = pa;
             }
             None => {
                 if cur.parent.is_none() {
@@ -475,7 +719,8 @@ fn worker_loop(
         if !job.iter_done.load(Ordering::Relaxed) {
             job.iter_done.store(true, Ordering::Relaxed);
             let total = *job.size.lock().unwrap_or_else(|e| e.into_inner());
-            complete_dir(&ctx, &job, total, false);
+            let alloc = *job.alloc.lock().unwrap_or_else(|e| e.into_inner());
+            complete_dir(&ctx, &job, total, alloc, false);
         }
     }
     alive.fetch_sub(1, Ordering::Relaxed);
@@ -495,8 +740,8 @@ fn process_job(
             .lock()
             .ok()
             .and_then(|m| m.get(&job.path.to_lowercase()).copied());
-        if let Some(sz) = known {
-            complete_dir(ctx, job, sz, true);
+        if let Some((sz, al)) = known {
+            complete_dir(ctx, job, sz, al, true);
             return;
         }
     }
@@ -507,39 +752,46 @@ fn process_job(
             parent: job.parent_path.clone(),
             name: job.name.clone(),
             size: 0,
+            al: 0,
             done: false,
             file: false,
+            dup: false,
+            cloud: false,
+            denied: false,
         },
     );
+    let cluster = cluster_for(&job.path);
     let mut pending: u64 = 0;
+    let mut pending_al: u64 = 0;
     let mut n_items: u64 = 0;
     let mut big_file_count: u64 = 0;
-    let mut last_flush = Instant::now();    if let Ok(rd) = fs::read_dir(&job.path) {
+    let mut last_flush = Instant::now();
+    if let Ok(rd) = fs::read_dir(&job.path) {
         for entry in rd.flatten() {
             if ctx.stop.load(Ordering::Relaxed) {
                 break;
             }
             n_items += 1;
-            let got = (|| -> Option<u64> {
+            let got = (|| -> Option<(u64, u64)> {
                 let sm = fs::symlink_metadata(entry.path()).ok()?;
                 if is_reparse(&sm) {
-                    return Some(0);
+                    return Some((0, 0));
                 }
                 if sm.is_dir() {
                     let child_name = entry.file_name().to_string_lossy().to_string();
                     if is_deny(&child_name) {
-                        return Some(0);
+                        return Some((0, 0));
                     }
                     if job.depth == 0 {
-                        return Some(0);
+                        return Some((0, 0));
                     }
                     let child_path = entry.path().to_string_lossy().to_string();
                     // 已由另一方完成的子树：体积直接并入，不入队
                     {
                         let m = ctx.sizes.lock();
                         if let Ok(m) = &m {
-                            if let Some(sz) = m.get(&child_path.to_lowercase()) {
-                                return Some(*sz);
+                            if let Some(&(sz, al)) = m.get(&child_path.to_lowercase()) {
+                                return Some((sz, al));
                             }
                         }
                     }
@@ -550,6 +802,8 @@ fn process_job(
                         depth: job.depth - 1,
                         remaining: AtomicUsize::new(0),
                         size: Mutex::new(0),
+                        alloc: Mutex::new(0),
+                        denied: AtomicBool::new(false),
                         iter_done: AtomicBool::new(false),
                         parent: Some(job.clone()),
                     });
@@ -567,13 +821,18 @@ fn process_job(
                             parent: job.path.clone(),
                             name: child_name,
                             size: 0,
+                            al: 0,
                             done: false,
                             file: false,
+                            dup: false,
+                            cloud: false,
+                            denied: false,
                         },
                     );
-                    return Some(0); // 子目录体积经完成级联上缴
+                    return Some((0, 0)); // 子目录体积经完成级联上缴
                 }
                 let len = sm.len();
+                let (counted, al, cloud, dup) = file_metrics(&entry.path(), &sm, cluster);
                 if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
                     big_file_count += 1;
                     push_event(
@@ -582,16 +841,24 @@ fn process_job(
                             path: entry.path().to_string_lossy().to_string(),
                             parent: job.path.clone(),
                             name: entry.file_name().to_string_lossy().to_string(),
-                            size: len,
+                            size: counted,
+                            al,
                             done: true,
                             file: true,
+                            dup,
+                            cloud,
+                            denied: false,
                         },
                     );
                 }
-                Some(len)
+                Some((counted, al))
             })();
-            if let Some(v) = got {
-                pending += v;
+            match got {
+                Some((v, a)) => {
+                    pending += v;
+                    pending_al += a;
+                }
+                None => job.denied.store(true, Ordering::Relaxed),
             }
             // flush 节流：体积驱动（16MB）/ 条目驱动（2000 项）/ 定时（250ms 且确有进展）。
             // 并行时几千个目录同时在线，无进展的定时 flush 会造成事件洪流
@@ -602,8 +869,11 @@ fn process_job(
                 {
                     let mut s = job.size.lock().unwrap_or_else(|e| e.into_inner());
                     *s += pending;
+                    let mut a = job.alloc.lock().unwrap_or_else(|e| e.into_inner());
+                    *a += pending_al;
                 }
                 pending = 0;
+                pending_al = 0;
                 push_event(
                     ctx,
                     NodeEvent {
@@ -611,24 +881,33 @@ fn process_job(
                         parent: job.parent_path.clone(),
                         name: job.name.clone(),
                         size: *job.size.lock().unwrap_or_else(|e| e.into_inner()),
+                        al: *job.alloc.lock().unwrap_or_else(|e| e.into_inner()),
                         done: false,
                         file: false,
+                        dup: false,
+                        cloud: false,
+                        denied: false,
                     },
                 );
                 last_flush = Instant::now();
                 flush_out(ctx); // 批量缓冲随节拍刷出，避免低事件量时期批积压延迟
             }
         }
+    } else {
+        job.denied.store(true, Ordering::Relaxed); // read_dir 打不开：无权限
     }
     {
         let mut s = job.size.lock().unwrap_or_else(|e| e.into_inner());
         *s += pending;
+        let mut a = job.alloc.lock().unwrap_or_else(|e| e.into_inner());
+        *a += pending_al;
     }
     job.iter_done.store(true, Ordering::Relaxed);
     // 停止时强制完成（部分体积），让前端各目录状态收敛、不再永久转圈
     if ctx.stop.load(Ordering::Relaxed) || job.remaining.load(Ordering::Relaxed) == 0 {
         let total = *job.size.lock().unwrap_or_else(|e| e.into_inner());
-        complete_dir(ctx, job, total, false);
+        let alloc = *job.alloc.lock().unwrap_or_else(|e| e.into_inner());
+        complete_dir(ctx, job, total, alloc, false);
     }
 }
 
@@ -841,6 +1120,7 @@ fn watch_start(
                         kind: "remove".into(),
                         is_dir: false,
                         size: 0,
+                        al: 0,
                     }),
                     RawOp::Upsert => {
                         // 事件与 stat 之间文件可能已消失：拿不到元数据就跳过（真删了会有 Remove 事件）
@@ -852,11 +1132,27 @@ fn watch_start(
                             continue; // junction/symlink 与扫描同语义：不计
                         }
                         let is_dir = sm.is_dir();
+                        // 占用口径走扫描同一套近似（云占位=0、压缩/稀疏按逻辑、普通按簇取整）；
+                        // 硬链接去重在此不做（需开句柄，监视事件量大，接受少量漂移）
+                        #[cfg(windows)]
+                        let al = if is_dir {
+                            0
+                        } else {
+                            let attrs = sm.file_attributes();
+                            if is_cloud_placeholder(attrs) {
+                                0
+                            } else {
+                                approx_alloc(sm.len(), cluster_for(&path), attrs)
+                            }
+                        };
+                        #[cfg(not(windows))]
+                        let al = if is_dir { 0 } else { sm.len() };
                         batch.push(FsEvent {
                             path,
                             kind: "upsert".into(),
                             is_dir,
                             size: if is_dir { 0 } else { sm.len() },
+                            al,
                         });
                     }
                 }
@@ -1137,6 +1433,496 @@ fn probe_volumes() -> Vec<VolumeInfo> {
 #[tauri::command]
 fn list_volumes() -> Vec<VolumeInfo> {
     probe_volumes()
+}
+
+/// 前端 CSV 导出落盘：路径由原生保存对话框给出，内容为前端拼好的完整字符串
+#[tauri::command]
+fn save_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("写入失败：{}", e))
+}
+
+// ======================== 窗口显示与无感重启 ========================
+// 用户双击启动 → 正常 show（前台，符合预期）；--no-focus 启动（自动更新重启等后台拉起）
+// → SW_SHOWNOACTIVATE：显示但绝不抢正在使用的前台应用焦点。
+
+static NO_FOCUS: AtomicBool = AtomicBool::new(false);
+
+/// 显示主窗口。--no-focus 模式走 ShowWindow(SW_SHOWNOACTIVATE)，不激活不置顶
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        #[cfg(windows)]
+        if NO_FOCUS.load(Ordering::Relaxed) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+            if let Ok(h) = win.hwnd() {
+                // tauri(windows crate) 的 HWND(isize) → windows-sys 的 *mut c_void
+                unsafe { ShowWindow(h.0 as *mut core::ffi::c_void, SW_SHOWNOACTIVATE) };
+                return;
+            }
+        }
+        let _ = win.show();
+    }
+}
+
+/// 自动更新后的重启：以 --no-focus 拉起新进程（新窗口不抢焦点）再退出当前
+#[tauri::command]
+fn relaunch_no_focus(app: AppHandle) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let _ = std::process::Command::new(exe).arg("--no-focus").spawn();
+    app.exit(0);
+}
+
+// ======================== AI 联动通道（本地 HTTP） ========================
+// 设计：AI 助手（ZCode / Claude Code 等）经 127.0.0.1 拉取扫描快照、回传迁移/清理
+// 提案；用户在应用内确认后由本应用复用迁移引擎执行（AI 不直接碰文件系统）。
+// 安全三道门：① 仅绑定 127.0.0.1；② Host 头必须是 127.0.0.1/localhost（防 DNS
+// rebinding）；③ 自定义头 X-DiskLens-Token 匹配会话 token（自定义头天然阻断
+// 浏览器 CSRF form）。快照由前端聚合推送，Rust 原样回传、零解析。
+
+/// 会话 token：RandomState（OS 种子）+ 纳秒时钟哈希，零依赖的不可预测串
+fn gen_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut out = String::new();
+    for i in 0..2usize {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(nanos.wrapping_add(i as u64 * 0x9E37_79B9_7F4A_7C15));
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+pub struct AiChannelState {
+    /// 前端聚合好的扫描快照 JSON 字符串
+    snapshot: Mutex<Option<String>>,
+    /// 当前提案 {id, summary, items, status: pending|accepted|rejected|done, results}
+    proposal: Mutex<Option<serde_json::Value>>,
+    enabled: AtomicBool,
+    /// HTTP 服务端口（0 = 未启动）
+    port: AtomicUsize,
+    token: String,
+}
+
+impl AiChannelState {
+    fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(None),
+            proposal: Mutex::new(None),
+            enabled: AtomicBool::new(true),
+            port: AtomicUsize::new(0),
+            token: gen_token(),
+        }
+    }
+}
+
+/// 下钻：从 sizes 完成表取某目录的直接子目录（一层，无大小阈值）。
+/// 表键是小写路径；返回按大小降序。注意：监视模式的增量未反映在此表（陈旧可接受）
+fn tree_children(
+    sizes: &HashMap<String, (u64, u64)>,
+    path_lower: &str,
+) -> Vec<(String, u64, u64)> {
+    let prefix = format!("{}\\", path_lower.trim_end_matches('\\'));
+    let mut out: Vec<(String, u64, u64)> = Vec::new();
+    for (k, v) in sizes.iter() {
+        if let Some(rest) = k.strip_prefix(prefix.as_str()) {
+            // 直接子层：余段不含 '\'（子目录自身的键），排除更深层
+            if !rest.is_empty() && !rest.contains('\\') {
+                out.push((k.clone(), v.0, v.1));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// 手写 percent-decode（%XX；'+' 不当空格），供 /api/tree 的 path 查询参数用
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| -> Option<u8> {
+                match c {
+                    b'0'..=b'9' => Some(c - b'0'),
+                    b'a'..=b'f' => Some(c - b'a' + 10),
+                    b'A'..=b'F' => Some(c - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 设置/覆盖提案；已有 pending 提案时拒绝（AI 需先等用户处理上一个）
+fn try_set_proposal(state: &AiChannelState, v: serde_json::Value) -> Result<(), String> {
+    let mut g = state.proposal.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = g.as_ref() {
+        if p.get("status").and_then(|s| s.as_str()) == Some("pending") {
+            return Err("已有待确认的提案".into());
+        }
+    }
+    *g = Some(v);
+    Ok(())
+}
+
+/// 解析后的请求头（头部名统一小写）
+struct ReqHead {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+}
+
+fn req_header<'a>(h: &'a ReqHead, name: &str) -> Option<&'a str> {
+    h.headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// 纯函数：解析请求头文本（到 \r\n\r\n 为止的段），便于单测
+fn parse_head(text: &str) -> Option<ReqHead> {
+    let mut lines = text.split("\r\n");
+    let first = lines.next()?;
+    let mut it = first.split(' ');
+    let method = it.next()?.to_string();
+    let path = it.next()?.to_string();
+    if method.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(idx) = line.find(':') {
+            headers.push((
+                line[..idx].trim().to_ascii_lowercase(),
+                line[idx + 1..].trim().to_string(),
+            ));
+        }
+    }
+    Some(ReqHead { method, path, headers })
+}
+
+/// Host 头校验：只接受 127.0.0.1 / [::1] / localhost（防 DNS rebinding）
+fn host_allowed(host: &str) -> bool {
+    let h = host.trim();
+    // IPv6 字面量带端口是 "[::1]:9000"：先取方括号段，再按 : 切端口
+    let h = if h.starts_with('[') {
+        match h.find(']') {
+            Some(i) => &h[..=i],
+            None => h,
+        }
+    } else {
+        h.split(':').next().unwrap_or("")
+    };
+    h == "127.0.0.1" || h == "localhost" || h == "[::1]"
+}
+
+fn http_res(stream: &mut std::net::TcpStream, status: u16, reason: &str, body: &str) {
+    use std::io::Write;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        status, reason, body.len(), body
+    );
+    let _ = stream.flush();
+}
+
+fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str) {
+    use std::io::Read;
+    // 读到头部结束（上限 16KB 防滥用）
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    let head_end;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_head_end(&buf) {
+                    head_end = pos;
+                    break;
+                }
+                if buf.len() > 16 * 1024 {
+                    http_res(&mut stream, 431, "Request Header Fields Too Large", "{\"error\":\"header too large\"}");
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let head = match parse_head(&head_text) {
+        Some(h) => h,
+        None => {
+            http_res(&mut stream, 400, "Bad Request", "{\"error\":\"bad request\"}");
+            return;
+        }
+    };
+    let state = app.state::<AiChannelState>();
+    // 三道门
+    if !state.enabled.load(Ordering::Relaxed) {
+        http_res(&mut stream, 403, "Forbidden", "{\"error\":\"channel disabled\"}");
+        return;
+    }
+    if !req_header(&head, "host").map(host_allowed).unwrap_or(false) {
+        http_res(&mut stream, 403, "Forbidden", "{\"error\":\"host not allowed\"}");
+        return;
+    }
+    if req_header(&head, "x-disklens-token") != Some(token) {
+        http_res(&mut stream, 403, "Forbidden", "{\"error\":\"bad token\"}");
+        return;
+    }
+    let content_len: usize = req_header(&head, "content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if content_len > 1024 * 1024 {
+        http_res(&mut stream, 413, "Payload Too Large", "{\"error\":\"body too large\"}");
+        return;
+    }
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < content_len {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+
+    // 路由匹配用去查询串的路径；查询参数交给需要的分支（/api/tree）
+    let route = head.path.split('?').next().unwrap_or("").to_string();
+    match (head.method.as_str(), route.as_str()) {
+        ("GET", "/api/info") => {
+            let root = state
+                .snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("root").cloned());
+            let body = serde_json::json!({
+                "app": "disklens",
+                "version": env!("CARGO_PKG_VERSION"),
+                "root": root,
+                "endpoints": [
+                    "GET  /api/status    — 扫描状态 {scanning, hasSnapshot, root}（先查这个）",
+                    "POST /api/scan      — 触发扫描 {\"root\":\"C:\\\\\"}（未扫描/换盘时用）",
+                    "GET  /api/scan      — 扫描快照：树形构成 tree（≥10MB 子项递归+每层 agg 聚合）、类型、受限目录",
+                    "GET  /api/tree?path=C%3A%5Csome%5Cdir — 下钻任意目录的直接子目录（无大小阈值，突破快照 10MB 粒度）",
+                    "GET  /api/proposal  — 当前提案状态（轮询执行结果）",
+                    "POST /api/proposal  — 提交提案 {summary, items:[{action:migrate|cleanup|note, src, dest_root?, reason?}]}"
+                ],
+            });
+            http_res(&mut stream, 200, "OK", &body.to_string());
+        }
+        ("GET", "/api/status") => {
+            let scanning = app
+                .state::<ScanState>()
+                .running
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(false);
+            let snap = state.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            let (has_snapshot, root, scanning_snap) = match snap.as_ref() {
+                Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) => (
+                        true,
+                        v.get("root").cloned(),
+                        v.get("scanning").and_then(|b| b.as_bool()),
+                    ),
+                    Err(_) => (true, None, None),
+                },
+                None => (false, None, None),
+            };
+            let body = serde_json::json!({
+                "scanning": scanning || scanning_snap.unwrap_or(false),
+                "hasSnapshot": has_snapshot,
+                "root": root,
+            });
+            http_res(&mut stream, 200, "OK", &body.to_string());
+        }
+        ("POST", "/api/scan") => {
+            let root = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(String::from))
+                .unwrap_or_else(|| "C:\\".to_string());
+            match do_scan_start(app, root) {
+                Ok(()) => http_res(&mut stream, 200, "OK", "{\"started\":true}"),
+                Err(e) if e.contains("已有扫描") => {
+                    http_res(&mut stream, 409, "Conflict", &format!("{{\"error\":\"{}\"}}", e))
+                }
+                Err(e) => http_res(&mut stream, 400, "Bad Request", &format!("{{\"error\":\"{}\"}}", e)),
+            }
+        }
+        ("GET", "/api/tree") => {
+            // 查询参数 path（percent-encoded），缺省回落到快照根
+            let qpath = head.path.split_once("?path=").map(|(_, v)| v).unwrap_or("");
+            let scan_state = app.state::<ScanState>();
+            let lower = if qpath.is_empty() {
+                state
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(String::from))
+                    .unwrap_or_default()
+                    .to_lowercase()
+            } else {
+                pct_decode(qpath).to_lowercase()
+            };
+            if lower.is_empty() {
+                http_res(&mut stream, 404, "Not Found", "{\"error\":\"no scan yet\"}");
+                return;
+            }
+            let g = scan_state.sizes.lock().unwrap_or_else(|e| e.into_inner());
+            let kids = tree_children(&g, &lower);
+            let items: Vec<serde_json::Value> = kids
+                .iter()
+                .map(|(p, s, al)| serde_json::json!({"path": p, "s": s, "al": al}))
+                .collect();
+            let total = g.get(&lower).map(|v| v.0).unwrap_or(0);
+            let body = serde_json::json!({
+                "path": lower,
+                "total": total,
+                "children": items,
+                "note": "路径为小写；监视中的增量变化可能未反映",
+            });
+            http_res(&mut stream, 200, "OK", &body.to_string());
+        }
+        ("GET", "/api/scan") => {
+            let g = state.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_ref() {
+                Some(s) => http_res(&mut stream, 200, "OK", s),
+                None => http_res(&mut stream, 404, "Not Found", "{\"error\":\"no scan yet\"}"),
+            }
+        }
+        ("GET", "/api/proposal") => {
+            let g = state.proposal.lock().unwrap_or_else(|e| e.into_inner());
+            let v = g.clone().unwrap_or(serde_json::json!({"status": "none"}));
+            http_res(&mut stream, 200, "OK", &v.to_string());
+        }
+        ("POST", "/api/proposal") => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+            let mut v = match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    http_res(&mut stream, 400, "Bad Request", &format!("{{\"error\":\"invalid json: {}\"}}", e));
+                    return;
+                }
+            };
+            let items_ok = v.get("items").and_then(|i| i.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+            if !items_ok {
+                http_res(&mut stream, 400, "Bad Request", "{\"error\":\"items must be a non-empty array\"}");
+                return;
+            }
+            let id = format!(
+                "p{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), serde_json::json!(id));
+                o.insert("status".into(), serde_json::json!("pending"));
+                o.insert("results".into(), serde_json::json!([]));
+            }
+            match try_set_proposal(&state, v.clone()) {
+                Ok(()) => {
+                    let _ = app.emit("ai-proposal", &v);
+                    http_res(&mut stream, 200, "OK", &format!("{{\"id\":\"{}\"}}", id));
+                }
+                Err(e) => http_res(&mut stream, 409, "Conflict", &format!("{{\"error\":\"{}\"}}", e)),
+            }
+        }
+        _ => http_res(&mut stream, 404, "Not Found", "{\"error\":\"unknown endpoint\"}"),
+    }
+}
+
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// 后台 HTTP 服务：绑定 127.0.0.1 随机端口，thread-per-connection（本机低流量）
+fn run_ai_channel(app: AppHandle) {
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(_) => return, // 端口绑定失败：通道不可用，应用其余功能不受影响
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let token = app.state::<AiChannelState>().token.clone();
+    app.state::<AiChannelState>()
+        .port
+        .store(port as usize, Ordering::Relaxed);
+    // dev 日志可见（tauri dev 的 stderr），方便用 curl 联调；发布版无控制台输出
+    eprintln!(
+        "[disklens] AI channel listening: http://127.0.0.1:{} (token: {})",
+        port, token
+    );
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let app2 = app.clone();
+        let token = token.clone();
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            handle_ai_conn(&app2, stream, &token);
+        });
+    }
+}
+
+#[tauri::command]
+fn ai_snapshot(state: State<'_, AiChannelState>, json: String) -> Result<(), String> {
+    *state.snapshot.lock().map_err(|e| e.to_string())? = Some(json);
+    Ok(())
+}
+
+#[tauri::command]
+fn ai_channel_info(state: State<'_, AiChannelState>) -> serde_json::Value {
+    serde_json::json!({
+        "port": state.port.load(Ordering::Relaxed) as u64,
+        "token": state.token,
+        "enabled": state.enabled.load(Ordering::Relaxed),
+    })
+}
+
+#[tauri::command]
+fn ai_channel_set_enabled(state: State<'_, AiChannelState>, enabled: bool) {
+    state.enabled.store(enabled, Ordering::Relaxed);
+}
+
+/// 前端在提案处理完（执行完毕 / 用户忽略）后回写终态，供 AI 轮询
+#[tauri::command]
+fn ai_proposal_result(
+    state: State<'_, AiChannelState>,
+    id: String,
+    status: String,
+    results: serde_json::Value,
+) -> Result<(), String> {
+    let mut g = state.proposal.lock().map_err(|e| e.to_string())?;
+    if let Some(p) = g.as_mut() {
+        if p.get("id").and_then(|i| i.as_str()) == Some(id.as_str()) {
+            if let Some(o) = p.as_object_mut() {
+                o.insert("status".into(), serde_json::json!(status));
+                o.insert("results".into(), results);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1531,11 +2317,16 @@ fn migrate_stop(state: State<'_, MigrateState>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 后台拉起（自动更新重启/开机自启快捷方式带参）时不抢前台焦点
+    if std::env::args().any(|a| a == "--no-focus") {
+        NO_FOCUS.store(true, Ordering::Relaxed);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(ScanState::default())
         .manage(MigrateState::default())
         .manage(WatchState::default())
+        .manage(AiChannelState::new())
         .invoke_handler(tauri::generate_handler![
             scan_start,
             scan_stop,
@@ -1543,6 +2334,13 @@ pub fn run() {
             scan_status,
             open_in_explorer,
             list_volumes,
+            save_text_file,
+            show_window,
+            relaunch_no_focus,
+            ai_snapshot,
+            ai_channel_info,
+            ai_channel_set_enabled,
+            ai_proposal_result,
             migrate_check,
             migrate_start,
             migrate_stop,
@@ -1557,6 +2355,10 @@ pub fn run() {
                 app.handle().plugin(tauri_plugin_process::init())?;
                 app.handle().plugin(tauri_plugin_dialog::init())?;
             }
+            // AI 联动通道：本地 127.0.0.1 随机端口的迷你 HTTP 服务（仅桌面端有意义；
+            // 端口/token 通过 ai_channel_info 给前端展示）
+            let handle = app.handle().clone();
+            std::thread::spawn(move || run_ai_channel(handle));
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -1583,16 +2385,140 @@ mod tests {
             parent: r"C:\".into(),
             name: "Users".into(),
             size: 123,
+            al: 130,
             done: true,
             file: false,
+            dup: true,
+            cloud: false,
+            denied: false,
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["path"], r"C:\Users");
         assert_eq!(v["parent"], r"C:\");
         assert_eq!(v["name"], "Users");
         assert_eq!(v["size"], 123);
+        assert_eq!(v["al"], 130);
         assert_eq!(v["done"], true);
         assert_eq!(v["file"], false);
+        // 标记字段按需序列化：true 必须出现，false 省略（省 IPC 流量）
+        assert_eq!(v["dup"], true);
+        assert!(v.get("cloud").is_none());
+        assert!(v.get("denied").is_none());
+    }
+
+    #[test]
+    fn approx_alloc_rounds_to_cluster() {
+        // 普通文件按簇取整
+        assert_eq!(approx_alloc(1, 4096, 0), 4096);
+        assert_eq!(approx_alloc(4096, 4096, 0), 4096);
+        assert_eq!(approx_alloc(4097, 4096, 0), 8192);
+        // 压缩 / 稀疏文件不取整（真实占用拿不到，逻辑大小是更近的近似）
+        assert_eq!(approx_alloc(3000, 4096, FILE_ATTRIBUTE_COMPRESSED), 3000);
+        assert_eq!(approx_alloc(7000, 4096, FILE_ATTRIBUTE_SPARSE_FILE), 7000);
+        // 云占位独立于 approx_alloc 判定，这里只看普通/压缩两分支
+        assert_eq!(approx_alloc(0, 4096, 0), 0);
+        assert_eq!(approx_alloc(123, 0, 0), 123); // 无簇大小信息时退化为逻辑大小
+    }
+
+    #[test]
+    fn cloud_placeholder_detects_recall_bits() {
+        assert!(is_cloud_placeholder(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS));
+        assert!(is_cloud_placeholder(FILE_ATTRIBUTE_RECALL_ON_OPEN));
+        assert!(is_cloud_placeholder(
+            FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_ARCHIVE
+        ));
+        assert!(!is_cloud_placeholder(FILE_ATTRIBUTE_ARCHIVE));
+        assert!(!is_cloud_placeholder(0));
+    }
+
+    #[test]
+    fn ai_http_parse_head_and_host_check() {
+        let h = parse_head("POST /api/proposal HTTP/1.1\r\nHost: 127.0.0.1:8431\r\n\
+                           X-DiskLens-Token: abc123\r\nContent-Length: 42\r\n\r\n")
+            .expect("合法请求头应解析成功");
+        assert_eq!(h.method, "POST");
+        assert_eq!(h.path, "/api/proposal");
+        assert_eq!(req_header(&h, "host"), Some("127.0.0.1:8431"));
+        assert_eq!(req_header(&h, "x-disklens-token"), Some("abc123")); // 头部名小写化
+        assert_eq!(req_header(&h, "content-length"), Some("42"));
+        assert!(parse_head("garbage").is_none());
+        assert!(parse_head("GET ftp://x HTTP/1.1\r\n\r\n").is_none()); // 路径必须以 / 开头
+        // Host 白名单：本机放行，外域拒（防 DNS rebinding）
+        assert!(host_allowed("127.0.0.1:8431"));
+        assert!(host_allowed("localhost"));
+        assert!(host_allowed("[::1]:9000"));
+        assert!(!host_allowed("evil.example.com"));
+        assert!(!host_allowed(""));
+    }
+
+    #[test]
+    fn ai_token_is_long_and_changes() {
+        let a = gen_token();
+        let b = gen_token();
+        assert_eq!(a.len(), 32); // 2 × u64 hex
+        assert_ne!(a, b);        // 同纳秒窗口内也因 RandomState 种子不同而互异
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn ai_tree_children_direct_layer_only() {
+        let mut m: HashMap<String, (u64, u64)> = HashMap::new();
+        m.insert("c:\\a".into(), (100, 110));
+        m.insert("c:\\a\\b".into(), (60, 66));          // 直接子层
+        m.insert("c:\\a\\b\\deep".into(), (10, 11));     // 更深层：不下钻
+        m.insert("c:\\a\\c".into(), (40, 44));           // 直接子层
+        m.insert("c:\\ab".into(), (999, 999));           // 前缀相似但非子目录：排除
+        m.insert("c:\\x".into(), (1, 1));
+        let kids = tree_children(&m, "c:\\a");
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].0, "c:\\a\\b");               // 按大小降序
+        assert_eq!(kids[0].1, 60);
+        assert_eq!(kids[1].0, "c:\\a\\c");
+        // 尾部反斜杠的输入归一化
+        assert_eq!(tree_children(&m, "c:\\a\\").len(), 2);
+        // 盘根（ trim 后为 "c:"，前缀 "c:\\" ）
+        let root_kids = tree_children(&m, "c:\\");
+        assert_eq!(root_kids.len(), 3);                  // a / ab / x
+    }
+
+    #[test]
+    fn ai_pct_decode_paths() {
+        assert_eq!(pct_decode("c%3A%5Cusers%5Cdemo"), "c:\\users\\demo");
+        assert_eq!(pct_decode("c:\\plain"), "c:\\plain");   // 未编码原样通过
+        assert_eq!(pct_decode("a%2"), "a%2");               // 非法序列不吞字符
+        assert_eq!(pct_decode("%E4%B8%AD"), "中");           // UTF-8 百分号编码
+    }
+
+    #[test]
+    fn ai_proposal_rejects_second_pending() {
+        let st = AiChannelState::new();
+        let p1 = serde_json::json!({"id":"p1","items":[{"action":"migrate","src":"C:\\x"}],"status":"pending"});
+        assert!(try_set_proposal(&st, p1).is_ok());
+        // pending 未处理时新提案被拒（409 语义）
+        let p2 = serde_json::json!({"id":"p2","items":[{"action":"note","src":"C:\\y"}],"status":"pending"});
+        assert!(try_set_proposal(&st, p2).is_err());
+        // 终态后可再提交
+        let done = serde_json::json!({"id":"p1","items":[],"status":"done","results":[]});
+        *st.proposal.lock().unwrap() = Some(done);
+        let p3 = serde_json::json!({"id":"p3","items":[{"action":"note","src":"C:\\z"}],"status":"pending"});
+        assert!(try_set_proposal(&st, p3).is_ok());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn file_identity_and_cluster_probe_work() {
+        // 用本仓库 Cargo.toml 当样本：真实 Win32 路径验证句柄查询与簇大小
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let id = file_identity(&p).expect("FILE_READ_ATTRIBUTES 句柄打开失败");
+        assert!(id.alloc > 0, "AllocationSize 应 > 0");
+        assert!(id.links >= 1);
+        assert!(id.id.0 != 0, "卷序列号非零");
+        // 同一文件二次查询身份与占用一致
+        let id2 = file_identity(&p).unwrap();
+        assert_eq!(id.id, id2.id);
+        assert_eq!(id.alloc, id2.alloc);
+        let c = cluster_for("C:\\");
+        assert!(c > 0 && (c & (c - 1)) == 0, "簇大小应为 2 的幂，实际 {}", c);
     }
 
     #[test]
@@ -1648,6 +2574,8 @@ mod tests {
             depth: 48,
             remaining: AtomicUsize::new(0),
             size: Mutex::new(0),
+            alloc: Mutex::new(0),
+            denied: AtomicBool::new(false),
             iter_done: AtomicBool::new(false),
             parent,
         })
@@ -1655,39 +2583,44 @@ mod tests {
 
     #[test]
     fn settle_propagates_totals_up_the_chain() {
-        let sizes: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+        let sizes: Mutex<HashMap<String, (u64, u64)>> = Mutex::new(HashMap::new());
         let root = dstate("C:\\r", None);
         let child = dstate("C:\\r\\c", Some(root.clone()));
         // 父目录有一个未完成的子目录任务
         root.remaining.store(1, Ordering::Relaxed);
         // 子目录完成（体积 100）→ 上缴父目录；但父目录还没读完目录项 → 不级联
-        let r = settle(&child, 100, &sizes);
+        let r = settle(&child, 100, 110, &sizes);
         assert!(r.is_none(), "父目录 iter_done=false 不应级联");
         assert_eq!(*root.size.lock().unwrap(), 100);
+        assert_eq!(*root.alloc.lock().unwrap(), 110);
         assert_eq!(root.remaining.load(Ordering::Relaxed), 0);
-        assert_eq!(sizes.lock().unwrap().get("c:\\r\\c"), Some(&100));
+        assert_eq!(sizes.lock().unwrap().get("c:\\r\\c"), Some(&(100, 110)));
         // 父目录自己读完（自带 5 字节文件，总计 105）→ 级联条件满足但自身是根 → 返回 None
         root.iter_done.store(true, Ordering::Relaxed);
-        let r = settle(&root, 105, &sizes);
+        let r = settle(&root, 105, 115, &sizes);
         assert!(r.is_none(), "根目录没有父级");
-        assert_eq!(sizes.lock().unwrap().get("c:\\r"), Some(&105));
+        assert_eq!(sizes.lock().unwrap().get("c:\\r"), Some(&(105, 115)));
     }
 
     #[test]
     fn settle_cascades_when_parent_ready() {
-        let sizes: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+        let sizes: Mutex<HashMap<String, (u64, u64)>> = Mutex::new(HashMap::new());
         let root = dstate("C:\\p", None);
         let mid = dstate("C:\\p\\m", Some(root.clone()));
         let leaf = dstate("C:\\p\\m\\l", Some(mid.clone()));
         mid.remaining.store(1, Ordering::Relaxed);
         mid.iter_done.store(true, Ordering::Relaxed);
         // 叶子完成 → mid 减到 0 且已读完 → 级联返回 mid（总价 7 = 自身 0 + 叶子 7）
-        let r = settle(&leaf, 7, &sizes);
-        assert_eq!(r.map(|(s, t)| (s.path.clone(), t)), Some(("C:\\p\\m".into(), 7)));
+        let r = settle(&leaf, 7, 8, &sizes);
+        assert_eq!(
+            r.map(|(s, t, a)| (s.path.clone(), t, a)),
+            Some(("C:\\p\\m".into(), 7, 8))
+        );
         // mid 再完成 → 上缴 root；root 未读完 → None
-        let r = settle(&mid, 7, &sizes);
+        let r = settle(&mid, 7, 8, &sizes);
         assert!(r.is_none());
         assert_eq!(*root.size.lock().unwrap(), 7);
+        assert_eq!(*root.alloc.lock().unwrap(), 8);
         assert_eq!(mid.remaining.load(Ordering::Relaxed), 0);
     }
 }

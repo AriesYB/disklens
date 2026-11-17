@@ -28,7 +28,7 @@ serde_json = "1"
 
 # 枚举本地卷（盘符/文件系统/剩余空间）供迁移目标选择
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 # 应用内自动更新（检查/下载/安装签名更新包）+ 更新后重启 + 原生文件夹选择；仅桌面端
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]

@@ -98,7 +98,11 @@ function getCell(kk){
       t.style.top=(ev.clientY+14)+'px';
       var fp=n.agg?('聚合 '+n.agg+' 个极小/未扫完项'):(el.__path||n.p||'');
       t.innerHTML='<div style="color:#9fd1ff;word-break:break-all">'+esc(fp)+'</div><b>'+fmt(n.raw!=null?n.raw:n.s)+'</b>'+
+        (n.f?'':'<span style="color:#aaa"> · 占用 '+fmt((n.al!=null)?n.al:n.s)+'</span>')+
+        (n.cloud?'<span style="color:#7fc7ff"> ☁ 云端占位</span>':'')+
+        (n.dup?'<span style="color:#b8c4d4"> ⛓ 硬链接副本（已在他处计数）</span>':'')+
         (n.f?'<span style="color:#888"> · 文件</span>':'<span style="color:#888"> · 目录 · 单击展开/收起 · 双击进入</span>')+
+        (n.denied?'<br><span style="color:#ffd479">⛔ 无权限：体积只含已读到的部分</span>':'')+
         (n.done?'':'<br><span style="color:#ffd479">counting...</span>')+
         '<br><span style="color:#888">右键：'+(n.f?'打开所在文件夹':'更多操作')+'</span>';
     });
@@ -187,7 +191,8 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     var availH=h0-stripH;
     if(availH<10){ break; }
     var k=(w0*availH)/goodSum;
-    var px=main.map(function(it,i2){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,idx:i2}; });
+    var px=main.map(function(it,i2){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,
+      al:it.al,dup:!!it.dup,cloud:!!it.cloud,denied:!!it.denied,idx:i2}; });
     out=[]; squarify(px,x0,y0,w0,availH,out);
     var bad=false, keep={};
     for(var b=0;b<out.length;b++){
@@ -218,7 +223,8 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
     return;
   }
   var k=(w0*availH)/goodSum;
-  var px=main.map(function(it){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c}; });
+  var px=main.map(function(it){ return {n:it.n,s:lsOf(it)*k,raw:it.s,p:it.p,f:it.f,done:it.done,c:it.c,
+    al:it.al,dup:!!it.dup,cloud:!!it.cloud,denied:!!it.denied}; });
   out=[]; squarify(px,x0,y0,w0,availH,out);
   var depth=stack.length;
   var sep=(keyBase.charAt(keyBase.length-1)==='\\')?'':'\\';

@@ -91,7 +91,10 @@
         }
       }).then(function () {
         $('upd-stage').textContent = '更新完成，正在重启…';
-        window.__TAURI__.process.relaunch().catch(function () {});
+        // 自定义重启：新进程带 --no-focus，窗口回来时不抢用户正在用的前台应用
+        window.__TAURI__.core.invoke('relaunch_no_focus').catch(function () {
+          window.__TAURI__.process.relaunch().catch(function () {});
+        });
       }).catch(function (e) {
         installing = false;
         $('upd-stage').textContent = '';

@@ -35,20 +35,29 @@ function renderList(node){
   html+='<div class="l-head">'+
     '<div class="th" data-sort="name">名称'+sortArrow('name')+'</div>'+
     '<div class="th rt" data-sort="size">大小'+sortArrow('size')+'</div>'+
+    '<div class="th rt">占用</div>'+
     '<div class="th">占比</div>'+
     '<div class="th">状态</div></div>';
   for(var j=0;j<items.length;j++){
     var it=items[j];
     var pct=(tot>0&&it.s>0)?(it.s/tot*100):0;
+    // 状态列：受限目录 / 云占位 / 硬链接副本优先于普通就绪标记
+    var st = !it.done ? '⟳ 统计中'
+      : it.denied ? '⛔ 受限'
+      : it.cloud ? '☁ 云端'
+      : it.dup ? '⛓ 硬链接'
+      : '✓ 就绪';
+    var stColor = it.denied ? 'var(--amber)' : it.cloud ? '#7fc7ff' : '';
     html+='<div class="l-row'+(it.done?' done':' counting')+(selectedRow===it.p?' sel':'')+'"'+
       ' data-path="'+escAttr(it.p)+'" data-kind="'+(it.f?'file':'dir')+'">'+
       '<div class="l-name"><span class="ic '+(it.f?'ic-file">📄':'ic-dir">📁')+'</span>'+
       '<span class="nm" title="'+escAttr(it.p)+'">'+esc(it.n)+'</span></div>'+
       '<div class="l-size">'+fmt(it.s)+'</div>'+
+      '<div class="l-al" title="磁盘占用：簇对齐后的实际占用；云占位文件为 0，硬链接副本不重复计">'+fmt(alOf(it))+'</div>'+
       '<div class="l-pct"><div class="l-track"><div class="l-fill" style="width:'+
         Math.min(100,pct).toFixed(1)+'%"></div></div>'+
       '<span class="pv">'+(pct>0?pct.toFixed(1):'0')+'%</span></div>'+
-      '<div class="l-st">'+(it.done?'✓ 就绪':'⟳ 统计中')+'</div></div>';
+      '<div class="l-st"'+(stColor?' style="color:'+stColor+'"':'')+'>'+st+'</div></div>';
   }
   box.innerHTML=html;
 }
@@ -91,38 +100,71 @@ function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
   });
 })();
 
-/* ===== 大文件榜 ===== */
-function renderFiles(){
-  var box=document.getElementById('files');
-  if(!box) return;
+/* ===== 大文件榜（含名称搜索：无通配符=子串匹配；* ? 通配；搜索时目录名也参与） ===== */
+var fileSearch = '';       // 当前搜索词（'' = 不过滤，纯大文件榜）
+var fileSearchTimer = null;
+
+// 名称匹配：不含 * ? → 子串不区分大小写；含则按通配转正则
+function nameMatches(q, name){
+  var n = name.toLowerCase(), p = q.toLowerCase();
+  if(q.indexOf('*')<0 && q.indexOf('?')<0) return n.indexOf(p)>=0;
+  var rx = new RegExp('^'+p.replace(/[.+^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/\?/g,'.')+'$');
+  return rx.test(n);
+}
+
+// 当前榜单数据集：无搜索 = 全部 ≥1MB 大文件；有搜索 = 命中的大文件 + 命中的目录（按大小降序）
+function filesPool(){
   var arr=[];
   fileIndex.forEach(function(n){ if(n.s>=BIG_FILE_MIN) arr.push(n); });
+  if(fileSearch){
+    var out=arr.filter(function(n){ return nameMatches(fileSearch, n.n); });
+    store.forEach(function(n){
+      if(!n.f && n.s>0 && nameMatches(fileSearch, n.n)) out.push(n);   // 目录也参与：node_modules 猎手
+    });
+    arr=out;
+  }
   arr.sort(function(a,b){ return b.s-a.s; });
-  var html='<div class="f-meta">共 <b>'+arr.length+'</b> 个 ≥1MB 的大文件'+
-    (scanning?' · 实时更新中':'')+'</div>';
+  return arr;
+}
+
+function renderFiles(){
+  var box=document.getElementById('files-body');
+  if(!box) return;
+  var arr=filesPool();
+  var cnt=document.getElementById('file-search-count');
+  if(cnt) cnt.textContent = fileSearch
+    ? '匹配 '+arr.length+' 项'+(scanning?' · 实时更新中':'')
+    : '共 '+arr.length+' 个 ≥1MB 大文件'+(scanning?' · 实时更新中':'');
+  var html='<div class="f-meta">'+(fileSearch
+    ? '搜索「'+esc(fileSearch)+'」命中 <b>'+arr.length+'</b> 项（大文件 + 目录名匹配）'
+    : '共 <b>'+arr.length+'</b> 个 ≥1MB 的大文件')+'</div>';
   if(!arr.length){
     html+='<div class="empty"><div class="e-ic">📦</div><div>'+
-      (scanning?'扫描中，发现大文件后自动上榜':'本次扫描未发现 ≥1MB 的大文件')+'</div></div>';
+      (fileSearch?'没有匹配「'+esc(fileSearch)+'」的文件或目录（搜索范围：已入索引的大文件与全部目录）'
+      :(scanning?'扫描中，发现大文件后自动上榜':'本次扫描未发现 ≥1MB 的大文件'))+'</div></div>';
     box.innerHTML=html;
     return;
   }
   var shown=arr.slice(0,FILES_MAX_ROWS);
-  html+='<div class="f-head"><div>#</div><div>文件名</div><div class="f-fsize" style="text-align:right">大小</div>'+
-    '<div>所在目录</div><div></div></div>';
+  html+='<div class="f-head"><div>#</div><div>名称</div><div class="f-fsize" style="text-align:right">大小</div>'+
+    '<div>所在位置</div><div></div></div>';
   for(var i=0;i<shown.length;i++){
     var n=shown[i];
-    var dir=parentPathOf(n.p);
-    html+='<div class="f-row'+(i<3?' r'+(i+1):'')+'" data-path="'+escAttr(n.p)+'" data-parent="'+escAttr(dir)+'">'+
+    var isDir=!n.f;
+    var loc=parentPathOf(n.p);
+    html+='<div class="f-row'+(i<3?' r'+(i+1):'')+'" data-path="'+escAttr(n.p)+'" data-parent="'+escAttr(loc)+'"'+
+      ' data-kind="'+(isDir?'dir':'file')+'">'+
       '<div class="f-rank">'+(i+1)+'</div>'+
-      '<div class="f-file"><span class="ic ic-file">📄</span><span class="nm" title="'+escAttr(n.p)+'">'+esc(n.n)+'</span></div>'+
+      '<div class="f-file"><span class="ic '+(isDir?'ic-dir">📁':'ic-file">📄')+'</span>'+
+      '<span class="nm" title="'+escAttr(n.p)+'">'+esc(n.n)+'</span></div>'+
       '<div class="f-fsize">'+fmt(n.s)+'</div>'+
-      '<div class="f-dir" title="'+escAttr(dir)+'">'+esc(dir)+'</div>'+
+      '<div class="f-dir" title="'+escAttr(n.p)+'">'+esc(loc)+'</div>'+
       '<div class="f-act"><button class="icon-btn act-open">📂 定位</button>'+
       '<button class="icon-btn act-copy">📋 复制</button></div></div>';
   }
   if(arr.length>shown.length){
     html+='<div class="f-meta">（仅显示前 '+FILES_MAX_ROWS+' 个，其余 '+
-      (arr.length-shown.length)+' 个已省略）</div>';
+      (arr.length-shown.length)+' 个已省略，导出 CSV 含全部结果）</div>';
   }
   box.innerHTML=html;
 }
@@ -132,8 +174,25 @@ function parentPathOf(p){
   return idx===2 ? p.slice(0,3) : p.slice(0,idx);   // 'C:\x' 的父是 'C:\'
 }
 
+/* 设置搜索词（类型视图钻取联动用）并刷新 */
+function setFileSearch(q){
+  fileSearch=q||'';
+  var inp=document.getElementById('file-search');
+  if(inp && inp.value!==fileSearch) inp.value=fileSearch;
+  renderFiles();
+}
+
 (function initFilesView(){
   var box=document.getElementById('files');
+  // 搜索框：150ms 防抖（静态 DOM 不随榜单重渲染重建，焦点不丢）
+  var inp=document.getElementById('file-search');
+  if(inp) inp.addEventListener('input',function(){
+    clearTimeout(fileSearchTimer);
+    var v=this.value.trim();
+    fileSearchTimer=setTimeout(function(){ fileSearch=v; renderFiles(); },150);
+  });
+  var exp=document.getElementById('files-export');
+  if(exp) exp.addEventListener('click',function(){ exportFilesCSV(); });   // 定义在 main.js，运行时解析
   box.addEventListener('click',function(ev){
     var row=ev.target.closest('.f-row');
     if(!row) return;
@@ -145,6 +204,7 @@ function parentPathOf(p){
   box.addEventListener('dblclick',function(ev){
     var row=ev.target.closest('.f-row');
     if(!row) return;
+    if(row.dataset.kind==='dir'){ navigate(row.dataset.path); return; }   // 目录行：进入
     var parent=row.dataset.parent;
     if(parent){ setView('list'); navigate(parent); }
   });
@@ -152,6 +212,72 @@ function parentPathOf(p){
     var row=ev.target.closest('.f-row');
     if(!row) return;
     ev.preventDefault();
-    openContextMenu(ev,row.dataset.path,true);
+    openContextMenu(ev,row.dataset.path,row.dataset.kind!=='dir');
   });
+})();
+
+/* ===== 类型统计视图：扩展名聚合（数据源 = 大文件榜同一索引；真实扫描口径 ≥10MB） ===== */
+function extOf(name){
+  var idx=name.lastIndexOf('.');
+  if(idx<=0||idx===name.length-1) return '';
+  return name.slice(idx+1).toLowerCase();
+}
+function typesPool(){
+  var m=new Map();   // ext -> {ext,n,s,al}
+  fileIndex.forEach(function(f){
+    if(f.s<BIG_FILE_MIN) return;
+    var e=extOf(f.n)||'（无扩展名）';
+    var t=m.get(e);
+    if(!t){ t={ext:e,n:0,s:0,al:0}; m.set(e,t); }
+    t.n++; t.s+=f.s; t.al+=alOf(f);
+  });
+  var arr=[];
+  m.forEach(function(t){ arr.push(t); });
+  arr.sort(function(a,b){ return b.s-a.s; });
+  return arr;
+}
+function renderTypes(){
+  var box=document.getElementById('types-body');
+  if(!box) return;
+  var arr=typesPool();
+  var meta=document.getElementById('types-meta');
+  if(meta) meta.innerHTML = arr.length
+    ? '<b>'+arr.length+'</b> 种类型 · <b>'+arr.reduce(function(a,t){return a+t.n;},0).toLocaleString()+'</b> 个文件 · 单击行查看该类型文件'
+    : '暂无类型数据（扫描开始后自动聚合）';
+  if(!arr.length){
+    box.innerHTML='<div class="t-empty">'+(scanning?'扫描中…':'先扫描，类型分布自动聚合')+'</div>';
+    return;
+  }
+  var tot=0; for(var q=0;q<arr.length;q++) tot+=arr[q].s;
+  var html='<div class="t-head"><div>类型</div><div class="rt">文件数</div>'+
+    '<div class="rt">大小</div><div class="rt">占用</div><div>占比</div></div>';
+  for(var i=0;i<arr.length;i++){
+    var t=arr[i];
+    var pct=tot>0?(t.s/tot*100):0;
+    html+='<div class="t-row" data-ext="'+escAttr(t.ext)+'">'+
+      '<div class="t-ext"><span class="sw" style="background:'+colors(i)+'"></span>'+esc(t.ext)+'</div>'+
+      '<div class="t-num">'+t.n.toLocaleString()+'</div>'+
+      '<div class="t-num">'+fmt(t.s)+'</div>'+
+      '<div class="t-num">'+fmt(t.al)+'</div>'+
+      '<div class="l-pct"><div class="l-track"><div class="l-fill" style="width:'+
+        Math.min(100,pct).toFixed(1)+'%"></div></div>'+
+      '<span class="pv">'+(pct>0?pct.toFixed(1):'0')+'%</span></div></div>';
+  }
+  box.innerHTML=html;
+}
+
+(function initTypesView(){
+  var box=document.getElementById('types-body');
+  box.addEventListener('click',function(ev){
+    var row=ev.target.closest('.t-row');
+    if(!row) return;
+    var e=row.dataset.ext;
+    if(!e) return;
+    if(e==='（无扩展名）'){ setView('files'); setFileSearch(''); return; }
+    // 类型 → 文件联动：预填 *.ext 搜索并切到大文件榜
+    setView('files');
+    setFileSearch('*.'+e);
+  });
+  var exp=document.getElementById('types-export');
+  if(exp) exp.addEventListener('click',function(){ exportTypesCSV(); });
 })();
