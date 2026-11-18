@@ -25,6 +25,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 全量历史 + tags；浅克隆取不到 tag 附注，更新弹窗说明会退化
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -58,6 +60,7 @@ jobs:
       - name: 生成更新清单（说明取自 tag 附注）
         shell: bash
         run: |
+          git fetch origin --tags --force   # 确保附注 tag 对象在本地（checkout 浅时兜底）
           TAG_MSG="$(git tag -l --format='%(contents)' ${{ github.ref_name }} | head -1)"
           if [ -z "$TAG_MSG" ]; then TAG_MSG="性能优化与问题修复。"; fi
           node scripts/gen-updater-manifest.mjs "$TAG_MSG"
