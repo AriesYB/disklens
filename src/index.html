@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/styles.css?v=0.22" />
+    <link rel="stylesheet" href="/styles.css?v=0.23" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DiskLens 盘析 — 看清每一寸磁盘</title>
   </head>
@@ -26,7 +26,25 @@
         <button class="seg" data-view="list">列表视图</button>
         <button class="seg" data-view="files">大文件榜</button>
         <button class="seg" data-view="types">类型统计</button>
+        <button class="seg" data-view="diff">历史对比</button>
       </nav>
+      <span id="expand-ctl" title="自动展开控制（两个条件可任选，同时启用时需都满足）：占比限制多大的子目录才展开；深度限制最多展开几层。手动单击展开不受限">
+        <span class="ec-lab">自动展开</span>
+        <select id="expand-pct">
+          <option value="">占比不限</option>
+          <option value="0.05">≥5%</option>
+          <option value="0.1" selected>≥10%</option>
+          <option value="0.2">≥20%</option>
+          <option value="0.3">≥30%</option>
+        </select>
+        <select id="expand-depth">
+          <option value="">深度不限</option>
+          <option value="1">1 层</option>
+          <option value="2">2 层</option>
+          <option value="3" selected>3 层</option>
+          <option value="5">5 层</option>
+        </select>
+      </span>
       <span id="summary"></span>
     </div>
 
@@ -49,6 +67,13 @@
           <button id="types-export" title="导出类型统计为 CSV">📤 导出 CSV</button>
         </div>
         <div id="types-body"></div>
+      </div>
+      <div id="diff">
+        <div id="diff-bar">
+          <span id="diff-meta"></span>
+          <button id="diff-export" title="导出对比结果为 CSV">📤 导出 CSV</button>
+        </div>
+        <div id="diff-body"></div>
       </div>
       <div id="wait"><div><div class="spin"></div><div style="margin-top:12px">等待扫描开始…</div></div></div>
     </main>
@@ -89,6 +114,7 @@
       <div class="sep"></div>
       <div class="mi" id="mi-enter"><span class="ic">↯</span><span>进入此目录</span></div>
       <div class="mi" id="mi-expand"><span class="ic">⊞</span><span id="mi-expand-t">展开</span></div>
+      <div class="mi" id="mi-rescan"><span class="ic">⟳</span><span>重新扫描此目录</span></div>
       <div class="mi" id="mi-migrate"><span class="ic">📦</span><span>迁移此目录（junction）…</span></div>
       <div class="mi" id="mi-ai"><span class="ic">🤖</span><span>AI 辅助迁移 / 清理（c-relocator）…</span></div>
     </div>
@@ -159,7 +185,7 @@
         </div>
         <div class="about-foot">
           <button id="about-check" class="primary">⟳ 检查更新</button>
-          <span class="about-privacy">纯本地只读分析 · 不上传任何数据 · 联网仅用于检查更新</span>
+          <span class="about-privacy">纯本地只读分析 · 不上传任何数据 · 联网仅用于检查更新 · AI 通道仅限本机访问</span>
         </div>
         <div class="about-copy">© 2026 AriesYB · <a id="about-site">ikanp.top</a></div>
       </div>
@@ -202,18 +228,19 @@
         <div id="mig-actions">
           <button id="mig-start" class="primary" disabled>检查中…</button>
           <button id="mig-stop" style="display:none">停止</button>
+          <button id="mig-undo" style="display:none" title="验证相关软件可用后，可一键撤销：删 junction 并把数据搬回原位">↩ 撤销迁移</button>
           <button id="mig-rescan" style="display:none">重新扫描</button>
           <button id="mig-cancel">关闭</button>
         </div>
       </div>
     </div>
 
-    <script src="/treemap.js?v=0.18"></script>
+    <script src="/treemap.js?v=0.20"></script>
     <script src="/listview.js?v=0.13"></script>
-    <script src="/migrate.js?v=0.13"></script>
-    <script src="/aiassist.js?v=0.15"></script>
-    <script src="/main.js?v=0.20"></script>
+    <script src="/migrate.js?v=0.14"></script>
+    <script src="/aiassist.js?v=0.16"></script>
+    <script src="/main.js?v=0.25"></script>
     <script src="/about.js?v=0.13"></script>
-    <script src="/update.js?v=0.14"></script>
+    <script src="/update.js?v=0.15"></script>
   </body>
 </html>

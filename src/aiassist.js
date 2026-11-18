@@ -103,9 +103,9 @@ function renderAiPanel() {
         '在拿到通道数据前不要用 du/PowerShell 等自己扫盘）：\n' +
         '第 0 步·查状态：curl -s ' + hd + ' ' + base + '/api/status\n' +
         '  → {"scanning":…,"hasSnapshot":…,"root":"…"}\n' +
-        '  · hasSnapshot=false（还没扫过）：先触发扫描 curl -s -X POST ' + hd + ' -d \'{"root":"' +
-        String(window.ROOT || 'C:\\\\') + '"}\' ' + base + '/api/scan' +
-        '，之后每 5 秒轮询 /api/status 直到 scanning=false 且 hasSnapshot=true（大目录需几十秒到几分钟，期间向我播报进度）；\n' +
+        '  · hasSnapshot=false（还没扫过）：先触发扫描 curl -s -X POST ' + hd + ' -d \'{"roots":["' +
+        String((ROOTS[0] || 'C:\\\\')).replace(/\\\\$/, '') + '"}\' ' + base + '/api/scan' +
+        '（多盘齐扫可传多个，如 {"roots":["C:\\\\","D:\\\\"]}），之后每 5 秒轮询 /api/status 直到 scanning=false 且 hasSnapshot=true（大目录需几十秒到几分钟，期间向我播报进度）；\n' +
         '  · scanning=true（正在扫）：不要重复触发，轮询等它完成即可；\n' +
         '  · hasSnapshot=true 且 scanning=false：直接进第 1 步。\n' +
         '第 1 步·取数：curl -s ' + hd + ' ' + base + '/api/scan\n' +
@@ -280,6 +280,7 @@ function showProposal(p){
     return;
   }
   propData = p;
+  propResults = [];
   aiChEl('prop-summary').textContent = p.summary || '';
   aiChEl('prop-progress').textContent = '';
   aiChEl('prop-stop').style.display = 'none';
@@ -303,13 +304,19 @@ function renderProposal(){
     var size = node ? fmt(node.s) : (it.est_bytes ? fmt(it.est_bytes) : '');
     var cb = act==='migrate' ? '<input type="checkbox" class="pr-cb" data-i="'+i+'" checked>'
                              : '<span style="display:inline-block;width:13px"></span>';
+    var actBtns = '';
+    if (it.src) {
+      actBtns += '<button class="pr-loc" data-p="'+escAttr(it.src)+'">📂 定位</button>';
+      if (act==='cleanup') actBtns += '<button class="pr-recycle" data-i="'+i+'">🗑 移入回收站</button>';
+    }
     html+='<div class="pr-row">'
       +'<div class="pr-top">'+cb+badge
       +'<span class="pr-path" title="'+escAttr(it.src||'')+'">'+esc(it.src||'')+'</span>'
       +(size?'<span class="pr-size">'+size+'</span>':'')
-      +'<span class="pr-act">'+(act!=='migrate'&&it.src?'<button class="pr-loc" data-p="'+escAttr(it.src)+'">📂 定位</button>':'')+'</span>'
+      +'<span class="pr-act">'+actBtns+'</span>'
       +'</div><div class="pr-sub">'
       +(act==='migrate'&&it.dest_root?'<div>目标：<span class="dest">'+esc(it.dest_root)+'</span></div>':'')
+      +(act==='cleanup'?'<div class="reason">移入回收站后可自行还原；确认无问题再清空回收站</div>':'')
       +(it.reason?'<div class="reason">理由：'+esc(it.reason)+'</div>':'')
       +'</div><div class="pr-st" id="pr-st-'+i+'"></div></div>';
   }
@@ -350,9 +357,10 @@ function runProposal(){
     aiChEl('prop-close').disabled = false;
     propProg('完成：✓ '+doneN+' 成功 · ⛔ '+failN+' 失败'+(propAborted?' · 已手动停止':'')
       +'（结果已回传，AI 可经 /api/proposal 查询）');
-    if(feed.aiProposalResult) feed.aiProposalResult(propData.id, status, results);
-    // 迁移过的目录：建议重扫刷新视图
-    if(doneN>0) setStatus('AI 提案执行完毕（成功 '+doneN+' 项）——建议重新扫描','done');
+    // 整批执行结果 + 行级操作（回收站/撤销）累积结果一并回传
+    var all = results.concat(propResults);
+    if(feed.aiProposalResult) feed.aiProposalResult(propData.id, status, all);
+    if(doneN>0) setStatus('AI 提案执行完毕（成功 '+doneN+' 项），受影响目录已自动重扫','done');
   }
 
   (function next(){
@@ -378,8 +386,16 @@ function runProposal(){
           return;
         }
         if(ev.stage==='done'){
-          prSt(i,'ok','✓ 迁移完成（原位置已建 junction）');
+          prSt(i,'ok','✓ 迁移完成（原位置已建 junction）· 建议先验证相关软件可用，确认后再决定是否撤销');
+          // 完成行给出撤销入口（验证可用后可一键回迁；数据仍需人工确认才删）
+          var stEl = document.getElementById('pr-st-'+i);
+          if(stEl) stEl.innerHTML = '✓ 迁移完成 · 建议先验证相关软件可用 <button class="pr-undo" data-i="'+i+'" style="padding:2px 8px;font-size:11px;margin-left:6px">↩ 撤销迁移</button>';
           results.push({src:src,ok:true,dest:r.dest_path||dest});
+          // 迁移完成：局部重扫受影响目录（junction/目标两侧数据变化）
+          if(feed.scanRefresh){
+            feed.scanRefresh(src);
+            feed.scanRefresh(r.dest_path||dest);
+          }
           doneN++; k++; return next();
         }
         // error / aborted / locked
@@ -416,10 +432,66 @@ function closeProposal(reject){
     if(feed.migrateStop) feed.migrateStop();
   });
   aiChEl('prop-list').addEventListener('click', function(ev){
-    var b = ev.target.closest('button.pr-loc');
-    if(b && b.dataset.p) feed.open(b.dataset.p, true);
+    var loc = ev.target.closest('button.pr-loc');
+    if(loc && loc.dataset.p){ feed.open(loc.dataset.p, true); return; }
+    // 撤销迁移（行级）：验证相关软件没问题后，删 junction 并把数据搬回原位
+    var undo = ev.target.closest('button.pr-undo');
+    if(undo){
+      if(propRunning){ prSt(parseInt(undo.dataset.i,10)||0,'err','当前批次执行中，稍后再撤销'); return; }
+      var ui = parseInt(undo.dataset.i, 10);
+      var uit = (propData && propData.items) ? propData.items[ui] : null;
+      if(!uit || !uit.src || !uit.dest_root) return;
+      undo.disabled = true;
+      prSt(ui,'run','⟳ 撤销迁移中…');
+      window.__migHandler = function(ev){
+        var pct = ev.bytes_total>0 ? Math.round(ev.bytes_done/ev.bytes_total*100) : 100;
+        if(ev.stage==='copy'||ev.stage==='verify'||ev.stage==='switch'){
+          var ph = ev.stage==='copy'?'回移':(ev.stage==='verify'?'校验':'恢复目录');
+          prSt(ui,'run','⟳ 撤销·'+ph+'… '+pct+'%'+(ev.current?' · '+ev.current:''));
+          return;
+        }
+        if(ev.stage==='done'){
+          prSt(ui,'ok','↩ 撤销完成：数据已回到原位（目标侧已清理）');
+          resultsPush(propData.id, {src:uit.src, ok:true, action:'undo'});
+          if(feed.scanRefresh){ feed.scanRefresh(uit.src); feed.scanRefresh(uit.dest_root); }
+          window.__migHandler = null;
+          return;
+        }
+        var m2 = ev.message || ev.stage;
+        if(ev.locked && ev.locked.length) m2 += '（'+ev.locked.length+' 个文件被占用）';
+        prSt(ui,'err',(ev.stage==='aborted'?'⏹ ':'⛔ ')+m2);
+        resultsPush(propData.id, {src:uit.src, ok:false, error:'撤销：'+m2});
+        window.__migHandler = null;
+      };
+      feed.migrateUndo(uit.src, uit.dest_root);
+      return;
+    }
+    var rc = ev.target.closest('button.pr-recycle');
+    if(rc){
+      var i = parseInt(rc.dataset.i, 10);
+      var it = (propData && propData.items) ? propData.items[i] : null;
+      if(!it || !it.src || propRunning) return;
+      prSt(i,'run','⟳ 移入回收站…');
+      feed.recycleDelete([it.src], function(failed){
+        if(failed.length){ prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
+          resultsPush(propData.id, {src:it.src, ok:false, error:'回收站删除失败'}); }
+        else{
+          prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
+          resultsPush(propData.id, {src:it.src, ok:true, action:'recycled'});
+          if(feed.scanRefresh) feed.scanRefresh(it.src);
+          rc.disabled = true;
+        }
+      });
+    }
   });
 })();
+
+// 轻量结果追加：行级操作（回收站/撤销）即时回写——前端累积，整包发送（Rust 侧整包替换）
+var propResults = [];
+function resultsPush(id, item){
+  propResults.push(item);
+  if(feed.aiProposalResult) feed.aiProposalResult(id, 'pending', propResults);
+}
 
 // 浏览器模式 / 调试入口：模拟一条 AI 提案（与 POST /api/proposal 的 payload 同构）
 window.__testProposal = function(p){ showProposal(p); };

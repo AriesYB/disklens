@@ -22,12 +22,17 @@
     $('upd-actions').style.display = 'flex';
   }
 
-  /* 状态栏短反馈（手动检查时用） */
+  /* 状态栏短反馈（手动检查时用）。4 秒后回放原状态（扫描中/完成的计时信息不丢） */
   function flashStatus(msg, cls) {
-    if (typeof setStatus === 'function') {
-      setStatus(msg, cls);
-      if (cls !== 'done') { setTimeout(function () { try { setStatus('就绪', 'done'); } catch (_) {} }, 4000); }
-    }
+    if (typeof setStatus !== 'function') return;
+    setStatus(msg, cls);
+    setTimeout(function () {
+      try {
+        var scanningNow = document.body.classList.contains('scanning');
+        if (!scanningNow && typeof lastStatusMsg !== 'undefined') setStatus(lastStatusMsg, lastStatusCls);
+        else setStatus('就绪', 'done');
+      } catch (_) {}
+    }, 4000);
   }
 
   function setBtnState(text, disabled) {

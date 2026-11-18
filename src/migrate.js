@@ -7,6 +7,7 @@ var migSrc = '';          // 当前迁移源路径
 var migVolumes = [];
 var migChecking = false;
 var migRunning = false;
+var migUndoing = false;   // 正在执行撤销迁移（done 时不再显示撤销入口）
 var migDestDir = '';      // 用户具体选择的目标文件夹；空 = 用 mig-vol 选中的卷根
 var migGuidanceMap = [
   { re: /pagefile\.sys|swapfile\.sys/i, t: '虚拟内存文件', s: '这是系统页面文件，不能搬也不能删。请在「系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存 → 更改」里把它设置到其他盘。' },
@@ -41,6 +42,8 @@ function el(id) { return document.getElementById(id); }
 function openMigrate(path) {
   window.__migHandler = onMigrateEvent;   // 接管 migrate-update 事件流
   migSrc = path;
+  migUndoing = false;
+  el('mig-undo').style.display = 'none';
   el('mig-mask').style.display = 'flex';
   el('mig-src').textContent = path;
   el('mig-vol').innerHTML = '<option>加载卷…</option>';
@@ -183,6 +186,8 @@ function onMigrateEvent(ev) {
     el('mig-stop').style.display = 'none';
     el('mig-start').style.display = 'none';
     el('mig-rescan').style.display = '';
+    // done 态提供撤销入口（撤销完成后 junction 已不存在，不再显示）
+    if (!migUndoing && migSrc && migSelectedRoot()) el('mig-undo').style.display = '';
     el('mig-cancel').disabled = false;
     return;
   }
@@ -238,6 +243,22 @@ function closeMigrate() {
     feed.migrateStart(migSrc, migSelectedRoot());
   });
   el('mig-stop').addEventListener('click', function () { feed.migrateStop(); });
+  // 撤销迁移：删 junction + 数据回原位（复用迁移对话框的进度/事件流展示）
+  el('mig-undo').addEventListener('click', function () {
+    if (!migSrc || !migSelectedRoot()) return;
+    migUndoing = true;
+    el('mig-undo').disabled = true;
+    el('mig-start').style.display = 'none';
+    el('mig-rescan').style.display = 'none';
+    el('mig-locked').style.display = 'none';
+    el('mig-prog').style.display = '';
+    el('mig-fill').classList.remove('ok');
+    migRunning = true;
+    el('mig-cancel').disabled = true;
+    el('mig-stage').textContent = '撤销中…';
+    feed.migrateUndo(migSrc, migSelectedRoot());
+    // 进度/结果由 migrate-update 事件流驱动 onMigrateEvent（撤销事件同构）
+  });
   el('mig-rescan').addEventListener('click', function () {
     closeMigrate();
     el('scan-btn').click();   // 重新扫描以刷新视图

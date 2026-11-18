@@ -23,6 +23,7 @@ function openContextMenu(ev,fp,isFile){
   document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
   document.getElementById('mi-enter').style.display=isFile?'none':'';
   document.getElementById('mi-expand').style.display=isFile?'none':'';
+  document.getElementById('mi-rescan').style.display=isFile?'none':'';
   document.getElementById('mi-migrate').style.display=isFile?'none':'';
   document.getElementById('mi-ai').style.display=isFile?'none':'';
   document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
@@ -277,11 +278,13 @@ function renderTreemap(){
 }
 function goUp(){
   if(!stack.length) return;
-  var p=stack.pop(); curPath=p.path; divs={}; map.innerHTML=''; expanded={}; render();
+  // 返回上级：保留 expanded（按路径记忆的展开状态）——回到原目录时恢复之前的展开
+  var p=stack.pop(); curPath=p.path; divs={}; map.innerHTML=''; render();
 }
 function navigate(path,isChild){
   if(isChild!==false && curPath && store.get(curPath.toLowerCase())){ stack.push({name:store.get(curPath.toLowerCase()).n,path:curPath}); }
-  curPath=path; divs={}; map.innerHTML=''; expanded={};
+  // 进入子目录不清 expanded：各级目录的展开状态独立记忆，返回时逐级恢复
+  curPath=path; divs={}; map.innerHTML='';
   // 进入还没扫完的目录 → 优先调度扫描（扫描中或监视模式下）
   var n=store.get(path.toLowerCase());
   if(typeof feed!=='undefined'&&feed&&typeof feed.scanPriority==='function'&&
@@ -305,6 +308,14 @@ document.getElementById('mi-expand').addEventListener('click',function(){
     render();
   }
   hideCtx();
+});
+document.getElementById('mi-rescan').addEventListener('click',function(){
+  var p=menuPath;
+  hideCtx();
+  if(p&&!menuSel){
+    setStatus('正在重新扫描此目录…','scanning');
+    feed.scanRefresh(p);
+  }
 });
 document.addEventListener('mousedown',function(ev){
   var c=document.getElementById('ctx');

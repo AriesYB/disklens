@@ -32,3 +32,5 @@ src-tauri/target-dev/
 
 # ZCode 会话产物
 .zcode/
+test-results/
+playwright-report/

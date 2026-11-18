@@ -281,3 +281,89 @@ function renderTypes(){
   var exp=document.getElementById('types-export');
   if(exp) exp.addEventListener('click',function(){ exportTypesCSV(); });
 })();
+
+/* ===== 历史对比视图：上次扫描 vs 本次（目录级增量） ===== */
+// 数据源：scan-cache.prev.json（上次）vs 内存 store（本次，≥1MB 目录）。
+// prev 异步读一次后缓存到 prevCache；重扫完成自动 markDirty 刷新
+var prevCache = null;      // {at, root, m: Map(lower->s)}
+var prevCacheLoaded = false;
+
+function loadPrevCache(cb){
+  if(prevCacheLoaded) return cb(prevCache);
+  if(!feed.readScanCache) { prevCacheLoaded = true; return cb(null); }
+  feed.readScanCache('prev', function(json){
+    if(!json){ prevCacheLoaded = true; return cb(null); }
+    try {
+      var d = JSON.parse(json);
+      var m = new Map();
+      (d.nodes||[]).forEach(function(r){ m.set(r[0].toLowerCase(), r[2]); });
+      prevCache = { at:d.at||0, root:d.root||'', m:m };
+    } catch(e) { prevCache = null; }
+    prevCacheLoaded = true;
+    cb(prevCache);
+  });
+}
+
+function renderDiff(){
+  var box=document.getElementById('diff-body');
+  if(!box) return;
+  var meta=document.getElementById('diff-meta');
+  loadPrevCache(function(prev){
+    if(!prev || !prev.m.size){
+      if(meta) meta.innerHTML='暂无历史数据——连续完成两次扫描后，这里显示「上次 vs 本次」的目录级增减';
+      box.innerHTML='<div class="t-empty">完成两次扫描后可查看：哪些目录在增长、哪些是新出现的大头</div>';
+      return;
+    }
+    var grown=[], added=[];
+    store.forEach(function(n){
+      if(n.f || n.s < 1024*1024) return;
+      var old = prev.m.get(n.p.toLowerCase());
+      if(old == null){ if(n.done) added.push(n); }
+      else if(n.done && n.s > old) grown.push({ n:n.n, p:n.p, s:n.s, delta:n.s-old });
+    });
+    grown.sort(function(a,b){ return b.delta-a.delta; });
+    added.sort(function(a,b){ return b.s-a.s; });
+    grown = grown.slice(0, 20);
+    added = added.slice(0, 20);
+    var prevDate = prev.at ? new Date(prev.at).toLocaleString() : '—';
+    if(meta) meta.innerHTML='上次：'+esc(prevDate)+' · '+
+      '<b>'+grown.length+'</b> 个增长目录 / <b>'+added.length+'</b> 个新增大目录（≥1MB）';
+    var html='';
+    if(grown.length){
+      html+='<div class="f-meta" style="padding-left:18px">📈 增长最大（本次 - 上次）</div>'+
+        '<div class="t-head"><div>目录</div><div class="rt">上次</div><div class="rt">本次</div><div class="rt">增量</div><div></div></div>';
+      for(var i=0;i<grown.length;i++){
+        var g=grown[i];
+        var old=prev.m.get(g.p.toLowerCase());
+        html+='<div class="t-row" data-path="'+escAttr(g.p)+'">'+
+          '<div class="t-ext" title="'+escAttr(g.p)+'">'+esc(g.n)+'</div>'+
+          '<div class="t-num">'+fmt(old)+'</div><div class="t-num">'+fmt(g.s)+'</div>'+
+          '<div class="t-num" style="color:#e8a0a0">+'+fmt(g.delta)+'</div><div></div></div>';
+      }
+    }
+    if(added.length){
+      html+='<div class="f-meta" style="padding-left:18px;margin-top:10px">🆕 新出现的大目录</div>'+
+        '<div class="t-head"><div>目录</div><div class="rt" colspan2></div><div class="rt">大小</div><div></div><div></div></div>';
+      for(var j=0;j<added.length;j++){
+        var a=added[j];
+        html+='<div class="t-row" data-path="'+escAttr(a.p)+'">'+
+          '<div class="t-ext" title="'+escAttr(a.p)+'">'+esc(a.n)+'</div>'+
+          '<div class="t-num">—</div><div class="t-num">'+fmt(a.s)+'</div><div class="t-num">新增</div><div></div></div>';
+      }
+    }
+    if(!grown.length && !added.length){
+      html='<div class="t-empty">与上次相比没有明显增长（≥1MB 粒度）——盘面很稳定 👍</div>';
+    }
+    box.innerHTML=html;
+  });
+}
+
+(function initDiffView(){
+  var box=document.getElementById('diff-body');
+  if(box) box.addEventListener('click', function(ev){
+    var row=ev.target.closest('.t-row');
+    if(row && row.dataset.path){ navigate(row.dataset.path); }
+  });
+  // 重扫后 prevCache 失效（下次进视图重读），配合 scan-finished 的 saveScanCache 轮换
+  if (typeof markDirty === 'function') markDirty();
+})();

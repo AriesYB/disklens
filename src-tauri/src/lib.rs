@@ -27,14 +27,15 @@ pub struct ScanState {
     sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
 
-/// 扫描完成后的实时监视状态：watcher 与其合批线程的生命周期句柄
+/// 扫描完成后的实时监视状态：多盘齐扫时每个根一个 watcher
 #[derive(Default)]
 pub struct WatchState {
-    inner: Mutex<Option<WatchRun>>,
+    inner: Mutex<Vec<WatchRun>>,
 }
 
 struct WatchRun {
     stop: Arc<AtomicBool>,
+    root_lower: Option<String>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -438,18 +439,25 @@ fn scan_dir(
 }
 
 #[tauri::command]
-fn scan_start(app: AppHandle, root: String) -> Result<(), String> {
-    do_scan_start(&app, root)
+fn scan_start(app: AppHandle, roots: Vec<String>) -> Result<(), String> {
+    do_scan_start(&app, roots)
 }
 
 /// 扫描启动主体：前端「开始扫描」按钮与 AI 联动通道（POST /api/scan）共用。
-/// 成功启动后向前端发 scan-started 事件（AI 触发时前端据此进入扫描 UI 态）
-fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
-    let state = app.state::<ScanState>();
-    let root_path = Path::new(&root).to_path_buf();
-    if !root_path.is_dir() {
-        return Err(format!("目录不存在：{}", root));
+/// roots 支持多个盘根（多盘齐扫）；成功启动后发 scan-started（payload = roots 数组）
+fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
+    let mut root_paths: Vec<std::path::PathBuf> = Vec::new();
+    for r in &roots {
+        let rp = Path::new(r).to_path_buf();
+        if !rp.is_dir() {
+            return Err(format!("目录不存在：{}", r));
+        }
+        root_paths.push(rp);
     }
+    if root_paths.is_empty() {
+        return Err("未指定扫描范围".into());
+    }
+    let state = app.state::<ScanState>();
     {
         let mut running = state.running.lock().map_err(|e| e.to_string())?;
         if *running {
@@ -469,35 +477,37 @@ fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
 
     let app2 = app.clone();
     std::thread::spawn(move || {
-        let root_name = root_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| root_path.to_string_lossy().to_string());
-        let parent = root_path
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
         let t0 = Instant::now();
 
         // ===== 并行扫描引擎：N 个工作线程共享一个任务队列 =====
         // 每个目录一个 DState：工作线程读完目录项后，子目录入队、文件累计；
         // 子目录完成时把体积上缴父目录（remaining-- 到 0 且自身读完 → 级联完成）。
-        // 同一时刻大量目录处于统计中——前端会看到多个目录同时转圈，这是真实并行状态。
-        let root = Arc::new(DState {
-            path: root_path.to_string_lossy().to_string(),
-            parent_path: parent,
-            name: root_name,
-            depth: 48,
-            remaining: AtomicUsize::new(0),
-            size: Mutex::new(0),
-            alloc: Mutex::new(0),
-            denied: AtomicBool::new(false),
-            iter_done: AtomicBool::new(false),
-            parent: None,
-        });
+        // 多盘齐扫：每个盘根都是独立 DState（parent=None），共享同一个工作队列。
         let jobs: Arc<Mutex<VecDeque<Arc<DState>>>> = Arc::new(Mutex::new(VecDeque::new()));
         let cv: Arc<Condvar> = Arc::new(Condvar::new());
-        jobs.lock().unwrap().push_back(root);
+        let n_roots = root_paths.len();
+        for rp in &root_paths {
+            let root_name = rp
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| rp.to_string_lossy().to_string());
+            let parent = rp
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            jobs.lock().unwrap().push_back(Arc::new(DState {
+                path: rp.to_string_lossy().to_string(),
+                parent_path: parent,
+                name: root_name,
+                depth: 48,
+                remaining: AtomicUsize::new(0),
+                size: Mutex::new(0),
+                alloc: Mutex::new(0),
+                denied: AtomicBool::new(false),
+                iter_done: AtomicBool::new(false),
+                parent: None,
+            }));
+        }
         // 机械盘上几十个线程随机 read_dir 会互相 seek 抖动，8 个以内最稳
         let n_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -511,6 +521,7 @@ fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
             sizes: st.sizes.clone(),
             stop: st.stop.clone(),
             finished: finished.clone(),
+            roots_left: Arc::new(AtomicUsize::new(n_roots)),
             cv: cv.clone(),
             out: Arc::new(Mutex::new(Vec::new())),
         });
@@ -521,7 +532,7 @@ fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
             let alive = alive.clone();
             std::thread::spawn(move || worker_loop(ctx, jobs, cv, alive));
         }
-        // 协调者：等根目录完成（finished）或全部 worker 退出（停止）
+        // 协调者：等全部根完成（finished）或全部 worker 退出（停止）
         loop {
             std::thread::sleep(Duration::from_millis(120));
             if finished.load(Ordering::Relaxed) || alive.load(Ordering::Relaxed) == 0 {
@@ -530,7 +541,11 @@ fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
         }
         flush_out(&ctx); // 排空残留事件批次
         let msg = if finished.load(Ordering::Relaxed) {
-            format!("扫描完成，用时 {:.1}s", t0.elapsed().as_secs_f32())
+            format!(
+                "扫描完成，{} 个盘，用时 {:.1}s",
+                n_roots,
+                t0.elapsed().as_secs_f32()
+            )
         } else {
             "已停止".to_string()
         };
@@ -555,7 +570,7 @@ fn do_scan_start(app: &AppHandle, root: String) -> Result<(), String> {
         }
     });
     // 通知前端进入扫描 UI 态（AI 经 POST /api/scan 触发时前端没有按钮上下文）
-    let _ = app.emit("scan-started", root.clone());
+    let _ = app.emit("scan-started", &roots);
     Ok(())
 }
 
@@ -588,6 +603,8 @@ struct EngineCtx {
     sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    /// 尚未完成的盘根数（多盘齐扫：最后一个根完成时才置 finished）
+    roots_left: Arc<AtomicUsize>,
     cv: Arc<Condvar>,
     /// 待发事件缓冲：攒批合并成 scan-batch 再发，避免并行时事件洪流淹没前端
     out: Arc<Mutex<Vec<NodeEvent>>>,
@@ -678,9 +695,11 @@ fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, alloc: u64, al
             }
             None => {
                 if cur.parent.is_none() {
-                    // 根目录完成 → 本次扫描结束
-                    ctx.finished.store(true, Ordering::Relaxed);
-                    ctx.cv.notify_all();
+                    // 一个盘根完成；最后一个根完成 → 本次扫描结束
+                    if ctx.roots_left.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        ctx.finished.store(true, Ordering::Relaxed);
+                        ctx.cv.notify_all();
+                    }
                 }
                 return;
             }
@@ -915,7 +934,10 @@ fn process_job(
 /// 立刻起一个线程优先扫这个子树。主 DFS 之后到达该目录时会从共享 sizes 表取结果直接跳过，
 /// 不重复耗 IO。监视模式下（无主扫描）同样可用：新出现的目录点开即扫。
 #[tauri::command]
-fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> Result<(), String> {
+/// 优先扫描主体：后台线程扫单个子树（扫描中点击未扫到的目录 / 监视模式补扫共用）。
+/// force=true 时忽略 sizes 表的"已扫完"记录，强制重扫（右键重新扫描 / 提案执行后刷新）
+fn spawn_priority_scan(app: &AppHandle, path: String, force: bool) -> Result<(), String> {
+    let state = app.state::<ScanState>();
     let running = match state.running.lock() {
         Ok(g) => *g,
         Err(_) => false,
@@ -928,7 +950,7 @@ fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> R
     if !bp.is_dir() {
         return Err(format!("目录不存在：{}", p));
     }
-    {
+    if !force {
         let m = state.sizes.lock().map_err(|e| e.to_string())?;
         if m.contains_key(&p.to_lowercase()) {
             return Ok(()); // 已扫完，无需优先
@@ -976,6 +998,34 @@ fn scan_priority(app: AppHandle, state: State<'_, ScanState>, path: String) -> R
 }
 
 #[tauri::command]
+fn scan_priority(app: AppHandle, path: String) -> Result<(), String> {
+    spawn_priority_scan(&app, path, false)
+}
+
+/// 强制重扫子树：先清 sizes 表里该子树的全部完成记录（含自身），再走优先扫描。
+/// 用于「右键重新扫描此目录」与提案执行后的局部刷新
+#[tauri::command]
+fn scan_refresh(app: AppHandle, path: String) -> Result<(), String> {
+    let p = norm_path(&path);
+    if !Path::new(&p).is_dir() {
+        return Err(format!("目录不存在：{}", p));
+    }
+    let state = app.state::<ScanState>();
+    let base = p.to_lowercase();
+    // 盘根键自带尾杠（"c:\"），子目录键无尾杠——前缀按此归一
+    let prefix = if base.ends_with('\\') {
+        base.clone()
+    } else {
+        format!("{}\\", base)
+    };
+    {
+        let mut m = state.sizes.lock().map_err(|e| e.to_string())?;
+        m.retain(|k, _| k.as_str() != base.as_str() && !k.starts_with(prefix.as_str()));
+    }
+    spawn_priority_scan(&app, p, true)
+}
+
+#[tauri::command]
 fn scan_stop(state: State<'_, ScanState>) {
     state.stop.store(true, Ordering::Relaxed);
 }
@@ -1013,15 +1063,24 @@ fn watch_start(
     if !Path::new(&root_n).is_dir() {
         return Err(format!("目录不存在：{}", root_n));
     }
-    // 停掉旧监视线程（换根重开时）
+    // 同根查重：先停掉旧 watcher（换根重开 / 多盘逐根挂载互不影响）
     {
         let mut g = wstate.inner.lock().map_err(|e| e.to_string())?;
-        if let Some(run) = g.take() {
-            run.stop.store(true, Ordering::Relaxed);
-            if let Some(h) = run.join {
-                let _ = h.join();
+        let root_lower = root_n.to_lowercase();
+        let mut kept = Vec::new();
+        for run in g.drain(..) {
+            if let Some(r) = run.root_lower.as_ref() {
+                if *r == root_lower {
+                    run.stop.store(true, Ordering::Relaxed);
+                    if let Some(h) = run.join {
+                        let _ = h.join();
+                    }
+                    continue;
+                }
             }
+            kept.push(run);
         }
+        *g = kept;
     }
 
     let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(String, RawOp)>();
@@ -1164,8 +1223,9 @@ fn watch_start(
     });
 
     let mut g = wstate.inner.lock().map_err(|e| e.to_string())?;
-    *g = Some(WatchRun {
+    g.push(WatchRun {
         stop,
+        root_lower: Some(root_n.to_lowercase()),
         join: Some(join),
     });
     Ok(())
@@ -1173,12 +1233,12 @@ fn watch_start(
 
 #[tauri::command]
 fn watch_stop(wstate: State<'_, WatchState>) {
-    if let Ok(mut g) = wstate.inner.lock() {
-        if let Some(run) = g.take() {
-            run.stop.store(true, Ordering::Relaxed);
-            if let Some(h) = run.join {
-                let _ = h.join();
-            }
+    // 停掉全部 watcher（多盘）
+    let Ok(mut g) = wstate.inner.lock() else { return };
+    for run in g.drain(..) {
+        run.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = run.join {
+            let _ = h.join();
         }
     }
 }
@@ -1430,15 +1490,248 @@ fn probe_volumes() -> Vec<VolumeInfo> {
     Vec::new()
 }
 
+/// 枚举本地卷。映射的网络盘断连时 API 会阻塞数秒——async + 线程池，不阻塞 UI
 #[tauri::command]
-fn list_volumes() -> Vec<VolumeInfo> {
-    probe_volumes()
+async fn list_volumes() -> Vec<VolumeInfo> {
+    tauri::async_runtime::spawn_blocking(probe_volumes)
+        .await
+        .unwrap_or_default()
 }
 
 /// 前端 CSV 导出落盘：路径由原生保存对话框给出，内容为前端拼好的完整字符串
 #[tauri::command]
 fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("写入失败：{}", e))
+}
+
+// ======================== 扫描缓存（启动秒开 + 历史对比） ========================
+// scan-cache.json = 最近一次扫描摘要；写入时把旧文件轮换为 scan-cache.prev.json，
+// 前端重扫完成后可做「上次 vs 本次」对比。
+
+fn cache_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录：{}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建数据目录：{}", e))?;
+    Ok(dir)
+}
+
+/// 写入扫描缓存：当前缓存轮换为 prev（供对比），新结果覆盖 current
+#[tauri::command]
+fn write_scan_cache(app: AppHandle, json: String) -> Result<(), String> {
+    let dir = cache_dir(&app)?;
+    let cur = dir.join("scan-cache.json");
+    let prev = dir.join("scan-cache.prev.json");
+    if cur.exists() {
+        let _ = std::fs::rename(&cur, &prev);
+    }
+    std::fs::write(&cur, json.as_bytes()).map_err(|e| format!("写入缓存失败：{}", e))
+}
+
+/// 读取扫描缓存：which = "current" | "prev"；不存在返回 Ok(None)
+#[tauri::command]
+fn read_scan_cache(app: AppHandle, which: String) -> Result<Option<String>, String> {
+    let dir = cache_dir(&app)?;
+    let file = if which == "prev" {
+        dir.join("scan-cache.prev.json")
+    } else {
+        dir.join("scan-cache.json")
+    };
+    if !file.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&file)
+        .map(Some)
+        .map_err(|e| format!("读取缓存失败：{}", e))
+}
+
+// ======================== 回收站删除与迁移撤销 ========================
+
+/// 移入回收站（FOF_ALLOWUNDO，可在回收站还原）——清理类操作的安全执行方式。
+/// 大目录入回收站可能耗时——async + 线程池，不阻塞 UI
+#[tauri::command]
+async fn recycle_delete(paths: Vec<String>) -> Vec<String> {
+    let task = paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut failed = Vec::new();
+        for p in &task {
+            if !recycle_one(p) {
+                failed.push(p.clone());
+            }
+        }
+        failed
+    })
+    .await
+    .unwrap_or_else(|_| paths)
+}
+
+#[cfg(windows)]
+fn recycle_one(path: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::{
+        SHFileOperationW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
+        FOF_SILENT, SHFILEOPSTRUCTW,
+    };
+    if !Path::new(path).exists() {
+        return false;
+    }
+    // pFrom 要求双零结尾的可变 UTF-16 缓冲
+    let mut from: Vec<u16> = path.encode_utf16().collect();
+    from.push(0);
+    from.push(0);
+    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+    op.hwnd = std::ptr::null_mut();
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.as_ptr();
+    op.pTo = std::ptr::null();
+    op.fFlags = (FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_ALLOWUNDO) as u16;
+    let r = unsafe { SHFileOperationW(&mut op) };
+    r == 0 && op.fAnyOperationsAborted == 0
+}
+
+#[cfg(not(windows))]
+fn recycle_one(_path: &str) -> bool {
+    false
+}
+
+/// 撤销迁移：删掉源位置 junction，把数据从目标搬回原位（逆向走一遍迁移事务）。
+/// 安全校验：src 必须是 reparse point 且 dest 真实存在——两者任一不满足即拒绝（防误删真数据）
+#[tauri::command]
+fn migrate_undo(app: AppHandle, state: State<'_, MigrateState>, src: String, dest_root: String) -> Result<(), String> {
+    {
+        let mut running = state.running.lock().map_err(|e| e.to_string())?;
+        if *running {
+            return Err("已有迁移/撤销在进行".into());
+        }
+        *running = true;
+    }
+    state.stop.store(false, Ordering::Relaxed);
+
+    let src_n = norm_path(&src);
+    let basename = src_n
+        .trim_end_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let dest_path = format!("{}\\{}", dest_root.trim_end_matches('\\'), basename);
+
+    let ok_sm = fs::symlink_metadata(&src_n);
+    let is_link = ok_sm.as_ref().map(|m| is_reparse(m)).unwrap_or(false);
+    let dest_exists = Path::new(&dest_path).is_dir();
+    if !is_link || !dest_exists {
+        if let Ok(mut r) = state.running.lock() {
+            *r = false;
+        }
+        return Err(format!(
+            "撤销校验失败：{} 不是 junction 或 {} 不存在，拒绝执行（数据可能已被手动处理）",
+            src_n, dest_path
+        ));
+    }
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let st = app2.state::<MigrateState>();
+        let stop = &st.stop;
+        let src_p = Path::new(&src_n);
+        let dest_p = Path::new(&dest_path);
+        let mut locked: Vec<String> = Vec::new();
+        macro_rules! bail {
+            ($msg:expr) => {{
+                let m: &str = &$msg;
+                emit_mig(&app2, "error", m, "", 0, 0, 0, 0, &locked);
+                if let Ok(mut r) = st.running.lock() {
+                    *r = false;
+                }
+                return;
+            }};
+        }
+
+        // 第一步：删掉源位置的 junction（对 reparse point 只删链接，不碰目标数据）
+        if fs::remove_dir(src_p).is_err() {
+            bail!(format!("删除 junction 失败（可能被占用）：{}", src_n));
+        }
+        emit_mig(&app2, "switch", "已移除 junction，正在恢复原目录…", "", 0, 0, 0, 0, &[]);
+
+        if volume_prefix(&src_n) == volume_prefix(dest_root.as_str()) {
+            // 同卷：rename 瞬时还原
+            if fs::rename(dest_p, src_p).is_ok() {
+                emit_mig(&app2, "done", "撤销完成：数据已回到原位", "", 0, 0, 0, 0, &[]);
+            } else {
+                // rename 失败：把 junction 重新建回去，保持可迁移状态
+                let _ = fs::create_dir(src_p);
+                let _ = create_junction(&src_n, &dest_path);
+                bail!("还原 rename 失败（目录被占用），已恢复 junction 可稍后重试");
+            }
+        } else {
+            // 跨卷：复制回 → 对账 → 清掉目标
+            let mut stats = WalkStats::default();
+            walk_stats(dest_p, stop, &mut stats);
+            if stats.inner_links {
+                bail!("目标目录内含链接，撤销中止");
+            }
+            if stop.load(Ordering::Relaxed) {
+                emit_mig(&app2, "aborted", "撤销已停止", "", 0, 0, 0, 0, &[]);
+                if let Ok(mut r) = st.running.lock() {
+                    *r = false;
+                }
+                return;
+            }
+            emit_mig(
+                &app2, "copy", "撤销迁移：把数据从目标复制回原位…", "",
+                0, stats.bytes, 0, stats.files, &[],
+            );
+            let mut ctx = CopyCtx {
+                app: &app2,
+                bytes_done: 0,
+                files_done: 0,
+                last_emit: Instant::now(),
+                errors: Vec::new(),
+            };
+            if fs::create_dir_all(src_p).is_err() {
+                bail!("重建原目录失败");
+            }
+            match copy_tree(&mut ctx, dest_p, src_p, stats.bytes, stats.files, stop) {
+                Ok(()) => {}
+                Err(CopyAbort::Stopped) => {
+                    emit_mig(&app2, "aborted", "撤销已停止（已完成部分保留，junction 未动，可重新发起撤销）", "", ctx.bytes_done, stats.bytes, ctx.files_done, stats.files, &[]);
+                    if let Ok(mut r) = st.running.lock() {
+                        *r = false;
+                    }
+                    return;
+                }
+                Err(CopyAbort::Failed) => {
+                    let msg = if ctx.errors.is_empty() { "复制失败".to_string() } else { format!("复制失败（{} 项错误，已复制部分保留，可重试续传）", ctx.errors.len()) };
+                    bail!(msg);
+                }
+            }
+            // 对账
+            let mut vstats = WalkStats::default();
+            walk_stats(src_p, stop, &mut vstats);
+            if vstats.bytes != stats.bytes || vstats.files != stats.files {
+                bail!(format!(
+                    "对账不一致（源 {} 字节/{} 文件 vs 回移 {} / {}）——原位数据保留，junction 未动，请人工检查",
+                    stats.bytes, stats.files, vstats.bytes, vstats.files
+                ));
+            }
+            // 清掉目标侧
+            delete_contents(dest_p, stop, &mut locked);
+            if !locked.is_empty() {
+                emit_mig(&app2, "locked", "撤销基本完成，目标侧部分文件被占用未能删除", "", 0, 0, 0, 0, &locked);
+            } else if fs::remove_dir(dest_p).is_err() {
+                emit_mig(&app2, "locked", "目标空壳目录删除失败（可稍后手动删除）", "", 0, 0, 0, 0, &[dest_path.clone()]);
+            }
+            if stop.load(Ordering::Relaxed) {
+                emit_mig(&app2, "aborted", "撤销已停止", "", 0, 0, 0, 0, &[]);
+            } else {
+                emit_mig(&app2, "done", "撤销完成：数据已回到原位，目标侧已清理", "", stats.bytes, stats.bytes, stats.files, stats.files, &[]);
+            }
+        }
+        if let Ok(mut r) = st.running.lock() {
+            *r = false;
+        }
+    });
+    Ok(())
 }
 
 // ======================== 窗口显示与无感重启 ========================
@@ -1756,11 +2049,24 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
             http_res(&mut stream, 200, "OK", &body.to_string());
         }
         ("POST", "/api/scan") => {
-            let root = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(String::from))
-                .unwrap_or_else(|| "C:\\".to_string());
-            match do_scan_start(app, root) {
+            let body_v = serde_json::from_slice::<serde_json::Value>(&body).ok();
+            // 兼容 {"root":"C:\\"} 单盘 与 {"roots":["C:\\","D:\\"]} 多盘
+            let roots: Vec<String> = body_v
+                .as_ref()
+                .and_then(|v| v.get("roots").and_then(|r| r.as_array()).cloned())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .or_else(|| {
+                    body_v
+                        .as_ref()
+                        .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(String::from))
+                        .map(|r| vec![r])
+                })
+                .unwrap_or_else(|| vec!["C:\\".to_string()]);
+            match do_scan_start(app, roots) {
                 Ok(()) => http_res(&mut stream, 200, "OK", "{\"started\":true}"),
                 Err(e) if e.contains("已有扫描") => {
                     http_res(&mut stream, 409, "Conflict", &format!("{{\"error\":\"{}\"}}", e))
@@ -1925,8 +2231,16 @@ fn ai_proposal_result(
     Ok(())
 }
 
+/// 评估可迁移性。walk_stats 递归统计大目录可能耗时数秒——async + 线程池执行，
+/// 不阻塞 UI 主线程（否则转圈动画外的整个界面冻结，观感"未响应"）
 #[tauri::command]
-fn migrate_check(src: String, dest_root: String) -> Result<CheckResult, String> {
+async fn migrate_check(src: String, dest_root: String) -> Result<CheckResult, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate_check_impl(src, dest_root))
+        .await
+        .map_err(|e| format!("内部错误：{}", e))?
+}
+
+fn migrate_check_impl(src: String, dest_root: String) -> Result<CheckResult, String> {
     let src_n = norm_path(&src);
     let dest_root_n = norm_path(&dest_root);
     let mut blockers: Vec<String> = Vec::new();
@@ -2331,10 +2645,16 @@ pub fn run() {
             scan_start,
             scan_stop,
             scan_priority,
+            scan_refresh,
             scan_status,
             open_in_explorer,
             list_volumes,
             save_text_file,
+            write_scan_cache,
+            read_scan_cache,
+            recycle_delete,
+            migrate_undo,
+            scan_refresh,
             show_window,
             relaunch_no_focus,
             ai_snapshot,
