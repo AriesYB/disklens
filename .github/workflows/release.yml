@@ -1,0 +1,80 @@
+# 自动发版：推送 v* 标签 → 测试 → 签名构建 → 自动创建 GitHub Release 并上传产物
+#
+# 前置（仓库 Settings → Secrets and variables → Actions 配置一次）：
+#   TAURI_SIGNING_PRIVATE_KEY           = .tauri/disklens-updater.key 的文件内容（整段粘贴）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  = 私钥密码（没设密码就建一个空字符串 Secret）
+#
+# 以后发版只需：
+#   1. 升版本号（package.json / package-lock.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json）
+#   2. git tag -a v1.x.0 -m "一句话更新说明" && git push origin v1.x.0
+# → 自动跑测试 → 构建 → Release 页面出现 setup.exe/.sig/latest.json/disklens.exe
+#   （latest.json 挂在 Release 附件上，老客户端经 GitHub 源自动收到更新提示；
+#    ikanp.top 服务器源仍需手动 scp 一次 dist/latest.json）
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # 创建 Release 与上传附件
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 发版前全量验证：Rust 测试 + 浏览器 e2e
+      - name: Rust 测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: 安装 e2e 浏览器
+        run: npx playwright install chromium
+        env:
+          PLAYWRIGHT_DOWNLOAD_HOST: https://npmmirror.com/mirrors/playwright/
+
+      - name: e2e 冒烟
+        run: npm run e2e
+
+      - name: 签名构建
+        run: npm run build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: 生成更新清单（说明取自 tag 附注）
+        shell: bash
+        run: |
+          TAG_MSG="$(git tag -l --format='%(contents)' ${{ github.ref_name }} | head -1)"
+          if [ -z "$TAG_MSG" ]; then TAG_MSG="性能优化与问题修复。"; fi
+          node scripts/gen-updater-manifest.mjs "$TAG_MSG"
+
+      - name: 整理免安装版文件名
+        shell: bash
+        run: |
+          cp src-tauri/target/release/disklens.exe "disklens-${{ github.ref_name }}.exe"
+
+      - name: 创建 GitHub Release 并上传产物
+        uses: softprops/action-ghrelease@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: DiskLens ${{ github.ref_name }}
+          generate_release_notes: true   # 自动汇总本版 commits
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            dist/latest.json
+            disklens-*.exe
