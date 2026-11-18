@@ -17,6 +17,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Linux 构建需要 Tauri 系统依赖（webkit2gtk 等），缺失会在依赖编译阶段失败
+      - name: 安装 Linux 系统依赖（Tauri）
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
   e2e:
