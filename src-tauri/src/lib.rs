@@ -25,6 +25,9 @@ pub struct ScanState {
     /// 已完成子树的大小表：lower(path) -> (逻辑字节, 磁盘占用)。
     /// 并行工作线程/优先扫描到达某目录时若表里已有（被另一方先行完成）则直接采用，不再重扫
     sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// 大文件登记表（AI 通道 /api/tree 展示用）：lower(父目录) -> [(文件名, 逻辑字节, 占用)]。
+    /// 与事件流同口径：仅 ≥MIN_BIG_FILE，且每目录最多 MAX_BIG_FILES_PER_DIR 条
+    big_files: Arc<Mutex<HashMap<String, Vec<(String, u64, u64)>>>>,
 }
 
 /// 扫描完成后的实时监视状态：多盘齐扫时每个根一个 watcher
@@ -289,6 +292,7 @@ fn scan_dir(
     depth: u32,
     stop: &AtomicBool,
     sizes: &Mutex<HashMap<String, (u64, u64)>>,
+    big_files: &Mutex<HashMap<String, Vec<(String, u64, u64)>>>,
 ) -> (u64, u64) {
     let path_str = dir.to_string_lossy().to_string();
     let lower = path_str.to_lowercase();
@@ -354,11 +358,13 @@ fn scan_dir(
                         depth - 1,
                         stop,
                         sizes,
+                        big_files,
                     ))
                 } else {
                     let (counted, al, cloud, dup) = file_metrics(&entry.path(), &sm, cluster);
                     if sm.len() >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
                         big_file_count += 1;
+                        register_big_file(big_files, &lower, &entry.file_name(), counted, al);
                         emit(
                             app,
                             &NodeEvent {
@@ -443,6 +449,23 @@ fn scan_start(app: AppHandle, roots: Vec<String>) -> Result<(), String> {
     do_scan_start(&app, roots)
 }
 
+/// 大文件登记（AI 通道 /api/tree 的 files 数据源）：与事件流同口径逐条登记，
+/// 每目录上限 MAX_BIG_FILES_PER_DIR（与上报事件的上限一致）
+fn register_big_file(
+    files: &Mutex<HashMap<String, Vec<(String, u64, u64)>>>,
+    parent_lower: &str,
+    name: &std::ffi::OsStr,
+    s: u64,
+    al: u64,
+) {
+    if let Ok(mut m) = files.lock() {
+        let e = m.entry(parent_lower.to_string()).or_default();
+        if (e.len() as u64) < MAX_BIG_FILES_PER_DIR {
+            e.push((name.to_string(), s, al));
+        }
+    }
+}
+
 /// 扫描启动主体：前端「开始扫描」按钮与 AI 联动通道（POST /api/scan）共用。
 /// roots 支持多个盘根（多盘齐扫）；成功启动后发 scan-started（payload = roots 数组）
 fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
@@ -467,6 +490,9 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
     }
     state.stop.store(false, Ordering::Relaxed);
     if let Ok(mut m) = state.sizes.lock() {
+        m.clear();
+    }
+    if let Ok(mut m) = state.big_files.lock() {
         m.clear();
     }
     #[cfg(windows)]
@@ -519,6 +545,7 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
         let ctx = Arc::new(EngineCtx {
             app: app2.clone(),
             sizes: st.sizes.clone(),
+            big_files: st.big_files.clone(),
             stop: st.stop.clone(),
             finished: finished.clone(),
             roots_left: Arc::new(AtomicUsize::new(n_roots)),
@@ -601,6 +628,8 @@ struct DState {
 struct EngineCtx {
     app: AppHandle,
     sizes: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// 大文件登记表（AI 通道用），与 sizes 同生命周期（扫描开始时清空）
+    big_files: Arc<Mutex<HashMap<String, Vec<(String, u64, u64)>>>>,
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     /// 尚未完成的盘根数（多盘齐扫：最后一个根完成时才置 finished）
@@ -854,6 +883,13 @@ fn process_job(
                 let (counted, al, cloud, dup) = file_metrics(&entry.path(), &sm, cluster);
                 if len >= MIN_BIG_FILE && big_file_count < MAX_BIG_FILES_PER_DIR {
                     big_file_count += 1;
+                    register_big_file(
+                        &ctx.big_files,
+                        &job.path.to_lowercase(),
+                        &entry.file_name(),
+                        counted,
+                        al,
+                    );
                     push_event(
                         ctx,
                         NodeEvent {
@@ -979,7 +1015,7 @@ fn spawn_priority_scan(app: &AppHandle, path: String, force: bool) -> Result<(),
     std::thread::spawn(move || {
         let st2 = app2.state::<ScanState>();
         let bp2 = Path::new(&p);
-        scan_dir(&app2, bp2, parent, name, 48, &st2.stop, &st2.sizes);
+        scan_dir(&app2, bp2, parent, name, 48, &st2.stop, &st2.sizes, &st2.big_files);
         let mut announce = false;
         if let Ok(mut a) = st2.active.lock() {
             if *a > 0 {
@@ -1021,6 +1057,12 @@ fn scan_refresh(app: AppHandle, path: String) -> Result<(), String> {
     {
         let mut m = state.sizes.lock().map_err(|e| e.to_string())?;
         m.retain(|k, _| k.as_str() != base.as_str() && !k.starts_with(prefix.as_str()));
+    }
+    {
+        // 大文件登记表按父目录键清：子树内所有父目录的登记一并失效，重扫后重新登记
+        if let Ok(mut m) = state.big_files.lock() {
+            m.retain(|k, _| k.as_str() != base.as_str() && !k.starts_with(prefix.as_str()));
+        }
     }
     spawn_priority_scan(&app, p, true)
 }
@@ -1859,6 +1901,140 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// 查询串解析：k=v&k2=v2，值做 percent-decode（面向 AI 的宽容解析，缺 '=' 视为空值）
+fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (pct_decode(k), pct_decode(v))
+        })
+        .collect()
+}
+
+/// AI 传入路径的宽容归一：正/反斜杠等价、去引号与空白、尾杠整理、裸盘符补 \、统一小写。
+/// 让 AI 写 "C:/Users/x"、"c:\\\\users\\\\x"（JSON 转义后）、"C:\\Users\\X\\" 都能命中
+fn norm_query_path(raw: &str) -> String {
+    let mut s = raw.trim().trim_matches('"').replace('/', "\\");
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    if s.len() == 2 && s.as_bytes().get(1) == Some(&b':') {
+        s.push('\\'); // "c:" → "c:\"
+    }
+    s.to_lowercase()
+}
+
+/// /api/tree 单目录单列子项上限：其余按 `more` 计数（配合预算防"一大坨"）
+const TREE_MAX_CHILDREN: usize = 200;
+/// /api/tree 单次响应的全局节点预算：超出即停止下钻并标 truncated
+const TREE_NODE_BUDGET: usize = 2000;
+
+/// 多层级树节点构建（纯函数，供 /api/tree 与单测）：
+/// 一次返回 path 下 depth 层的目录与大文件（≥min 单列，<min 聚合进 agg），
+/// 每目录最多 TREE_MAX_CHILDREN 个单列子项，全局 TREE_NODE_BUDGET 节点预算。
+/// 返回 (节点 JSON, 子树是否被预算截断)。节点字段：
+///   name/path/s/al + file?（文件）+ agg?{n,s}（低于 min 的聚合）+ more?（超上限未单列数）
+///   + children?[]（子目录继续展开）+ truncated?（预算截断标记）
+fn build_tree_node(
+    sizes: &HashMap<String, (u64, u64)>,
+    files: &HashMap<String, Vec<(String, u64, u64)>>,
+    path_lower: &str,
+    depth: u32,
+    min: u64,
+    budget: &mut usize,
+) -> (serde_json::Value, bool) {
+    let (s, al) = sizes.get(path_lower).copied().unwrap_or((0, 0));
+    let name = path_lower
+        .trim_end_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    // 直接子层：目录来自 sizes 完成表（tree_children 已按大小降序），文件来自登记表
+    let dirs = tree_children(sizes, path_lower);
+    let dir_iter = dirs
+        .into_iter()
+        .map(|(p, cs, cal)| {
+            let nm = p.rsplit('\\').next().unwrap_or("").to_string();
+            (nm, cs, cal, p, false)
+        })
+        .collect::<Vec<_>>();
+    let file_iter = files
+        .get(path_lower)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|(nm, cs, cal)| (nm.clone(), *cs, *cal, String::new(), true))
+        .collect::<Vec<_>>();
+    let mut entries = dir_iter;
+    entries.extend(file_iter);
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut agg_n: u64 = 0;
+    let mut agg_s: u64 = 0;
+    let mut more: u64 = 0;
+    let mut listed = 0usize;
+    let mut children: Vec<serde_json::Value> = Vec::new();
+    let mut truncated = false;
+
+    for (nm, cs, cal, child_path, is_file) in entries {
+        if cs < min {
+            // 低于阈值不单列：聚合计数与字节（信息不丢，体量可控）
+            agg_n += 1;
+            agg_s += cs;
+            continue;
+        }
+        if listed >= TREE_MAX_CHILDREN {
+            more += 1;
+            continue;
+        }
+        if *budget == 0 {
+            // 全局预算耗尽：不再发节点，剩余计 more 并标记截断
+            truncated = true;
+            more += 1;
+            continue;
+        }
+        *budget -= 1;
+        listed += 1;
+        if is_file {
+            children.push(serde_json::json!({
+                "name": nm, "path": child_path, "s": cs, "al": cal, "file": true
+            }));
+        } else if depth > 1 {
+            let (mut cobj, ctrunc) =
+                build_tree_node(sizes, files, &child_path, depth - 1, min, budget);
+            if ctrunc {
+                truncated = true;
+                cobj["truncated"] = serde_json::json!(true);
+            }
+            children.push(cobj);
+        } else {
+            children.push(serde_json::json!({
+                "name": nm, "path": child_path, "s": cs, "al": cal
+            }));
+        }
+    }
+
+    let mut node = serde_json::json!({
+        "name": name,
+        "path": path_lower,
+        "s": s,
+        "al": al,
+    });
+    if agg_n > 0 {
+        node["agg"] = serde_json::json!({"n": agg_n, "s": agg_s});
+    }
+    if more > 0 {
+        node["more"] = more.into();
+    }
+    if !children.is_empty() {
+        node["children"] = serde_json::Value::Array(children);
+    }
+    (node, truncated)
+}
+
 /// 设置/覆盖提案；已有 pending 提案时拒绝（AI 需先等用户处理上一个）
 fn try_set_proposal(state: &AiChannelState, v: serde_json::Value) -> Result<(), String> {
     let mut g = state.proposal.lock().unwrap_or_else(|e| e.into_inner());
@@ -2011,11 +2187,12 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                 "app": "disklens",
                 "version": env!("CARGO_PKG_VERSION"),
                 "root": root,
+                "flow": "推荐：GET /api/tree（不带 path，一次拿根下 3 层全景）→ 对目标目录 GET /api/tree?path=...&depth=3 精准下钻。扫描完成后无需逐层探索；GET /api/scan 是全量快照（MB 级），只在需要类型分布/卷口径/受限目录汇总时才拉",
                 "endpoints": [
                     "GET  /api/status    — 扫描状态 {scanning, hasSnapshot, root}（先查这个）",
-                    "POST /api/scan      — 触发扫描 {\"root\":\"C:\\\\\"}（未扫描/换盘时用）",
-                    "GET  /api/scan      — 扫描快照：树形构成 tree（≥10MB 子项递归+每层 agg 聚合）、类型、受限目录",
-                    "GET  /api/tree?path=C%3A%5Csome%5Cdir — 下钻任意目录的直接子目录（无大小阈值，突破快照 10MB 粒度）",
+                    "POST /api/scan      — 触发扫描 {\"root\":\"C:\\\\\"} 或 {\"roots\":[\"C:\\\\\",\"D:\\\\\"]}（未扫描/换盘时用）",
+                    "GET  /api/tree      — 多层级下钻：?path=<目录>&depth=<1..=8,默认3>&min=<字节,默认10MB>。一次返回 depth 层的目录+大文件（含 file 标记），<min 聚合进 agg{n,s}，more=未单列数，truncated=预算截断。path 不带则用根；正/反斜杠等价、大小写不敏感",
+                    "GET  /api/scan      — 全量快照（较大）：树形构成 tree（≥10MB 递归+每层 agg）、类型、卷口径、受限目录 denied",
                     "GET  /api/proposal  — 当前提案状态（轮询执行结果）",
                     "POST /api/proposal  — 提交提案 {summary, items:[{action:migrate|cleanup|note, src, dest_root?, reason?}]}"
                 ],
@@ -2075,11 +2252,19 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
             }
         }
         ("GET", "/api/tree") => {
-            // 查询参数 path（percent-encoded），缺省回落到快照根
-            let qpath = head.path.split_once("?path=").map(|(_, v)| v).unwrap_or("");
+            // 多层级下钻：path（缺省=快照根）+ depth（1..=8，默认 3）+ min（子项单列阈值字节，默认 10MB）
+            let q = head.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let params = parse_query(q);
+            let get_p = |k: &str| {
+                params
+                    .iter()
+                    .find(|(kk, _)| kk == k)
+                    .map(|(_, v)| v.clone())
+            };
             let scan_state = app.state::<ScanState>();
-            let lower = if qpath.is_empty() {
-                state
+            let lower = match get_p("path") {
+                Some(p) if !p.trim().is_empty() => norm_query_path(&p),
+                _ => state
                     .snapshot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2087,28 +2272,52 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                     .and_then(|v| v.get("root").and_then(|r| r.as_str()).map(String::from))
                     .unwrap_or_default()
-                    .to_lowercase()
-            } else {
-                pct_decode(qpath).to_lowercase()
+                    .to_lowercase(),
             };
             if lower.is_empty() {
                 http_res(&mut stream, 404, "Not Found", "{\"error\":\"no scan yet\"}");
                 return;
             }
+            let depth = get_p("depth")
+                .and_then(|d| d.trim().parse::<u32>().ok())
+                .unwrap_or(3)
+                .clamp(1, 8);
+            let min = get_p("min")
+                .and_then(|m| m.trim().parse::<u64>().ok())
+                .unwrap_or(MIN_BIG_FILE);
             let g = scan_state.sizes.lock().unwrap_or_else(|e| e.into_inner());
-            let kids = tree_children(&g, &lower);
-            let items: Vec<serde_json::Value> = kids
-                .iter()
-                .map(|(p, s, al)| serde_json::json!({"path": p, "s": s, "al": al}))
-                .collect();
-            let total = g.get(&lower).map(|v| v.0).unwrap_or(0);
-            let body = serde_json::json!({
+            if !g.contains_key(&lower) {
+                // 未扫描/不存在的路径：明确 404 + 下一步指引，而不是返回空 children 让 AI 猜
+                let body = serde_json::json!({
+                    "error": "path not found in scan records (未扫描或不在此范围内)",
+                    "hint": "先 GET /api/tree（不带 path）从根开始；路径传小写、/ 或 \\ 均可；已完成扫描的范围见 GET /api/status 的 root"
+                });
+                http_res(&mut stream, 404, "Not Found", &body.to_string());
+                return;
+            }
+            let f = scan_state
+                .big_files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut budget = TREE_NODE_BUDGET;
+            let (node, truncated) = build_tree_node(&g, &f, &lower, depth, min, &mut budget);
+            let mut root = serde_json::json!({
                 "path": lower,
-                "total": total,
-                "children": items,
-                "note": "路径为小写；监视中的增量变化可能未反映",
+                "depth": depth,
+                "min": min,
+                "total": node["s"],
+                "rootAl": node["al"],
+                "truncated": truncated,
             });
-            http_res(&mut stream, 200, "OK", &body.to_string());
+            for k in ["agg", "more", "children"] {
+                if node.get(k).is_some() {
+                    root[k] = node[k].clone();
+                }
+            }
+            root["note"] = serde_json::json!(
+                "children 已展开 depth 层（目录+≥min 的大文件，按大小降序）；<min 的子项聚合成 agg{n,s}；more=超上限未单列数；truncated=节点预算截断，请用更小的 path/depth 精准下钻；路径均为小写；监视中的增量变化可能未反映；受限目录清单见 GET /api/scan 的 denied"
+            );
+            http_res(&mut stream, 200, "OK", &root.to_string());
         }
         ("GET", "/api/scan") => {
             let g = state.snapshot.lock().unwrap_or_else(|e| e.into_inner());
@@ -2807,6 +3016,117 @@ mod tests {
         assert_eq!(pct_decode("c:\\plain"), "c:\\plain");   // 未编码原样通过
         assert_eq!(pct_decode("a%2"), "a%2");               // 非法序列不吞字符
         assert_eq!(pct_decode("%E4%B8%AD"), "中");           // UTF-8 百分号编码
+    }
+
+    #[test]
+    fn query_parses_multiple_params() {
+        let q = parse_query("path=C%3A%5Cusers&depth=3&min=10485760&x=");
+        assert_eq!(q[0], ("path".into(), "C:\\users".into())); // 只解码；小写归一在 norm_query_path
+        assert_eq!(q[1], ("depth".into(), "3".into()));
+        assert_eq!(q[2], ("min".into(), "10485760".into()));
+        assert_eq!(q[3], ("x".into(), "".into()));
+    }
+
+    #[test]
+    fn norm_query_path_tolerates_ai_input_forms() {
+        // 正斜杠、大小写、尾杠、裸盘符、引号——AI 常见写法都要命中
+        assert_eq!(norm_query_path("C:/Users/HetFrame"), "c:\\users\\hetframe");
+        assert_eq!(norm_query_path("c:\\users\\"), "c:\\users");
+        assert_eq!(norm_query_path("\"C:\\Users\\X\""), "c:\\users\\x");
+        assert_eq!(norm_query_path("C:"), "c:\\");
+        assert_eq!(norm_query_path("C:\\"), "c:\\");
+        assert_eq!(norm_query_path("  D:\\big  "), "d:\\big");
+    }
+
+    /// 测试夹具：根下 a（内含 b/deep 与两个文件）、c 三层结构
+    fn tree_fixture() -> (
+        HashMap<String, (u64, u64)>,
+        HashMap<String, Vec<(String, u64, u64)>>,
+    ) {
+        let mut sizes: HashMap<String, (u64, u64)> = HashMap::new();
+        sizes.insert("c:\\".into(), (1000, 1100));
+        sizes.insert("c:\\a".into(), (600, 660));
+        sizes.insert("c:\\a\\b".into(), (500, 550));
+        sizes.insert("c:\\a\\b\\deep".into(), (400, 440));
+        sizes.insert("c:\\a\\small".into(), (5, 5));
+        sizes.insert("c:\\c".into(), (300, 330));
+        let mut files: HashMap<String, Vec<(String, u64, u64)>> = HashMap::new();
+        files.insert(
+            "c:\\a".into(),
+            vec![("big.iso".into(), 120, 130), ("tiny.log".into(), 1, 1)],
+        );
+        files.insert("c:\\a\\b\\deep".into(), vec![("core.vhdx".into(), 380, 400)]);
+        (sizes, files)
+    }
+
+    #[test]
+    fn tree_multi_expands_depth_and_includes_files() {
+        let (sizes, files) = tree_fixture();
+        let mut budget = TREE_NODE_BUDGET;
+        // depth=3：根 → a/b → deep，文件以 file 标记单列
+        let (node, trunc) = build_tree_node(&sizes, &files, "c:\\", 3, 10, &mut budget);
+        assert!(!trunc);
+        let kids = node["children"].as_array().unwrap();
+        // c:\ 根的子项按大小降序：a(600) > c(300) > big.iso(120)
+        assert_eq!(kids[0]["path"], "c:\\a");
+        // a 的单列子项 = b(500) + big.iso(120)；small(5)、tiny.log(1) < min=10 → 聚合进 agg
+        assert_eq!(kids[0]["children"].as_array().unwrap().len(), 2);
+        let a_node = &kids[0];
+        // a 的子项：b(500)、big.iso(120)单列；small(5)、tiny.log(1) <min=10 聚合
+        assert_eq!(a_node["agg"]["n"], 2);
+        assert_eq!(a_node["agg"]["s"], 6);
+        let a_kids = a_node["children"].as_array().unwrap();
+        assert_eq!(a_kids[0]["path"], "c:\\a\\b");
+        assert_eq!(a_kids[1]["file"], true); // big.iso
+        assert_eq!(a_kids[1]["s"], 120);
+        // depth=3：根 → a(第1层) → b(第2层) → deep(第3层，到顶不再下钻)
+        let b_node = &a_kids[0];
+        let b_kids = b_node["children"].as_array().unwrap();
+        assert_eq!(b_kids[0]["path"], "c:\\a\\b\\deep");
+        assert!(b_kids[0]["children"].is_null(), "depth 用尽：deep 不再下钻");
+    }
+
+    #[test]
+    fn tree_multi_depth1_lists_direct_only() {
+        let (sizes, files) = tree_fixture();
+        let mut budget = TREE_NODE_BUDGET;
+        let (node, trunc) = build_tree_node(&sizes, &files, "c:\\a", 1, 10, &mut budget);
+        assert!(!trunc);
+        let kids = node["children"].as_array().unwrap();
+        assert_eq!(kids.len(), 2); // b + big.iso（small/tiny 聚合进 agg）
+        assert!(kids.iter().all(|k| k["children"].is_null()), "depth=1 不展开");
+    }
+
+    #[test]
+    fn tree_multi_budget_truncates_with_more_count() {
+        let (sizes, files) = tree_fixture();
+        let mut budget = 2usize; // 只够 a、b 两个节点
+        let (node, trunc) = build_tree_node(&sizes, &files, "c:\\", 3, 10, &mut budget);
+        assert!(trunc, "预算耗尽应标记截断");
+        // 预算 2：a 消耗 1（其下层 b 再消耗 1 后耗尽），c 不再发节点、计入根的 more
+        let kids = node["children"].as_array().unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(node["more"], 1);
+        let a_node = &kids[0];
+        assert_eq!(a_node["truncated"], true, "a 的下层被截断应带标记");
+        assert_eq!(a_node["more"], 1, "耗尽后剩余单列子项计入 more（big.iso）");
+    }
+
+    #[test]
+    fn tree_multi_caps_children_per_dir() {
+        let mut sizes: HashMap<String, (u64, u64)> = HashMap::new();
+        sizes.insert("c:\\".into(), (1 << 30, 1 << 30));
+        for i in 0..TREE_MAX_CHILDREN + 15 {
+            sizes.insert(format!("c:\\d{:03}", i), ((i as u64) + 1, (i as u64) + 1));
+        }
+        let files: HashMap<String, Vec<(String, u64, u64)>> = HashMap::new();
+        let mut budget = TREE_NODE_BUDGET;
+        let (node, _) = build_tree_node(&sizes, &files, "c:\\", 1, 0, &mut budget);
+        let kids = node["children"].as_array().unwrap();
+        assert_eq!(kids.len(), TREE_MAX_CHILDREN);
+        assert_eq!(node["more"], 15);
+        // 排序仍按大小降序：d014 最大在前
+        assert_eq!(kids[0]["path"], format!("c:\\d{:03}", TREE_MAX_CHILDREN + 14));
     }
 
     #[test]

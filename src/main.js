@@ -440,7 +440,7 @@ function buildAiSnapshot(){
     rootSize:sum.s, rootAlloc:sum.al, deniedCount:deniedInScope(),
     tree: snapTree(root),      // 树形构成（多盘=虚拟根下各盘一棵；≥10MB 子项 + 每层 agg）
     denied:denied, types:types,
-    drill: 'GET /api/tree?path=<dir> 返回任意目录的直接子目录（无大小阈值，基于完整扫描表）'
+    drill: 'GET /api/tree?path=<dir>&depth=<1..=8,默认3>&min=<字节,默认10MB> 一次返回多层（目录+大文件，<min 聚合进 agg，预算截断标 truncated）；无需逐层探索'
   });
 }
 function pushAiSnapshot(){
