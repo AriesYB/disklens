@@ -70,6 +70,57 @@ function fmtAge(ms){
   if(h < 24) return h + ' 小时';
   return Math.round(h/24) + ' 天';
 }
+
+// ===== 会话内存上限 =====
+// 多范围记忆让 store/fileIndex 不再随新扫描清空——AI 连续扫多个盘时，
+// 每个盘的目录树（几十万节点、数百 MB）会全部堆在 webview 里，内存一路
+// 涨到全系统换页抖死（鼠标延迟、任务管理器都打不开）。策略：最多保留
+// MAX_SCOPES 个范围（当前 + 最近使用），超出按路径前缀整体丢弃最旧范围。
+var scopeOrder = [];        // 最近使用的 scopeKey（尾=最新）
+var scopeRoots = {};        // scopeKey -> roots 数组
+var MAX_SCOPES = 2;
+
+// 把一组盘根的数据从 store/fileIndex/deniedSeen/expanded 里整体移除
+function dropScopeData(roots){
+  var prefixes = roots.map(function(r){ return String(r).toLowerCase(); });
+  var hit = function(p){
+    var pl = String(p||'').toLowerCase();
+    for(var i=0;i<prefixes.length;i++){
+      if(prefixes[i] && pl.indexOf(prefixes[i])===0) return true;
+    }
+    return false;
+  };
+  var dead = [];
+  store.forEach(function(n, k){ if(hit(n.p || k)) dead.push(k); });
+  dead.forEach(function(k){
+    var n = store.get(k);
+    if(n) delete expanded[n.p];
+    store.delete(k);
+    fileIndex.delete(k);
+  });
+  var deadFiles = [];
+  fileIndex.forEach(function(n, k){ if(hit(n.p || k)) deadFiles.push(k); });
+  deadFiles.forEach(function(k){ fileIndex.delete(k); });
+  for(var k in deniedSeen){ if(hit(k)) delete deniedSeen[k]; }
+}
+
+// 记录/刷新当前范围的使用顺序，并逐出超限的最旧范围
+function rememberScope(){
+  var key = curScopeKey();
+  var i = scopeOrder.indexOf(key);
+  if(i >= 0) scopeOrder.splice(i, 1);
+  scopeOrder.push(key);
+  scopeRoots[key] = ROOTS.slice();
+  while(true){
+    var others = scopeOrder.filter(function(k){ return k !== key; });
+    if(others.length < MAX_SCOPES) break;
+    var oldest = others[0];
+    dropScopeData(scopeRoots[oldest] || []);
+    scopeOrder.splice(scopeOrder.indexOf(oldest), 1);
+    delete scopeRoots[oldest];
+    delete scopeAt[oldest];
+  }
+}
 // 合成根摘要对象（多盘时引擎不更新虚拟根，这里现场聚合各盘根）
 function rootsSummary(){
   var s=0, al=0, done=true;
@@ -304,6 +355,8 @@ function beginScanUI(roots, byAI){
   var keepData = sameScope && !scanning && store.size > 0;
   ROOTS = roots.map(function(r){ return r; });
   window.ROOT = ROOTS[0];
+  if (watchActive) setWatch(false);   // AI 触发路径没有按钮前置清理，这里统一关掉旧范围监视
+  rememberScope();                     // 记录本次范围并逐出超限的最旧范围（内存上限）
   if (!keepData) {
     clearViewBodies();
     window.expanded = {}; window.stack = []; selectedRow = '';
@@ -1132,6 +1185,7 @@ window.addEventListener('DOMContentLoaded', function(){
         window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
         ensurePcRoot();
         scopeAt[scopeKey(ROOTS)] = meta.at;   // 该范围完成时间（切走再切回时提示用）
+        rememberScope();
         setStatus('已恢复上次扫描结果（' + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + ' 小时前）· 建议重新扫描刷新', 'done');
         markDirty();
       }
@@ -1188,6 +1242,7 @@ function switchScope(picked){
   ROOTS = roots;
   window.ROOT = ROOTS[0];
   window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
+  rememberScope();                    // 刷新使用顺序并逐出超限的最旧范围（内存上限）
   clearViewBodies();                  // 丢弃上一范围的渲染块（数据仍在，切回即重绘）
   window.expanded = {}; window.stack = []; selectedRow = '';
   fileSearch = '';
