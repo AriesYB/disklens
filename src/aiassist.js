@@ -275,6 +275,7 @@ var propAborted = false;   // 用户点停：结束当前项后不再继续
 
 function showProposal(p){
   if(!p || !p.items || !p.items.length) return;
+  diagLog('info', '收到 AI 提案「' + (p.summary||'') + '」（' + p.items.length + ' 项）');
   if(propRunning){   // 正在执行上一批：不弹新面板（后端 409 已挡绝大多数，双保险）
     setStatus('收到新 AI 提案，但当前批次执行中——稍后请 AI 重发','err');
     return;

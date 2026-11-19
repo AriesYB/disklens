@@ -55,6 +55,7 @@
         if (manual) flashStatus('✓ 已是最新版本', 'done');
         return;
       }
+      diagLog('info', '发现新版本 v' + update.version + '（current=' + update.currentVersion + '）');
       showUpdate(update);
     }).catch(function (e) {
       checking = false;
@@ -96,6 +97,7 @@
         }
       }).then(function () {
         $('upd-stage').textContent = '更新完成，正在重启…';
+        diagLog('info', '更新下载完成，重启安装');
         // 自定义重启：新进程带 --no-focus，窗口回来时不抢用户正在用的前台应用
         window.__TAURI__.core.invoke('relaunch_no_focus').catch(function () {
           window.__TAURI__.process.relaunch().catch(function () {});
@@ -107,6 +109,7 @@
         $('upd-actions').style.display = 'flex';
         $('upd-err').textContent = '更新失败：' + String(e).slice(0, 120);
         $('upd-err').style.display = '';
+        diagLog('error', '更新安装失败: ' + String(e).slice(0, 300));
       });
     };
   }

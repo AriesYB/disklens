@@ -13,6 +13,16 @@ var watchChanges = 0;        // 本次监视会话累计收到的变更条数
 var lastScanSecs = 0;        // 最近一次扫描耗时（秒），完成态 summary 展示
 var BIG_FILE_MIN = 10 * 1024 * 1024;   // 与后端 MIN_BIG_FILE 一致：小于此值的文件扫描时不入树
 
+/* ===== 诊断日志（问题反馈 / 异常追溯）：关键事件与报错进滚动日志 ===== */
+var diagThrottle = 0;
+function diagLog(level, msg){
+  if (!IN_TAURI || !feed || !feed.appLog) return;
+  var now = Date.now();
+  if (level !== 'error' && now - diagThrottle < 500) return;   // 非 error 节流
+  diagThrottle = now;
+  try { feed.appLog(level, msg); } catch (e) {}
+}
+
 // ===== 双口径 / 差额透明化 =====
 // s = 逻辑大小（size），al = 磁盘占用（簇对齐/云占位 0/硬链接副本计 0）
 var deniedSeen = {};         // 无权限目录（会话级累计，展示时按范围过滤；同一目录去重）
@@ -82,6 +92,7 @@ var MAX_SCOPES = 2;
 
 // 把一组盘根的数据从 store/fileIndex/deniedSeen/expanded 里整体移除
 function dropScopeData(roots){
+  diagLog('info', '逐出范围数据（内存上限）: ' + roots.join(','));
   var prefixes = roots.map(function(r){ return String(r).toLowerCase(); });
   var hit = function(p){
     var pl = String(p||'').toLowerCase();
@@ -738,6 +749,7 @@ function setStatus(s, cls){
   if(el) el.textContent = s;
   document.body.classList.remove('scanning','done','err');
   if(cls) document.body.classList.add(cls);
+  if(cls === 'err') diagLog('error', s);   // 报错进诊断日志（反馈/追溯用）
 }
 function setScanning(on){
   scanning = on;
@@ -847,6 +859,7 @@ function TauriFeed(){
     prevCacheLoaded = false; prevCache = null;   // prev 缓存已轮换，历史对比下次进视图重读
     saveScanCache();      // 完整扫描落缓存（轮换 prev 供历史对比）
     scopeAt[curScopeKey()] = Date.now();         // 记录该范围完成时间（切回时显示"多久前"）
+    diagLog('info', String(msg) + '（roots=' + ROOTS.join(',') + '）');
     // 完整扫描结束后进入实时监视：文件增删改即时反映到视图（多盘逐根挂 watcher）
     if (!watchActive && String(msg).indexOf('扫描完成') >= 0 && ROOTS.length) {
       setWatch(true, ROOTS);
@@ -938,6 +951,13 @@ TauriFeed.prototype.watchStart = function(root){
 };
 TauriFeed.prototype.watchStop = function(){
   window.__TAURI__.core.invoke('watch_stop').catch(function(){});
+};
+/* 诊断日志与报告（问题反馈 / 异常追溯） */
+TauriFeed.prototype.appLog = function(level, msg){
+  window.__TAURI__.core.invoke('app_log', { level: level, msg: msg }).catch(function(){});
+};
+TauriFeed.prototype.diagReport = function(cb){
+  window.__TAURI__.core.invoke('diag_report').then(function(r){ cb(r||null); }).catch(function(){ cb(null); });
 };
 
 /* ===== Mock Feed：浏览器直接打开时的合成数据（UI 开发 / 演示用） ===== */
@@ -1148,6 +1168,8 @@ MockFeed.prototype.scanPriority = function(p){
 /* 浏览器模式无文件系统监视：no-op（模拟扫描完成不触发 setWatch） */
 MockFeed.prototype.watchStart = function(){};
 MockFeed.prototype.watchStop = function(){};
+MockFeed.prototype.appLog = function(){};
+MockFeed.prototype.diagReport = function(cb){ cb(null); };
 
 /* 启动屏淡出 + 原生窗口显示（窗口配置为启动时隐藏，页面就绪后才出现，避免白屏） */
 function hideSplash(){
@@ -1168,6 +1190,15 @@ function hideSplash(){
 
 /* ===== 启动 ===== */
 window.addEventListener('DOMContentLoaded', function(){
+  // 全局 JS 异常捕获 → 诊断日志（反馈/追溯用）
+  window.addEventListener('error', function(ev){
+    diagLog('error', 'JS 异常: ' + (ev.message||'') + ' @ ' + (ev.filename||'?') + ':' + (ev.lineno||0));
+  });
+  window.addEventListener('unhandledrejection', function(ev){
+    var r = ev.reason;
+    diagLog('error', '未处理的 Promise 拒绝: ' + (r && (r.stack || r.message) || String(r)).slice(0, 300));
+  });
+
   window.map = document.getElementById('map');
   window.rootInput = document.getElementById('root-input');
   window.statusEl = document.getElementById('status');
@@ -1177,6 +1208,17 @@ window.addEventListener('DOMContentLoaded', function(){
   feed = IN_TAURI ? new TauriFeed() : new MockFeed();
   setView('treemap');
   if(IN_TAURI){
+    diagLog('info', '启动');
+    // 上次会话异常退出 → 提示用户可在「关于」里带日志反馈
+    feed.diagReport(function(d){
+      if(d && d.lastAbnormal){
+        window.__diagAbnormal = true;
+        diagLog('warn', '检测到上次会话异常退出（panic ' + (d.panics||0) + ' 次）');
+        setTimeout(function(){
+          setStatus('⚠ 上次会话异常退出——可在「关于」面板带日志反馈', 'err');
+        }, 2600);
+      }
+    });
     // 启动秒开：恢复上次扫描摘要（数据可能过期，重扫一次即刷新并落入历史对比）
     restoreScanCache(function(meta){
       if(meta && meta.root){
@@ -1284,6 +1326,7 @@ function startScan(){
   }
   beginScanUI(roots, false);
   feed.start(roots);
+  diagLog('info', '开始扫描: ' + roots.join(','));
   loadDrives();   // 重新枚举卷：volUsed 跟随新扫描范围
 }
 

@@ -1559,6 +1559,148 @@ fn cache_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+// ======================== 诊断日志（问题反馈 / 异常退出追溯） ========================
+// logs/current.log 为当前会话；启动时把上一份轮换为 prev-1..3（最多留 3 份）。
+// 正常退出写入 EXIT_MARKER，上一份没有该标记 = 异常退出（崩溃/被杀/断电），
+// 前端「关于 → 问题反馈」据此引导用户带日志提 Issue。日志只落本机，不做静默上传。
+
+const LOG_EXIT_MARKER: &str = "── 会话正常退出 ──";
+static DIAG_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct DiagState {
+    last_abnormal: AtomicBool,
+}
+
+/// UTC 时间戳（无 chrono 依赖，civil_from_days 算法）
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+fn diag_log_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_data_dir().ok()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn diag_append_file(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// 轮换上一会话日志并检测其是否异常退出（无正常退出标记）。返回 prev 是否异常。
+fn diag_rotate_dir(dir: &std::path::Path) -> bool {
+    let _ = std::fs::create_dir_all(dir);
+    let cur = dir.join("current.log");
+    let mut abnormal = false;
+    if cur.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cur) {
+            abnormal = !content.contains(LOG_EXIT_MARKER);
+        }
+        let _ = std::fs::remove_file(dir.join("prev-3.log"));
+        let _ = std::fs::rename(dir.join("prev-2.log"), dir.join("prev-3.log"));
+        let _ = std::fs::rename(dir.join("prev-1.log"), dir.join("prev-2.log"));
+        let _ = std::fs::rename(&cur, dir.join("prev-1.log"));
+    }
+    abnormal
+}
+
+fn diag_tail(path: &std::path::Path, max_chars: usize) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let count = s.chars().count();
+    Some(if count > max_chars {
+        s.chars().skip(count - max_chars).collect()
+    } else {
+        s
+    })
+}
+
+fn install_diag_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let bt = bt.lines().take(12).collect::<Vec<_>>().join(" | ");
+        let line = format!(
+            "[UTC {}] [panic] {} | backtrace: {}",
+            utc_stamp(),
+            info.to_string().replace(['\n', '\r'], " "),
+            bt
+        );
+        if let Some(p) = DIAG_LOG_PATH.get() {
+            diag_append_file(p, &line);
+        }
+        eprintln!("{}", line);
+    }));
+}
+
+/// 前端/关键路径写日志行（含体积护栏：超 1MB 后丢弃非 error 行，防错误风暴刷爆磁盘）
+#[tauri::command]
+fn app_log(app: AppHandle, level: String, msg: String) -> Result<(), String> {
+    let Some(dir) = diag_log_dir(&app) else { return Ok(()) };
+    let f = dir.join("current.log");
+    let level = if level.is_empty() { "info".into() } else { level };
+    if level != "error" {
+        if let Ok(md) = std::fs::metadata(&f) {
+            if md.len() > 1024 * 1024 {
+                return Ok(());
+            }
+        }
+    }
+    let safe = msg.replace(['\n', '\r'], " ");
+    diag_append_file(&f, &format!("[UTC {}] [{}] {}", utc_stamp(), level, safe));
+    Ok(())
+}
+
+/// 诊断报告：上次会话退出状态、panic 计数、前后日志尾部（前端组装后由用户决定提交）
+#[tauri::command]
+fn diag_report(app: AppHandle, state: State<'_, DiagState>) -> serde_json::Value {
+    let dir = diag_log_dir(&app);
+    let prev_tail = dir
+        .as_ref()
+        .and_then(|d| diag_tail(&d.join("prev-1.log"), 16000))
+        .unwrap_or_default();
+    let cur_tail = dir
+        .as_ref()
+        .and_then(|d| diag_tail(&d.join("current.log"), 16000))
+        .unwrap_or_default();
+    let panics = prev_tail.matches("[panic]").count() + cur_tail.matches("[panic]").count();
+    serde_json::json!({
+        "lastAbnormal": state.last_abnormal.load(Ordering::Relaxed),
+        "panics": panics,
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        "prevTail": prev_tail,
+        "curTail": cur_tail,
+    })
+}
+
+
+
 /// 写入扫描缓存：当前缓存轮换为 prev（供对比），新结果覆盖 current
 #[tauri::command]
 fn write_scan_cache(app: AppHandle, json: String) -> Result<(), String> {
@@ -2967,12 +3109,14 @@ pub fn run() {
     if std::env::args().any(|a| a == "--no-focus") {
         NO_FOCUS.store(true, Ordering::Relaxed);
     }
+    install_diag_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(ScanState::default())
         .manage(MigrateState::default())
         .manage(WatchState::default())
         .manage(AiChannelState::new())
+        .manage(DiagState::default())
         .invoke_handler(tauri::generate_handler![
             scan_start,
             scan_stop,
@@ -2997,7 +3141,9 @@ pub fn run() {
             migrate_start,
             migrate_stop,
             watch_start,
-            watch_stop
+            watch_stop,
+            app_log,
+            diag_report
         ])
         .setup(|app| {
             // 应用内自动更新（updater + 重启）+ 原生文件夹选择对话框：仅桌面端
@@ -3007,14 +3153,42 @@ pub fn run() {
                 app.handle().plugin(tauri_plugin_process::init())?;
                 app.handle().plugin(tauri_plugin_dialog::init())?;
             }
+            // 诊断日志：轮换上一会话 + 标记异常退出 + 写会话头
+            let dir = diag_log_dir(app.handle());
+            if let Some(dir) = dir {
+                let abnormal = diag_rotate_dir(&dir);
+                app.state::<DiagState>()
+                    .last_abnormal
+                    .store(abnormal, Ordering::Relaxed);
+                let cur = dir.join("current.log");
+                let _ = DIAG_LOG_PATH.set(cur.clone());
+                diag_append_file(
+                    &cur,
+                    &format!(
+                        "[UTC {}] [session] 启动 v{} {} {}",
+                        utc_stamp(),
+                        env!("CARGO_PKG_VERSION"),
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    ),
+                );
+            }
             // AI 联动通道：本地 127.0.0.1 随机端口的迷你 HTTP 服务（仅桌面端有意义；
             // 端口/token 通过 ai_channel_info 给前端展示）
             let handle = app.handle().clone();
             std::thread::spawn(move || run_ai_channel(handle));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, event| {
+            // 正常退出打标记：下一份日志没有该标记即视为异常退出（崩溃/被杀/断电）
+            if let tauri::RunEvent::Exit = event {
+                if let Some(p) = DIAG_LOG_PATH.get() {
+                    diag_append_file(p, LOG_EXIT_MARKER);
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -3385,5 +3559,55 @@ mod tests {
         assert_eq!(*root.size.lock().unwrap(), 7);
         assert_eq!(*root.alloc.lock().unwrap(), 8);
         assert_eq!(mid.remaining.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn diag_rotate_detects_abnormal_prev_session() {
+        let dir = std::env::temp_dir().join(format!("dl-diag-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 第一次启动：无 previous → 正常
+        assert!(!diag_rotate_dir(&dir));
+        // 上一会话没有正常退出标记 → 异常
+        diag_append_file(&dir.join("current.log"), "[UTC x] [info] working");
+        assert!(diag_rotate_dir(&dir), "无退出标记应判异常");
+        assert!(dir.join("prev-1.log").exists());
+        assert!(!dir.join("current.log").exists());
+        // 再轮换一次（上一份有标记）→ 正常
+        diag_append_file(&dir.join("current.log"), "[UTC x] [info] x");
+        diag_append_file(&dir.join("current.log"), LOG_EXIT_MARKER);
+        assert!(!diag_rotate_dir(&dir), "有退出标记应判正常");
+        // 轮换链最多保留 3 份 prev
+        for i in 0..5 {
+            diag_append_file(&dir.join("current.log"), &format!("session {}", i));
+            diag_rotate_dir(&dir);
+        }
+        assert!(dir.join("prev-1.log").exists());
+        assert!(dir.join("prev-2.log").exists());
+        assert!(dir.join("prev-3.log").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diag_tail_truncates_from_head() {
+        let dir = std::env::temp_dir().join(format!("dl-diag-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("current.log");
+        diag_append_file(&f, "line1");           // 6 字符（含 \n）
+        diag_append_file(&f, "line2-longer");    // 13 字符（含 \n），合计 19
+        let tail = diag_tail(&f, 13).unwrap();
+        assert!(tail.contains("line2-longer"), "尾部应保留最后内容");
+        let tail_all = diag_tail(&f, 9999).unwrap();
+        assert!(tail_all.contains("line1"), "小于上限时全量返回");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utc_stamp_shape() {
+        let s = utc_stamp();
+        // YYYY-MM-DD HH:MM:SS
+        assert_eq!(s.len(), 19);
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[10], b' ');
     }
 }

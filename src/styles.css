@@ -210,6 +210,7 @@ body[data-view="diff"] #diff{display:block}
 .about-ver{font-size:12.5px;color:var(--green);font-family:var(--mono);margin-top:2px}
 #about-close{margin-left:auto;padding:2px 10px;font-size:13px;border-radius:6px;align-self:flex-start}
 .about-tag{font-size:12.5px;color:#8b95a6;margin:12px 0 14px;line-height:1.6}
+.about-diag{font-size:12px;color:#8b95a6;margin:-6px 0 10px;text-align:left;min-height:1.4em}
 .about-rows{display:flex;flex-direction:column;gap:6px}
 .about-row{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;cursor:pointer;
   background:#1a2130;border:1px solid #2c3646;font-size:12.5px;color:#d6dde8;text-decoration:none}
