@@ -201,7 +201,7 @@ body[data-view="diff"] #diff{display:block}
 #about-mask{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
   background:rgba(5,8,13,.62);z-index:40;backdrop-filter:blur(2px)}
 #about{width:520px;max-width:92vw;background:#141a26;border:1px solid #2c3646;border-radius:12px;
-  padding:20px 22px;box-shadow:0 24px 64px rgba(0,0,0,.6)}
+  padding:20px 22px;box-shadow:0 24px 64px rgba(0,0,0,.6);max-height:92vh;overflow-y:auto}
 .about-head{display:flex;align-items:center;gap:14px}
 .about-logo{width:52px;height:52px;flex:none;display:grid;place-items:center;border-radius:14px;color:#fff;
   background:linear-gradient(135deg,var(--accent),#7c6cff);box-shadow:0 4px 16px rgba(76,194,255,.35)}
@@ -223,6 +223,17 @@ body[data-view="diff"] #diff{display:block}
 .about-copy{font-size:11.5px;color:var(--dim);margin-top:12px;text-align:center}
 .about-copy a{color:var(--dim);cursor:pointer;text-decoration:none}
 .about-copy a:hover{color:var(--accent)}
+#feedback-form h2{font-size:15px;margin:16px 0 12px}
+#feedback-fields{border:0;padding:0;margin:0;min-width:0}
+#feedback-form label{display:block;margin-bottom:10px;font-size:12.5px}
+#feedback-form [hidden]{display:none}
+#feedback-form textarea,#feedback-contact,#feedback-type{display:block;width:100%;margin-top:4px;
+  padding:7px 9px;border:1px solid #37445a;border-radius:6px;background:#0d1017;color:var(--text);font:inherit}
+#feedback-form textarea{resize:vertical;min-height:54px;user-select:text}
+#feedback-log,#feedback-copy-text{font-family:var(--mono)}
+#feedback-status{font-size:12.5px;color:var(--accent)}
+#feedback-status:empty{display:none}
+.feedback-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
 
 /* ===== 浮层 ===== */
 #tip{position:fixed;display:none;background:rgba(10,14,21,.94);border:1px solid #2c3646;border-radius:8px;

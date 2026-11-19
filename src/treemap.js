@@ -351,8 +351,10 @@ function copyPath(p,fbEl){
     document.body.appendChild(t); t.select();
     var done=false; try{ done=document.execCommand('copy'); }catch(e){ }
     document.body.removeChild(t);
-    if(done){ ok(); } else { fail(); } }
+    if(done){ ok(); } else { fail(); }
+    return done; }
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(p).then(ok,fallback);
-  } else { fallback(); }
+    return navigator.clipboard.writeText(p).then(function(){ ok(); return true; },fallback);
+  }
+  return Promise.resolve(fallback());
 }

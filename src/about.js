@@ -8,6 +8,7 @@
     home:   'https://ikanp.top/disklens/',
     github: 'https://github.com/AriesYB/disklens',
     issues: 'https://github.com/AriesYB/disklens/issues',
+    feedback: 'https://ikanp.top/api/feedback/disklens',
     rel:    'https://github.com/AriesYB/disklens/releases',
     site:   'https://ikanp.top'
   };
@@ -23,6 +24,7 @@
     window.open(url, '_blank', 'noopener');
   }
   function openAbout() {
+    showFeedback(false);
     $('about-mask').style.display = 'flex';
     loadVersion();
     fetchDiag(function (d) {
@@ -34,7 +36,6 @@
 
   function loadVersion() {
     var el = $('about-ver');
-    el.textContent = 'v1.1.0';   // 兜底
     if (TAURI && window.__TAURI__.app && window.__TAURI__.app.getVersion) {
       window.__TAURI__.app.getVersion().then(function (v) {
         if (v) el.textContent = 'v' + v;
@@ -59,15 +60,114 @@
     }
     return '上次会话正常退出 · 本机日志留档 ' + (d.panics ? ('（含 panic ' + d.panics + ' 次）') : '');
   }
-  function buildReport(d) {
+  function buildReport(d, tailLimit, includeNotice) {
+    function tail(text, empty) {
+      if (!text) return empty;
+      if (!tailLimit || text.length <= tailLimit) return text;
+      return '…（仅保留近期日志）\n' + text.slice(-tailLimit);
+    }
     return 'DiskLens 诊断报告\n' +
       '版本: v' + (d.version || '') + '\n' +
       '系统: ' + (d.os || '') + '\n' +
       '上次会话: ' + (d.lastAbnormal ? '异常退出' : '正常') + '\n' +
       'PANIC 次数: ' + (d.panics || 0) + '\n' +
-      '\n── 上次会话日志尾部 ──\n' + (d.prevTail || '（无）') +
-      '\n\n── 当前会话日志尾部 ──\n' + (d.curTail || '（空）') +
-      '\n\n注：日志可能包含本机目录路径，提交到公开仓库前请自行检查删除。';
+      '\n── 上次会话日志尾部 ──\n' + tail(d.prevTail, '（无）') +
+      '\n\n── 当前会话日志尾部 ──\n' + tail(d.curTail, '（空）') +
+      (includeNotice ? '\n\n注：日志可能包含本机目录路径，提交到公开仓库前请自行检查删除。' : '');
+  }
+
+  function showFeedback(visible) {
+    $('about-overview').hidden = visible;
+    $('feedback-form').hidden = !visible;
+    if (visible) $('feedback-text').focus();
+  }
+
+  function loadFeedbackLog() {
+    var toggle = $('feedback-include-log');
+    var preview = $('feedback-log-preview');
+    var log = $('feedback-log');
+    preview.hidden = !toggle.checked;
+    if (!toggle.checked || log.value) return;
+
+    toggle.disabled = true;
+    $('feedback-submit').disabled = true;
+    log.placeholder = '正在读取日志…';
+    log.readOnly = true;
+    feed.diagReport(function (report) {
+      toggle.disabled = false;
+      $('feedback-submit').disabled = false;
+      log.readOnly = false;
+      log.placeholder = '';
+      if (report) {
+        log.value = buildReport(report, 3800, false).slice(0, log.maxLength);
+      } else {
+        toggle.checked = false;
+        preview.hidden = true;
+        $('feedback-status').textContent = '无法读取诊断日志。你仍可提交文字反馈。';
+      }
+    });
+  }
+
+  async function submitFeedback(event) {
+    event.preventDefault();
+    var form = $('feedback-form');
+    var fields = $('feedback-fields');
+    var submit = $('feedback-submit');
+    var status = $('feedback-status');
+    if (submit.disabled) return;
+    var text = $('feedback-text').value.trim();
+    if (!text) {
+      status.textContent = '请填写反馈内容。';
+      $('feedback-text').focus();
+      return;
+    }
+    var payload = {
+      type: $('feedback-type').value,
+      text: text,
+      contact: $('feedback-contact').value.trim(),
+      version: $('about-ver').textContent.replace(/^v/, ''),
+    };
+    if ($('feedback-include-log').checked && $('feedback-log').value.trim()) {
+      payload.diagnostics = $('feedback-log').value.trim();
+    }
+    fields.disabled = submit.disabled = true;
+    $('feedback-copy-preview').hidden = true;
+    $('feedback-copy-text').value = '';
+    status.textContent = '正在提交…';
+    var controller = new AbortController();
+    var timeout = setTimeout(function () { controller.abort(); }, 10000);
+    try {
+      var response = await fetch(URLS.feedback, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      if (!response.ok) throw new Error(response.status === 429 ? 'rate-limit' : 'server');
+      var result = await response.json();
+      if (result.ok !== true || typeof result.id !== 'string') throw new Error('server');
+      form.reset();
+      $('feedback-log-preview').hidden = true;
+      status.textContent = '反馈已提交。编号 ' + result.id;
+    } catch (error) {
+      clearTimeout(timeout);
+      var kind = { bug: '问题', suggest: '建议', other: '其他' }[payload.type];
+      var copy = ['DiskLens v' + payload.version + ' · ' + kind, payload.text];
+      if (payload.contact) copy.push('联系方式：' + payload.contact);
+      if (payload.diagnostics) copy.push(payload.diagnostics);
+      var copyText = copy.join('\n\n');
+      var copied = await copyPath(copyText, null);
+      status.textContent = (error.message === 'rate-limit' ? '提交太频繁，请稍后再试。' : '未收到提交确认。') +
+        (copied ? '已复制反馈内容。' : '可手动复制下方内容。');
+      if (!copied) {
+        $('feedback-copy-text').value = copyText;
+        $('feedback-copy-preview').hidden = false;
+      }
+    } finally {
+      clearTimeout(timeout);
+      fields.disabled = submit.disabled = false;
+    }
   }
 
   window.addEventListener('DOMContentLoaded', function () {
@@ -80,20 +180,29 @@
     $('about-home').addEventListener('click', function () { openUrl(URLS.home); });
     $('about-github').addEventListener('click', function () { openUrl(URLS.github); });
     $('about-issues').addEventListener('click', function () { openUrl(URLS.issues); });
+    $('about-feedback').addEventListener('click', function () { showFeedback(true); });
+    $('feedback-back').addEventListener('click', function () {
+      showFeedback(false);
+      $('about-feedback').focus();
+    });
+    $('feedback-log-option').hidden = !TAURI || !window.feed || !feed.diagReport;
+    $('feedback-include-log').addEventListener('change', loadFeedbackLog);
+    $('feedback-form').addEventListener('submit', submitFeedback);
     $('about-rel').addEventListener('click', function () { openUrl(URLS.rel); });
     $('about-site').addEventListener('click', function () { openUrl(URLS.site); });
     // 诊断反馈：复制报告 / 带日志提 Issue（用户点击确认后才离开本机）
     $('about-diag-copy').addEventListener('click', function () {
       fetchDiag(function (d) {
         if (!d) { setStatus('诊断日志不可用（浏览器模式或读取失败）', 'err'); return; }
-        copyPath(buildReport(d), null);
-        setStatus('已复制诊断报告——粘贴给开发者或保存备用', 'done');
+        copyPath(buildReport(d, 0, true), null).then(function (copied) {
+          setStatus(copied ? '已复制诊断报告' : '复制诊断报告失败', copied ? 'done' : 'err');
+        });
       });
     });
     $('about-diag-issue').addEventListener('click', function () {
       fetchDiag(function (d) {
         if (!d) { setStatus('诊断日志不可用（浏览器模式或读取失败）', 'err'); return; }
-        var body = buildReport(d);
+        var body = buildReport(d, 0, true);
         if (body.length > 6000) body = body.slice(0, 6000) + '\n…（过长截断，可用「复制诊断报告」补充）';
         var url = URLS.github + '/issues/new?title=' +
           encodeURIComponent('DiskLens 问题反馈（附诊断日志）') +

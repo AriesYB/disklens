@@ -89,7 +89,7 @@ function renderAiPanel() {
 
   var prompt = '';
   if (aiMode === 'scan') {
-    el('ai-prompt-label').textContent = '① 复制下面的指令发给 AI 助手（ZCode / Claude Code 等）——它分析后这里会弹出确认面板：';
+    el('ai-prompt-label').textContent = '① 复制下面的指令发给 AI 助手。分析完成后，这里会弹出确认面板。';
     el('ai-body').innerHTML = '';   // 说明都在指令里，面板只留复制动作
     var chOk = aiChInfo && aiChInfo.enabled && aiChInfo.port;
     if (!IN_TAURI) {
