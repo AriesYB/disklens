@@ -2413,7 +2413,10 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                     if let Some(p) = get_p("path") {
                         if !p.trim().is_empty() {
                             let lower = norm_query_path(&p);
-                            match find_snapshot_tree_node(v.get_mut("tree"), &lower) {
+                            let found = v
+                                .get_mut("tree")
+                                .and_then(|t| find_snapshot_tree_node(t, &lower));
+                            match found {
                                 Some(sub) => {
                                     let taken = sub.take();
                                     if let Some(obj) = v.as_object_mut() {
