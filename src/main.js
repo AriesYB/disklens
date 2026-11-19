@@ -41,6 +41,10 @@ function scopeKey(roots){    // 范围标识：小写排序后拼接（'d:\' / '
 function curScopeKey(){
   return scopeKey(ROOTS.length ? ROOTS : [String(window.ROOT||'C:\\')]);
 }
+// 当前展示范围的口语名（空态/提示用）：多盘=「💻 所有磁盘」，单盘=盘根
+function scopeLabel(){
+  return isMultiRoot() ? '💻 所有磁盘' : String(window.ROOT||'');
+}
 // 路径是否属于当前展示范围：多盘=任一根前缀命中；单盘=该盘前缀
 function inScope(p){
   var pl = String(p||'').toLowerCase();
@@ -469,11 +473,24 @@ function render(){
   if(!curPath) return;
   var node = store.get(curPath.toLowerCase());
   if(!node){
-    // 该范围还没有数据（切到没扫过的盘）：上一范围画面已在切换时清掉，
-    // 这里只挂等待提示；首批事件到齐后走正常渲染
+    // 该范围还没有数据（切到没扫过的盘）：不用转圈 spinner（会被误读成正在扫描），
+    // 静态空态 + 清掉上一范围残留的面包屑/摘要/底栏，口径统一指向新范围
+    var b=document.getElementById('bar');
+    if(b) b.innerHTML='<b>'+esc(scopeLabel())+' · 尚未扫描</b>';
+    var sm=document.getElementById('summary');
+    if(sm){
+      var parts=[];
+      if(volTotal) parts.push('卷总容量 <b>'+fmt(volTotal)+'</b>');
+      if(volUsed) parts.push('卷已用 <b>'+fmt(volUsed)+'</b>');
+      parts.push('<span style="color:var(--muted,#9a9a9a)">尚未扫描 · 点「开始扫描」开始</span>');
+      sm.innerHTML=parts.join(' · ');
+    }
+    var st=document.getElementById('foot-stats');
+    if(st) st.innerHTML='当前 <b>'+esc(scopeLabel())+'</b> · 尚未扫描';
     var wt = document.getElementById('wait');
     if(wt){ wt.style.display='flex';
-      wt.innerHTML='<div><div class="spin"></div><div style="margin-top:12px">该范围尚未扫描 —— 点击「开始扫描」开始</div></div>'; }
+      wt.innerHTML='<div><div style="font-size:46px;margin-bottom:14px">🗂️</div>'+
+        '<div style="color:#9a9a9a">'+esc(scopeLabel())+' 还没有扫描记录 —— 点上方「开始扫描」开始</div></div>'; }
     return;
   }
   updateCrumb(node);
