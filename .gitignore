@@ -26,6 +26,9 @@ dist-ssr
 # 应用更新签名私钥——绝对不能提交；丢了就无法给已装用户推更新
 .tauri/*.key
 
+# 本机工具链绕行配置（含绝对路径，机器相关勿提交；说明见文件内注释）
+/.cargo/config.toml
+
 # Rust 构建产物（含多实例验证用的 target-dev 编译缓存，2.7GB+）
 src-tauri/target/
 src-tauri/target-dev/
