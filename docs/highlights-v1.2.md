@@ -44,8 +44,10 @@
 **完整闭环**：
 ```
 AI: GET /api/status（没扫？POST /api/scan 自己触发，轮询进度）
- → GET /api/scan（树形快照：层级构成+每层小项聚合+大文件叶+受限目录）
- → 需要更细？GET /api/tree?path=… 无阈值下钻任意目录
+ → GET /api/tree（不带 path：根下 3 层全景一次到手；?depth=1..=8&min=字节 可调）
+ → 需要更细？GET /api/tree?path=…&depth=N 多层级精准下钻（含大文件 file 标记；
+   <min 聚合进 agg、超出单列上限计 more、节点预算截断标 truncated——信息完备不刷屏）
+ → 全量统计口径才拉 GET /api/scan（树形快照+类型+卷口径+受限目录，MB 级）
  → POST /api/proposal（migrate/cleanup/note 三类提案）
  → DiskLens 弹确认面板 → 你勾选 → 串行执行（预检→复制→校验→junction）
  → AI 轮询 /api/proposal 拿执行结果
@@ -65,7 +67,7 @@ AI: GET /api/status（没扫？POST /api/scan 自己触发，轮询进度）
 
 **零依赖实现**：手写 std TcpListener 迷你 HTTP 服务（约 300 行），不引入 tokio/axum——与项目"前端零框架、无构建步骤"的哲学一致。Rust 侧对快照零解析原样回传。
 
-**实测数据**：真实 C 盘 231.9GB 树形快照 1.3MB（2 万节点预算封顶）；WinSxS 层 agg 聚合 18575 个小项一目了然；`/api/tree` 下钻 drivers 目录列出 8 个 1~5MB 小目录（突破快照 10MB 粒度）。
+**实测数据**：真实 C 盘 231.9GB 树形快照 1.3MB（2 万节点预算封顶）；WinSxS 层 agg 聚合 18575 个小项一目了然；`/api/tree?path=…&min=0` 可列出 1~5MB 小目录（默认 min=10MB 与快照同粒度，`min` 参数按需放开）。
 
 ---
 
