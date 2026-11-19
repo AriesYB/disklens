@@ -461,7 +461,7 @@ fn register_big_file(
     if let Ok(mut m) = files.lock() {
         let e = m.entry(parent_lower.to_string()).or_default();
         if (e.len() as u64) < MAX_BIG_FILES_PER_DIR {
-            e.push((name.to_string(), s, al));
+            e.push((name.to_string_lossy().into_owned(), s, al));
         }
     }
 }
