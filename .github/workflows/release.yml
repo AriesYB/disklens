@@ -3,13 +3,16 @@
 # 前置（仓库 Settings → Secrets and variables → Actions 配置一次）：
 #   TAURI_SIGNING_PRIVATE_KEY           = .tauri/disklens-updater.key 的文件内容（整段粘贴）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  = 私钥密码（没设密码就建一个空字符串 Secret）
+#   IKANP_SSH_HOST / IKANP_SSH_USER / IKANP_SSH_KEY（可选）
+#                                       = 服务器 SSH 信息，用于 CI 自动同步 latest.json
 #
 # 以后发版只需：
 #   1. 升版本号（package.json / package-lock.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json）
 #   2. git tag -a v1.x.0 -m "一句话更新说明" && git push origin v1.x.0
 # → 自动跑测试 → 构建 → Release 页面出现 setup.exe/.sig/latest.json/disklens.exe
 #   （latest.json 挂在 Release 附件上，老客户端经 GitHub 源自动收到更新提示；
-#    ikanp.top 服务器源仍需手动 scp 一次 dist/latest.json）
+#    ikanp.top 服务器源由 CI 自动同步，保证与 Release 的 exe 是同一构建、签名必然匹配；
+#    未配置 SSH secrets 时才需要手动 scp dist/latest.json——切勿用本地构建的清单，签名会对不上）
 
 name: Release
 
@@ -23,6 +26,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      # 供「同步更新清单」步骤的条件判断（secrets 不能直接用在 if 里）
+      IKANP_SSH_HOST: ${{ secrets.IKANP_SSH_HOST }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,11 +63,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: 生成更新清单（说明取自 tag 附注）
+      - name: 生成更新清单（说明取自 tag 说明，lightweight tag 时回退 commit 标题）
         shell: bash
         run: |
           git fetch origin --tags --force   # 确保附注 tag 对象在本地（checkout 浅时兜底）
-          TAG_MSG="$(git tag -l --format='%(contents)' ${{ github.ref_name }} | head -1)"
+          TAG_MSG="$(git tag -l --format='%(contents:subject)' ${{ github.ref_name }})"
+          if [ -z "$TAG_MSG" ]; then TAG_MSG="$(git log -1 --format='%s')"; fi
           if [ -z "$TAG_MSG" ]; then TAG_MSG="性能优化与问题修复。"; fi
           node scripts/gen-updater-manifest.mjs "$TAG_MSG"
 
@@ -76,11 +83,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 重跑时 release 可能已存在：不视为失败；上传用 --clobber 整套覆盖，
+          # 保证 exe / .sig / latest.json 三者永远出自同一构建（签名才一致）
           gh release create "${{ github.ref_name }}" \
             --title "DiskLens ${{ github.ref_name }}" \
-            --generate-notes --latest
-          gh release upload "${{ github.ref_name }}" \
+            --generate-notes --latest || true
+          gh release upload --clobber "${{ github.ref_name }}" \
             src-tauri/target/release/bundle/nsis/*.exe \
             src-tauri/target/release/bundle/nsis/*.exe.sig \
             dist/latest.json \
             "disklens-${{ github.ref_name }}.exe"
+
+      # 清单必须与 Release 上的 exe 出自同一构建，签名才匹配。
+      # v1.2.0 事故复盘：本地构建的清单先 scp 到了服务器，CI 随后重新构建上传了
+      # 新 exe（Rust/NSIS 构建非字节可重现），服务器旧签名 ≠ Release 新 exe，
+      # 客户端报 The signature verification failed。CI 在此自动同步，杜绝再犯。
+      - name: 同步更新清单到 ikanp.top
+        if: env.IKANP_SSH_HOST != ''
+        shell: bash
+        env:
+          IKANP_SSH_USER: ${{ secrets.IKANP_SSH_USER }}
+          IKANP_SSH_KEY: ${{ secrets.IKANP_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$IKANP_SSH_KEY" > ~/.ssh/ikanp_deploy_key
+          chmod 600 ~/.ssh/ikanp_deploy_key
+          scp -i ~/.ssh/ikanp_deploy_key -o StrictHostKeyChecking=accept-new \
+            dist/latest.json \
+            "$IKANP_SSH_USER@$IKANP_SSH_HOST:/usr/share/nginx/ikanp-home/downloads/disklens/latest.json"
+          rm -f ~/.ssh/ikanp_deploy_key
