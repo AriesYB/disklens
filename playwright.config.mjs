@@ -11,7 +11,7 @@ export default defineConfig({
     viewport: { width: 1280, height: 800 },
   },
   webServer: {
-    command: 'npx --yes serve -l 5180 src',
+    command: 'npm run dev',
     url: 'http://127.0.0.1:5180',
     reuseExistingServer: true,
     timeout: 30000,
