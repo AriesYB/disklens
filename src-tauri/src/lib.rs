@@ -1925,6 +1925,67 @@ fn norm_query_path(raw: &str) -> String {
     s.to_lowercase()
 }
 
+/// 快照 tree 裁剪到 depth 层（depth=0 即折叠本层全部子项）。
+/// 被 VP 掉的层不丢信息：子项数量与字节并入该节点的 agg{n,s,al}（与已有 agg 合并）
+fn prune_snapshot_tree(node: &mut serde_json::Value, depth: u32) {
+    let Some(obj) = node.as_object_mut() else { return };
+    let Some(mut children_val) = obj.remove("c") else { return };
+    if depth == 0 {
+        let mut n: u64 = 0;
+        let mut s: u64 = 0;
+        let mut al: u64 = 0;
+        if let Some(children) = children_val.as_array() {
+            for c in children {
+                n += 1;
+                s += c.get("s").and_then(|x| x.as_u64()).unwrap_or(0);
+                al += c.get("al").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+        }
+        if let Some(a) = obj.get("agg").and_then(|x| x.as_object()).cloned() {
+            n += a.get("n").and_then(|x| x.as_u64()).unwrap_or(0);
+            s += a.get("s").and_then(|x| x.as_u64()).unwrap_or(0);
+            al += a.get("al").and_then(|x| x.as_u64()).unwrap_or(0);
+        }
+        let mut agg = serde_json::Map::new();
+        agg.insert("n".into(), n.into());
+        agg.insert("s".into(), s.into());
+        if al > 0 {
+            agg.insert("al".into(), al.into());
+        }
+        obj.insert("agg".into(), agg.into());
+        return;
+    }
+    if let Some(children) = children_val.as_array_mut() {
+        for ch in children.iter_mut() {
+            prune_snapshot_tree(ch, depth - 1);
+        }
+    }
+    obj.insert("c".into(), children_val);
+}
+
+/// 在快照 tree 里按路径（小写）找子树节点（前端快照的 p 为原大小写，两侧都归一小写）
+fn find_snapshot_tree_node<'a>(
+    node: &'a mut serde_json::Value,
+    path_lower: &str,
+) -> Option<&'a mut serde_json::Value> {
+    let matches = node
+        .get("p")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+        == Some(path_lower);
+    if matches {
+        return Some(node);
+    }
+    let arr = node.get_mut("c")?.as_array_mut()?;
+    for ch in arr.iter_mut() {
+        if let Some(found) = find_snapshot_tree_node(ch, path_lower) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// /api/tree 单目录单列子项上限：其余按 `more` 计数（配合预算防"一大坨"）
 const TREE_MAX_CHILDREN: usize = 200;
 /// /api/tree 单次响应的全局节点预算：超出即停止下钻并标 truncated
@@ -2187,12 +2248,12 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                 "app": "disklens",
                 "version": env!("CARGO_PKG_VERSION"),
                 "root": root,
-                "flow": "推荐：GET /api/tree（不带 path，一次拿根下 3 层全景）→ 对目标目录 GET /api/tree?path=...&depth=3 精准下钻。扫描完成后无需逐层探索；GET /api/scan 是全量快照（MB 级），只在需要类型分布/卷口径/受限目录汇总时才拉",
+                "flow": "推荐：GET /api/tree（不带 path，一次拿根下 3 层全景）→ 对目标目录 GET /api/tree?path=...&depth=3 精准下钻。所有响应都是几 KB 的 JSON，直接读 stdout，不要 -o 落盘再解析；只在需要类型分布/卷口径/受限目录时才拉 /api/scan?tree=0&depth=1",
                 "endpoints": [
                     "GET  /api/status    — 扫描状态 {scanning, hasSnapshot, root}（先查这个）",
                     "POST /api/scan      — 触发扫描 {\"root\":\"C:\\\\\"} 或 {\"roots\":[\"C:\\\\\",\"D:\\\\\"]}（未扫描/换盘时用）",
                     "GET  /api/tree      — 多层级下钻：?path=<目录>&depth=<1..=8,默认3>&min=<字节,默认10MB>。一次返回 depth 层的目录+大文件（含 file 标记），<min 聚合进 agg{n,s}，more=未单列数，truncated=预算截断。path 不带则用根；正/反斜杠等价、大小写不敏感",
-                    "GET  /api/scan      — 全量快照（较大）：树形构成 tree（≥10MB 递归+每层 agg）、类型、卷口径、受限目录 denied",
+                    "GET  /api/scan      — 扫描快照：全量时树+类型+卷口径+受限目录 denied（MB 级）。裁剪参数：?depth=4 树只留 4 层（被裁层折叠进 agg）、?tree=0 不要树只要统计、?path=<目录> 只取子树——带参数的响应为 KB 级",
                     "GET  /api/proposal  — 当前提案状态（轮询执行结果）",
                     "POST /api/proposal  — 提交提案 {summary, items:[{action:migrate|cleanup|note, src, dest_root?, reason?}]}"
                 ],
@@ -2322,8 +2383,67 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
         ("GET", "/api/scan") => {
             let g = state.snapshot.lock().unwrap_or_else(|e| e.into_inner());
             match g.as_ref() {
-                Some(s) => http_res(&mut stream, 200, "OK", s),
                 None => http_res(&mut stream, 404, "Not Found", "{\"error\":\"no scan yet\"}"),
+                Some(s) => {
+                    // 无裁剪参数：原样回传全量快照（MB 级，兼容旧行为）
+                    let q = head.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                    let params = parse_query(q);
+                    let get_p = |k: &str| {
+                        params
+                            .iter()
+                            .find(|(kk, _)| kk == k)
+                            .map(|(_, v)| v.clone())
+                    };
+                    if get_p("depth").is_none()
+                        && get_p("tree").is_none()
+                        && get_p("path").is_none()
+                    {
+                        http_res(&mut stream, 200, "OK", s);
+                        return;
+                    }
+                    // 带裁剪参数：解析快照后按需瘦身——响应小到能直接读 stdout，
+                    // AI 不必 -o 落盘再解析（落盘易踩 Git Bash /tmp 与原生程序路径错位）
+                    let mut v: serde_json::Value = match serde_json::from_str(s) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            http_res(&mut stream, 200, "OK", s);
+                            return;
+                        }
+                    };
+                    if let Some(p) = get_p("path") {
+                        if !p.trim().is_empty() {
+                            let lower = norm_query_path(&p);
+                            match find_snapshot_tree_node(v.get_mut("tree"), &lower) {
+                                Some(sub) => {
+                                    let taken = sub.take();
+                                    if let Some(obj) = v.as_object_mut() {
+                                        obj.insert("tree".into(), taken);
+                                    }
+                                    v["root"] = serde_json::json!(lower);
+                                }
+                                None => {
+                                    let body = serde_json::json!({
+                                        "error": "path not found in snapshot tree",
+                                        "hint": "路径小写；先 GET /api/tree?depth=3 看看快照里有哪些目录"
+                                    });
+                                    http_res(&mut stream, 404, "Not Found", &body.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if get_p("tree").as_deref() == Some("0") {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.remove("tree");
+                        }
+                    } else if let Some(d) = get_p("depth") {
+                        let depth = d.trim().parse::<u32>().unwrap_or(u32::MAX).min(16);
+                        if let Some(tree) = v.get_mut("tree") {
+                            prune_snapshot_tree(tree, depth);
+                        }
+                    }
+                    http_res(&mut stream, 200, "OK", &v.to_string());
+                }
             }
         }
         ("GET", "/api/proposal") => {

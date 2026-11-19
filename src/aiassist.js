@@ -108,10 +108,10 @@ function renderAiPanel() {
         '（多盘齐扫可传多个，如 {"roots":["C:\\\\","D:\\\\"]}），之后每 5 秒轮询 /api/status 直到 scanning=false 且 hasSnapshot=true（大目录需几十秒到几分钟，期间向我播报进度）；\n' +
         '  · scanning=true（正在扫）：不要重复触发，轮询等它完成即可；\n' +
         '  · hasSnapshot=true 且 scanning=false：直接进第 1 步。\n' +
-        '第 1 步·取数：curl -s ' + hd + ' ' + base + '/api/scan\n' +
-        '  快照的 tree 字段是树形构成：节点 {n 名称, p 路径, s 大小, al 磁盘占用, c 子项[], agg 小项聚合, d 受限, f 文件叶}，' +
-        '可直接看出层级分布（目录里哪个子目录/文件占大头），不需要自己 du。\n' +
-        '  要看任意目录更细的分布（突破 10MB 粒度、含小目录）：curl -s ' + hd + ' "' + base + '/api/tree?path=c%3A%5Csome%5Cdir" 返回其直接子目录。\n' +
+        '第 1 步·取数（所有响应都是几 KB 的 JSON，直接读 curl 输出即可；不要用 -o 存文件再读——Git Bash 的 /tmp 与原生 Python 的路径不一致，会 FileNotFoundError；确要落盘请写当前目录相对路径）：\n' +
+        '  · 层级构成：curl -s ' + hd + ' "' + base + '/api/tree?depth=3" —— 根下 3 层的目录+大文件，节点 {name, path, s 大小, al 占用, file 文件叶, agg{n,s} 低于 min 的聚合项, more 未单列数, truncated 预算截断}，可直接看出目录里谁占大头，不需要自己 du；\n' +
+        '  · 要看任意目录更细的分布（突破 10MB 粒度、含小目录）：curl -s ' + hd + ' "' + base + '/api/tree?path=c%3A%5Csome%5Cdir&depth=4&min=1048576"；\n' +
+        '  · 类型分布/卷口径/受限目录清单：curl -s ' + hd + ' "' + base + '/api/scan?tree=0&depth=1"（全量快照是 MB 级，别默认拉全量；确需全量树用 /api/scan?depth=4）。\n' +
         '第 2 步·分析并回传提案：curl -s -X POST ' + hd + ' -d "@proposal.json" ' + base + '/api/proposal\n' +
         '  body: {"summary":"一句话结论","items":[\n' +
         '    {"action":"migrate","src":"绝对路径","dest_root":"D:\\\\","reason":"为什么值得 junction 迁移"},\n' +
@@ -262,7 +262,7 @@ function refreshAiChannel(){
     if(!aiChInfo || !aiChInfo.port) return;
     var b='http://127.0.0.1:'+aiChInfo.port;
     var txt='DiskLens AI 联动通道\n端点: '+b+'\n令牌: '+aiChInfo.token+
-      '\n示例: curl -s -H "X-DiskLens-Token: '+aiChInfo.token+'" '+b+'/api/scan';
+      '\n示例: curl -s -H "X-DiskLens-Token: '+aiChInfo.token+'" "'+b+'/api/tree?depth=3"（响应几 KB，直接读 stdout）';
     copyPath(txt,null);
     setStatus('已复制通道接入信息','done');
   });
