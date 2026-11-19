@@ -107,6 +107,37 @@ test.describe('DiskLens 浏览器冒烟', () => {
     await page.evaluate("hideCtx()");
   });
 
+  test('回归：手动重扫后大文件榜结构完好（#files 容器曾被整体清空）', async () => {
+    await page.evaluate("document.querySelector('[data-view=\"files\"]').click()");
+    await page.evaluate("startScan()");   // 曾经的 bug：beginScanUI 把 #files 连搜索框一起 innerHTML=''
+    await waitScanDone(page);
+    expect(await page.evaluate("!!document.getElementById('files-bar')")).toBe(true);
+    expect(await page.evaluate("!!document.getElementById('file-search')")).toBe(true);
+    const rows = await page.evaluate("document.querySelectorAll('#files-body .f-row').length");
+    expect(rows).toBeGreaterThan(0);
+  });
+
+  test('切换范围：不自动扫描，切回已扫范围秒显上次结果', async () => {
+    async function pick(v) {
+      await page.evaluate(`(() => {
+        const sel = document.getElementById('root-drives');
+        sel.value = ${JSON.stringify(v)};
+        sel.dispatchEvent(new Event('change'));
+      })()`);
+      await page.waitForTimeout(300);
+    }
+    // 切到未扫过的 D:\ → 不启动扫描，提示待扫
+    await pick('D:\\');
+    expect(await page.evaluate('window.scanning')).toBe(false);
+    expect(await page.evaluate("document.getElementById('status').textContent")).toContain('尚未扫描');
+    // 切回 C:\ → 秒显上次结果，仍不自动扫描，榜单数据回到 C: 口径
+    await pick('C:\\');
+    expect(await page.evaluate('window.scanning')).toBe(false);
+    expect(await page.evaluate("document.getElementById('status').textContent")).toContain('上次扫描结果');
+    const rows = await page.evaluate("document.querySelectorAll('#files-body .f-row').length");
+    expect(rows).toBeGreaterThan(0);
+  });
+
   test('收尾：全程零渲染错误', async () => {
     const errs = await page.evaluate('window.__errs ? window.__errs : []');
     expect(errs).toEqual([]);

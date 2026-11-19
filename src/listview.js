@@ -112,14 +112,18 @@ function nameMatches(q, name){
   return rx.test(n);
 }
 
-// 当前榜单数据集：无搜索 = 全部 ≥1MB 大文件；有搜索 = 命中的大文件 + 命中的目录（按大小降序）
+// 当前榜单数据集：无搜索 = 当前范围全部 ≥1MB 大文件；有搜索 = 命中的大文件 + 命中的目录（按大小降序）
+// 会话级多范围：store/fileIndex 里可能留着其他盘扫过的数据，按当前范围前缀过滤防串盘
 function filesPool(){
   var arr=[];
-  fileIndex.forEach(function(n){ if(n.s>=BIG_FILE_MIN) arr.push(n); });
+  fileIndex.forEach(function(n){
+    if(n.s<BIG_FILE_MIN || !inScope(n.p)) return;
+    arr.push(n);
+  });
   if(fileSearch){
     var out=arr.filter(function(n){ return nameMatches(fileSearch, n.n); });
     store.forEach(function(n){
-      if(!n.f && n.s>0 && nameMatches(fileSearch, n.n)) out.push(n);   // 目录也参与：node_modules 猎手
+      if(!n.f && n.s>0 && inScope(n.p) && nameMatches(fileSearch, n.n)) out.push(n);   // 目录也参与：node_modules 猎手
     });
     arr=out;
   }
@@ -225,7 +229,7 @@ function extOf(name){
 function typesPool(){
   var m=new Map();   // ext -> {ext,n,s,al}
   fileIndex.forEach(function(f){
-    if(f.s<BIG_FILE_MIN) return;
+    if(f.s<BIG_FILE_MIN || !inScope(f.p)) return;   // 与大文件榜同口径：只聚合当前范围
     var e=extOf(f.n)||'（无扩展名）';
     var t=m.get(e);
     if(!t){ t={ext:e,n:0,s:0,al:0}; m.set(e,t); }
@@ -314,9 +318,16 @@ function renderDiff(){
       box.innerHTML='<div class="t-empty">完成两次扫描后可查看：哪些目录在增长、哪些是新出现的大头</div>';
       return;
     }
+    // 上次扫描必须是同一范围：跨范围（如上次 C: 这次 D:）对比没有意义
+    function rk(s){ return String(s||'').toLowerCase().split(',').filter(Boolean).sort().join(','); }
+    if(rk(prev.root) !== rk(ROOTS.join(','))){
+      if(meta) meta.innerHTML='上次扫描是其他范围（'+esc(prev.root)+'）——重新扫描当前范围后即可对比';
+      box.innerHTML='<div class="t-empty">历史对比按范围分开：切回上次扫描的范围，或重新扫描当前范围</div>';
+      return;
+    }
     var grown=[], added=[];
     store.forEach(function(n){
-      if(n.f || n.s < 1024*1024) return;
+      if(n.f || n.s < 1024*1024 || !inScope(n.p)) return;
       var old = prev.m.get(n.p.toLowerCase());
       if(old == null){ if(n.done) added.push(n); }
       else if(n.done && n.s > old) grown.push({ n:n.n, p:n.p, s:n.s, delta:n.s-old });

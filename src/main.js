@@ -15,8 +15,7 @@ var BIG_FILE_MIN = 10 * 1024 * 1024;   // 与后端 MIN_BIG_FILE 一致：小于
 
 // ===== 双口径 / 差额透明化 =====
 // s = 逻辑大小（size），al = 磁盘占用（簇对齐/云占位 0/硬链接副本计 0）
-var deniedCount = 0;         // 无权限目录数（当前扫描范围）
-var deniedSeen = {};         // 去重：同一目录可能收到多次 denied 事件
+var deniedSeen = {};         // 无权限目录（会话级累计，展示时按范围过滤；同一目录去重）
 var volUsed = 0;             // 当前根所在卷的已用空间（list_volumes 的 total-free；0=未知）
 var volTotal = 0;            // 同上：卷总容量（0=未知）
 var aiSnapReady = false;     // 已向 AI 通道推送过至少一次扫描快照
@@ -30,6 +29,43 @@ var THISPC = '\\';           // 虚拟根路径（单字符反斜杠，不会与
 function isMultiRoot(){ return ROOTS.length > 1; }
 // 当前展示根的 store 键：多盘=虚拟根，单盘=盘根
 function curRootKey(){ return isMultiRoot() ? THISPC.toLowerCase() : String(window.ROOT||'').toLowerCase(); }
+
+// ===== 会话级多范围记忆 =====
+// store 键按盘符前缀天然不冲突（'c:\…' vs 'd:\…'），扫过的范围数据留在内存里，
+// 切换范围（盘符下拉）时直接展示该范围上次的结果，不自动清空、不自动扫描。
+var scopeAt = {};            // scopeKey -> 该范围上次扫描完成时间（启动恢复缓存时也记录）
+function scopeKey(roots){    // 范围标识：小写排序后拼接（'d:\' / 'c:\,d:\'）
+  return roots.map(function(r){ return String(r).toLowerCase(); })
+    .filter(Boolean).sort().join(',');
+}
+function curScopeKey(){
+  return scopeKey(ROOTS.length ? ROOTS : [String(window.ROOT||'C:\\')]);
+}
+// 路径是否属于当前展示范围：多盘=任一根前缀命中；单盘=该盘前缀
+function inScope(p){
+  var pl = String(p||'').toLowerCase();
+  var roots = isMultiRoot() ? ROOTS : [String(window.ROOT||'C:\\')];
+  for(var i=0;i<roots.length;i++){
+    var r = String(roots[i]).toLowerCase();
+    if(r && pl.indexOf(r)===0) return true;
+  }
+  return false;
+}
+// 当前范围内的无权限目录数
+function deniedInScope(){
+  var n = 0;
+  for(var k in deniedSeen){ if(inScope(k)) n++; }
+  return n;
+}
+// 时长口语化（「切回上次结果」提示用）
+function fmtAge(ms){
+  var m = Math.round(ms/60000);
+  if(m < 1) return '刚刚';
+  if(m < 60) return m + ' 分钟';
+  var h = Math.round(m/60);
+  if(h < 24) return h + ' 小时';
+  return Math.round(h/24) + ' 天';
+}
 // 合成根摘要对象（多盘时引擎不更新虚拟根，这里现场聚合各盘根）
 function rootsSummary(){
   var s=0, al=0, done=true;
@@ -97,8 +133,7 @@ function applyEvent(ev){
   if(ev.cloud) n.cloud = true;
   if(ev.denied){
     n.denied = true;
-    var dk = ev.path.toLowerCase();
-    if(!deniedSeen[dk]){ deniedSeen[dk] = 1; deniedCount++; }
+    deniedSeen[ev.path.toLowerCase()] = 1;
   }
   var idx = ev.path.lastIndexOf('\\');
   var parentPath = idx > 0 ? ev.path.slice(0, idx) : '';
@@ -245,21 +280,29 @@ function setWatch(on, root) {
   }
 }
 
+/* 清空各视图的动态列表体。只动 body 类容器：#files/#types/#diff 的操作条
+   （搜索框/导出按钮）是静态结构，整体 innerHTML='' 会把大文件榜永久打空 */
+function clearViewBodies(){
+  window.divs = {}; window.map.innerHTML = '';
+  document.getElementById('list').innerHTML = '';
+  document.getElementById('files-body').innerHTML = '';
+  document.getElementById('types-body').innerHTML = '';
+  document.getElementById('diff-body').innerHTML = '';
+}
+
 /* 扫描启动的统一 UI 接管：用户点按钮与 AI 触发共用（roots 数组）。
-   同范围重扫（如 AI 触发刷新）保留现有数据——重扫事件流会覆盖更新，
-   避免清空大文件榜等视图后小目录扫描没有新大文件回流、界面"变空" */
+   同范围重扫保留现有数据——重扫事件流会覆盖更新，手动与 AI 触发一致，
+   避免清空大文件榜等视图后小目录扫描没有新大文件回流、界面"变空"；
+   换范围时不清 store：其他范围扫过的数据留在内存，切回去还能秒开上次结果 */
 function beginScanUI(roots, byAI){
   var sameScope = roots.length === ROOTS.length &&
     roots.every(function(r, i){ return String(r).toLowerCase() === String(ROOTS[i]||'').toLowerCase(); });
-  var keepData = byAI && sameScope && !scanning && store.size > 0;
+  var keepData = sameScope && !scanning && store.size > 0;
   ROOTS = roots.map(function(r){ return r; });
   window.ROOT = ROOTS[0];
   if (!keepData) {
-    store.clear(); fileIndex.clear(); window.divs = {}; window.map.innerHTML = '';
-    document.getElementById('list').innerHTML = '';
-    document.getElementById('files').innerHTML = '';
+    clearViewBodies();
     window.expanded = {}; window.stack = []; selectedRow = '';
-    deniedCount = 0; deniedSeen = {};
     prevCacheLoaded = false; prevCache = null;             // 历史对比基线重置
     fileSearch = '';                                       // 搜索词随扫描重置
     var fsInp = document.getElementById('file-search');
@@ -288,17 +331,18 @@ function buildCacheJson(){
   if(!hasData) return null;
   var nodes = [];
   store.forEach(function(n){
-    if(!n.f && n.s >= 1024*1024 && n.p !== THISPC)
+    if(!n.f && n.s >= 1024*1024 && n.p !== THISPC && inScope(n.p))
       nodes.push([n.p, n.n, n.s, alOf(n), n.done?1:0, n.denied?1:0]);
   });
   var files = [];
   fileIndex.forEach(function(n){
+    if(!inScope(n.p)) return;   // 缓存只落当前范围：store 里可能还留着其他范围的数据
     files.push([n.p, n.n, n.s, alOf(n), n.cloud?1:0, n.dup?1:0]);
   });
   return JSON.stringify({
     v:1, root:ROOTS.join(','), at:Date.now(),
     volUsed:volUsed||null, volTotal:volTotal||null,
-    deniedCount:deniedCount, nodes:nodes, files:files
+    deniedCount:deniedInScope(), nodes:nodes, files:files
   });
 }
 // 扫描完成：写缓存（Rust 轮换 prev 供对比）+ 推 AI 快照
@@ -382,6 +426,7 @@ function buildAiSnapshot(){
   if(!root) return null;   // 扫描早期（s=0）也推：AI 靠 scanning 字段区分进行中/完成
   var denied = [];
   for(var k in deniedSeen){
+    if(!inScope(k)) continue;   // 只报当前扫描范围的受限目录
     var dn = store.get(k);
     if(dn) denied.push({ path:dn.p, s:dn.s||0, al:alOf(dn) });
   }
@@ -392,7 +437,7 @@ function buildAiSnapshot(){
     app:'disklens', root:ROOTS.join(','), generatedAt:new Date().toISOString(),
     scanning:scanning, volUsed:volUsed||null, volTotal:volTotal||null,
     gap:(volUsed ? volUsed - sum.al : null),
-    rootSize:sum.s, rootAlloc:sum.al, deniedCount:deniedCount,
+    rootSize:sum.s, rootAlloc:sum.al, deniedCount:deniedInScope(),
     tree: snapTree(root),      // 树形构成（多盘=虚拟根下各盘一棵；≥10MB 子项 + 每层 agg）
     denied:denied, types:types,
     drill: 'GET /api/tree?path=<dir> 返回任意目录的直接子目录（无大小阈值，基于完整扫描表）'
@@ -423,8 +468,17 @@ function pushAiSnapshot(){
 function render(){
   if(!curPath) return;
   var node = store.get(curPath.toLowerCase());
-  if(!node) return;
+  if(!node){
+    // 该范围还没有数据（切到没扫过的盘）：上一范围画面已在切换时清掉，
+    // 这里只挂等待提示；首批事件到齐后走正常渲染
+    var wt = document.getElementById('wait');
+    if(wt){ wt.style.display='flex';
+      wt.innerHTML='<div><div class="spin"></div><div style="margin-top:12px">该范围尚未扫描 —— 点击「开始扫描」开始</div></div>'; }
+    return;
+  }
   updateCrumb(node);
+  var wt2 = document.getElementById('wait');
+  if(wt2) wt2.style.display = 'none';   // 节点已就位：撤掉"尚未扫描"等待遮罩（treemap 视图按需自行重挂）
   if(viewMode === 'treemap') renderTreemap();
   else if(viewMode === 'list') renderList(node);
   else if(viewMode === 'types') renderTypes();
@@ -488,7 +542,8 @@ function updateSummary(node){
       parts.push('<span style="color:var(--amber)" title="扫描占用高于卷已用：压缩/稀疏文件按逻辑大小估算偏高">口径高估 '+fmt(-gap)+'</span>');
     }
   }
-  if(deniedCount) parts.push('<span id="denied-link" style="color:var(--amber);cursor:pointer;text-decoration:underline dotted" title="这些目录无权限读取，体积只含已读到的部分——点击查看清单">⛔ '+deniedCount+' 个目录无权限</span>');
+  var dCnt = deniedInScope();
+  if(dCnt) parts.push('<span id="denied-link" style="color:var(--amber);cursor:pointer;text-decoration:underline dotted" title="这些目录无权限读取，体积只含已读到的部分——点击查看清单">⛔ '+dCnt+' 个目录无权限</span>');
   if(scanning&&scanT0) parts.push('用时 '+((Date.now()-scanT0)/1000).toFixed(1)+'s');
   else if(lastScanSecs) parts.push('用时 '+lastScanSecs.toFixed(1)+'s');   // 完成态保留耗时
   if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?' · 已感知 '+watchChanges+' 项变更':'')+'</span>');
@@ -503,6 +558,7 @@ function openDeniedPanel(){
   if(!mask) return;
   var rows=[];
   for(var k in deniedSeen){
+    if(!inScope(k)) continue;   // 只列当前扫描范围的受限目录
     var n=store.get(k);
     if(n) rows.push(n);
   }
@@ -546,9 +602,10 @@ function openDeniedPanel(){
   });
   var cp=document.getElementById('denied-copy');
   if(cp) cp.addEventListener('click',function(){
-    var paths=Object.keys(deniedSeen).join('\r\n');
-    copyPath(paths,null);
-    setStatus('已复制 '+Object.keys(deniedSeen).length+' 条路径','done');
+    var paths=[];
+    for(var k in deniedSeen){ if(inScope(k)) paths.push(k); }
+    copyPath(paths.join('\r\n'),null);
+    setStatus('已复制 '+paths.length+' 条路径','done');
   });
 })();
 
@@ -717,7 +774,9 @@ function TauriFeed(){
     setStatus(msg, 'done');
     setScanning(false);   // 内部已推完成态快照
     autoExpandView();
+    prevCacheLoaded = false; prevCache = null;   // prev 缓存已轮换，历史对比下次进视图重读
     saveScanCache();      // 完整扫描落缓存（轮换 prev 供历史对比）
+    scopeAt[curScopeKey()] = Date.now();         // 记录该范围完成时间（切回时显示"多久前"）
     // 完整扫描结束后进入实时监视：文件增删改即时反映到视图（多盘逐根挂 watcher）
     if (!watchActive && String(msg).indexOf('扫描完成') >= 0 && ROOTS.length) {
       setWatch(true, ROOTS);
@@ -1055,6 +1114,7 @@ window.addEventListener('DOMContentLoaded', function(){
         window.ROOT = ROOTS[0];
         window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
         ensurePcRoot();
+        scopeAt[scopeKey(ROOTS)] = meta.at;   // 该范围完成时间（切走再切回时提示用）
         setStatus('已恢复上次扫描结果（' + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + ' 小时前）· 建议重新扫描刷新', 'done');
         markDirty();
       }
@@ -1078,19 +1138,18 @@ window.addEventListener('DOMContentLoaded', function(){
   document.getElementById('scan-btn').addEventListener('click', startScan);
   document.getElementById('stop-btn').addEventListener('click', function(){ feed.stop(); });
 
-  /* 盘符下拉：列出本地卷，选中即填入输入框并直接开始扫描 */
+  /* 盘符下拉：列出本地卷，选中只切换展示范围（上次结果秒开），不自动扫描 */
   var drivesSel = document.getElementById('root-drives');
   drivesSel.addEventListener('change', function(){
     if(!this.value) return;
     if (scanning) {
-      // 扫描进行中切换范围会被引擎拒绝，且 UI 数据已被清空——先恢复选中项再提示
+      // 扫描进行中切换范围会与引擎状态错位——先恢复选中项再提示
       setStatus('扫描进行中——请先「停止」再切换扫描范围', 'err');
       syncDrivesSelect();
       this.value = isMultiRoot() ? THISPC : String(window.ROOT||'');
       return;
     }
-    window.rootInput.value = this.value;
-    startScan();
+    switchScope(this.value);
   });
   window.addEventListener('focus', loadDrives);   // 插拔 U 盘等场景重新枚举
   loadDrives();
@@ -1098,6 +1157,45 @@ window.addEventListener('DOMContentLoaded', function(){
   // 页面与首帧渲染就绪：淡出启动屏、显示原生窗口
   setTimeout(hideSplash, 350);
 });
+
+/* ===== 切换展示范围（盘符下拉）：只切视图，不自动扫描 =====
+   该范围扫过（本会话内存或启动缓存恢复）→ 秒开上次结果并提示多久前；
+   没扫过 → 清掉上一范围画面，提示点「开始扫描」。其他范围的数据原样留在
+   store/fileIndex 里（键按盘符前缀不冲突），大文件榜/类型统计按范围过滤展示 */
+function switchScope(picked){
+  if (watchActive) setWatch(false);   // 监视挂在原扫描范围上，切走就停，避免摘要误报
+  var roots = picked === THISPC
+    ? drivesCache.map(function(v){ return v.mount; })
+    : [picked];
+  if(!roots.length) roots = ['C:\\'];
+  ROOTS = roots;
+  window.ROOT = ROOTS[0];
+  window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
+  clearViewBodies();                  // 丢弃上一范围的渲染块（数据仍在，切回即重绘）
+  window.expanded = {}; window.stack = []; selectedRow = '';
+  fileSearch = '';
+  var fsInp = document.getElementById('file-search');
+  if(fsInp) fsInp.value = '';
+  prevCacheLoaded = false; prevCache = null;   // 历史对比基线按新范围重读
+  ensurePcRoot();
+  window.rootInput.value = window.ROOT;
+  volUsed = 0; volTotal = 0;
+  loadDrives();                        // 卷已用/容量跟随新范围
+  var rootKey = String(window.ROOT).toLowerCase();
+  var rootNode = store.get(rootKey);
+  var hasData = isMultiRoot()
+    ? (function(){ var s = rootsSummary(); return s.s > 0; })()
+    : !!(rootNode && rootNode.s > 0);
+  var place = isMultiRoot() ? '全部磁盘' : String(window.ROOT);
+  var at = scopeAt[curScopeKey()];
+  if(hasData){
+    setStatus('已切换到 ' + place + ' · 显示上次扫描结果' + (at ? '（' + fmtAge(Date.now() - at) + '前）' : '') + ' · 点「开始扫描」刷新', 'done');
+  } else {
+    setStatus('已切换到 ' + place + ' · 该范围尚未扫描，点「开始扫描」开始', '');
+  }
+  syncDrivesSelect();
+  markDirty();
+}
 
 /* ===== 开始扫描：输入框/盘符下拉/「全部磁盘」共用 ===== */
 var drivesCache = [];   // loadDrives 枚举的卷列表（「全部磁盘」的 roots 来源）
