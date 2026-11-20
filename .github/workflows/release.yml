@@ -4,15 +4,16 @@
 #   TAURI_SIGNING_PRIVATE_KEY           = .tauri/disklens-updater.key 的文件内容（整段粘贴）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  = 私钥密码（没设密码就建一个空字符串 Secret）
 #   IKANP_SSH_HOST / IKANP_SSH_USER / IKANP_SSH_KEY（可选）
-#                                       = 服务器 SSH 信息，用于 CI 自动同步 latest.json
+#                                       = 服务器 SSH 信息，用于 CI 自动同步 latest.json 与版本化安装包
 #
 # 以后发版只需：
 #   1. 升版本号（package.json / package-lock.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json）
 #   2. git tag -a v1.x.0 -m "一句话更新说明" && git push origin v1.x.0
 # → 自动跑测试 → 构建 → Release 页面出现 setup.exe/.sig/latest.json/disklens.exe
 #   （latest.json 挂在 Release 附件上，老客户端经 GitHub 源自动收到更新提示；
-#    ikanp.top 服务器源由 CI 自动同步，保证与 Release 的 exe 是同一构建、签名必然匹配；
-#    未配置 SSH secrets 时才需要手动 scp dist/latest.json——切勿用本地构建的清单，签名会对不上）
+#    ikanp.top 服务器源由 CI 自动同步 latest.json + 版本化安装包，
+#    保证与 Release 的 exe 是同一构建、签名必然匹配；
+#    未配置 SSH secrets 时才需要手动 scp——切勿用本地构建的清单，签名会对不上）
 
 name: Release
 
@@ -150,7 +151,10 @@ jobs:
       # v1.2.0 事故复盘：本地构建的清单先 scp 到了服务器，CI 随后重新构建上传了
       # 新 exe（Rust/NSIS 构建非字节可重现），服务器旧签名 ≠ Release 新 exe，
       # 客户端报 The signature verification failed。CI 在此自动同步，杜绝再犯。
-      - name: 同步更新清单到 ikanp.top
+      # v1.3.1 复盘：官网下载页的版本化直链 /downloads/disklens/v*/ 同理，
+      # 安装包也由 CI 从本次构建直传，与 Release、latest.json 三方字节一致，
+      # 下载页 SHA256 校验值可放心引用；否则发版后直链 404、页面停在旧版本。
+      - name: 同步更新清单与安装包到 ikanp.top
         if: env.IKANP_SSH_HOST != ''
         shell: bash
         env:
@@ -160,7 +164,32 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$IKANP_SSH_KEY" > ~/.ssh/ikanp_deploy_key
           chmod 600 ~/.ssh/ikanp_deploy_key
+          ssh -i ~/.ssh/ikanp_deploy_key -o StrictHostKeyChecking=accept-new \
+            "$IKANP_SSH_USER@$IKANP_SSH_HOST" \
+            "mkdir -p /usr/share/nginx/ikanp-home/downloads/disklens/${{ github.ref_name }}"
           scp -i ~/.ssh/ikanp_deploy_key -o StrictHostKeyChecking=accept-new \
             dist/latest.json \
             "$IKANP_SSH_USER@$IKANP_SSH_HOST:/usr/share/nginx/ikanp-home/downloads/disklens/latest.json"
+          scp -i ~/.ssh/ikanp_deploy_key -o StrictHostKeyChecking=accept-new \
+            src-tauri/target/release/bundle/nsis/*.exe \
+            "disklens-${{ github.ref_name }}.exe" \
+            "$IKANP_SSH_USER@$IKANP_SSH_HOST:/usr/share/nginx/ikanp-home/downloads/disklens/${{ github.ref_name }}/"
           rm -f ~/.ssh/ikanp_deploy_key
+
+      # 官网还有两处不随本仓库发版自动更新的内容——更新日志条目与下载页版本/
+      # 校验值（都在 aliyun 仓库，需按其 DEPLOY.md 重新发布主页）。这里把本次
+      # 构建的关键信息打在日志里，照抄即可，漏了官网就会停留在旧版本。
+      - name: 发版收尾提醒（官网两处待同步）
+        shell: bash
+        run: |
+          SETUP=$(ls src-tauri/target/release/bundle/nsis/*.exe)
+          echo "============================================================"
+          echo "⚠ 发版未完全收尾：ikanp.top 官网还有两处要手动同步（aliyun 仓库）"
+          echo "1) 更新日志条目 ikanp-home/ik-changelog/data.js —— disklens 分组"
+          echo "   最前面加一条「DiskLens ${{ github.ref_name }} 上线」，内容用本次 tag 说明"
+          echo "2) 下载页 ikanp-home/disklens/index.html —— 三处链接改到"
+          echo "   /downloads/disklens/${{ github.ref_name }}/，SHA256 替换为："
+          sha256sum "$SETUP" "disklens-${{ github.ref_name }}.exe"
+          echo "   （安装包与清单已自动传到服务器；若上一步被跳过需手动补传）"
+          echo "3) 改完 aliyun 仓库执行主页发布（node tools/protect/run.mjs home，见其 DEPLOY.md）"
+          echo "============================================================"
