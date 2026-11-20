@@ -134,5 +134,7 @@
 
     // 启动静默检查：等首屏与扫描界面就绪后再查，失败静默
     setTimeout(function () { checkForUpdate(false); }, 5000);
+    // 周期静默检查：每 4 小时一次，长开挂机的会话也能收到新版提醒（只弹窗提示，绝不静默安装）
+    setInterval(function () { checkForUpdate(false); }, 4 * 60 * 60 * 1000);
   });
 })();

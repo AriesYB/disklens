@@ -1957,6 +1957,110 @@ fn recycle_one(_path: &str) -> bool {
     false
 }
 
+// ======================== 调出系统右键菜单 ========================
+
+/// 调出资源管理器的原生右键菜单（shell IContextMenu 托管，WizTree/Everything 同款做法）：
+/// 菜单出现在光标处，完整保留用户安装的全部 shell 扩展。必须在主线程弹出——
+/// TrackPopupMenu 自带消息循环，且 shell 菜单处理程序要求 STA 线程。
+#[tauri::command]
+fn shell_context_menu(app: AppHandle, path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let win = app
+            .get_webview_window("main")
+            .ok_or_else(|| "主窗口未就绪".to_string())?;
+        let hwnd = win.hwnd().map_err(|e| e.to_string())?.0 as isize;
+        let p = norm_path(&path);
+        if !Path::new(&p).exists() {
+            return Err("文件或目录不存在".into());
+        }
+        app.run_on_main_thread(move || {
+            if let Err(e) = show_shell_context_menu(hwnd, &p) {
+                eprintln!("[disklens] 系统右键菜单：{e}");
+            }
+        })
+        .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, path);
+        Err("此功能仅 Windows 可用".into())
+    }
+}
+
+/// 主线程：为 path 弹出 shell 右键菜单并执行用户选中的命令
+#[cfg(windows)]
+fn show_shell_context_menu(hwnd: isize, path: &str) -> Result<(), String> {
+    use windows::core::PCSTR;
+    use windows::Win32::Foundation::{HANDLE, HWND, POINT};
+    use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        BHID_SFUIObject, CMINVOKECOMMANDINFO, CMF_NORMAL, CMIC_MASK_PTINVOKE, IContextMenu,
+        IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenuEx, SW_SHOWNORMAL,
+        TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    // windows crate 未导出该常量：SDK CMIC_MASK_UNICODE = 0x4（Unicode 路径/参数）
+    const CMIC_MASK_UNICODE: u32 = 0x4;
+
+    unsafe {
+        // 主线程大概率已是 STA（tao 事件循环）；重复初始化返回 S_FALSE 无害
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
+        let item: IShellItem = SHCreateItemFromParsingName(
+            windows::core::PCWSTR(wide.as_ptr()),
+            None::<&IBindCtx>,
+        )
+        .map_err(|e| format!("解析路径失败：{e}"))?;
+        // BHID_SFUIObject：绑定该条目的 UI 对象（IContextMenu），用户装的 shell 扩展全都在
+        let cm: IContextMenu = item
+            .BindToHandler::<_, IContextMenu>(None::<&IBindCtx>, &BHID_SFUIObject)
+            .map_err(|e| format!("绑定 shell 菜单失败：{e}"))?;
+
+        let mut pt = POINT::default();
+        GetCursorPos(&mut pt).map_err(|e| format!("获取光标位置失败：{e}"))?;
+
+        let hmenu = CreatePopupMenu().map_err(|e| format!("创建菜单失败：{e}"))?;
+        // 命令 id 区间 1..0x7FFF（0 与负值是系统保留/出错分值）
+        let hr = cm.QueryContextMenu(hmenu, 0, 1, 0x7FFF, CMF_NORMAL);
+        if hr.is_err() {
+            let _ = DestroyMenu(hmenu);
+            return Err(format!("枚举 shell 菜单失败：{}", hr.message()));
+        }
+        let cmd = TrackPopupMenuEx(
+            hmenu,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTBUTTON).0,
+            pt.x,
+            pt.y,
+            HWND(hwnd as _),
+            None,
+        )
+        .0;
+        let _ = DestroyMenu(hmenu);
+        if cmd == 0 {
+            return Ok(()); // 用户取消
+        }
+        let ici = CMINVOKECOMMANDINFO {
+            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+            fMask: CMIC_MASK_PTINVOKE | CMIC_MASK_UNICODE,
+            hwnd: HWND(hwnd as _),
+            // MAKEINTRESOURCEA：整数动词按指针低位传递
+            lpVerb: PCSTR(cmd as usize as *const u8),
+            lpParameters: PCSTR::null(),
+            lpDirectory: PCSTR::null(),
+            nShow: SW_SHOWNORMAL.0,
+            dwHotKey: 0,
+            hIcon: HANDLE(std::ptr::null_mut()),
+        };
+        cm.InvokeCommand(&ici)
+            .map_err(|e| format!("执行命令失败：{e}"))
+    }
+}
+
 /// 撤销迁移：删掉源位置 junction，把数据从目标搬回原位（逆向走一遍迁移事务）。
 /// 安全校验：src 必须是 reparse point 且 dest 真实存在——两者任一不满足即拒绝（防误删真数据）
 #[tauri::command]
@@ -3639,6 +3743,7 @@ pub fn run() {
             scan_refresh,
             scan_status,
             open_in_explorer,
+            shell_context_menu,
             list_volumes,
             save_text_file,
             write_scan_cache,

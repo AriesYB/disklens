@@ -30,9 +30,20 @@ function openContextMenu(ev,fp,isFile){
   document.getElementById('mi-copy-t').textContent='复制完整路径';
   document.getElementById('ctxpath').textContent=fp;
   var c=document.getElementById('ctx');
+  // 先显示再测量：display:none 时 offsetWidth/Height 为 0
   c.style.display='block';
-  c.style.left=Math.min(ev.clientX,window.innerWidth-256)+'px';
-  c.style.top=Math.min(ev.clientY,window.innerHeight-200)+'px';
+  c.scrollTop=0;   // 重开时回到顶部，避免上次的滚动位置藏住前几项
+  // 自适应视口：量出实际尺寸再定位，靠近右/下边缘时整块向内收；
+  // 菜单高过窗口（小窗/聚合长路径）时由 max-height+滚动条兜底
+  var vw=window.innerWidth, vh=window.innerHeight, m=8;
+  c.style.maxHeight=(vh-m*2)+'px';
+  var left=Math.min(ev.clientX, vw-c.offsetWidth-m);
+  if(left<m) left=m;
+  var top=ev.clientY;
+  if(top+c.offsetHeight>vh-m) top=vh-m-c.offsetHeight;
+  if(top<m) top=m;
+  c.style.left=left+'px';
+  c.style.top=top+'px';
 }
 function worst(row,len){ if(!row.length) return Infinity;
   var s=0,mx=0,mn=Infinity;
@@ -295,6 +306,15 @@ function navigate(path,isChild){
 /* ===== 菜单 ===== */
 function hideCtx(){ document.getElementById('ctx').style.display='none'; }
 function openPathInExplorer(p,sel){ feed.open(p,sel); }
+// 调出资源管理器的原生右键菜单（WizTree/Everything 同款做法）：
+// shell IContextMenu 托管，完整保留用户装的所有右键扩展，菜单出现在光标处
+document.getElementById('mi-sysmenu').addEventListener('click',function(){
+  var p = menuPath;
+  hideCtx();
+  if(!p) return;
+  setStatus('已请求调出系统右键菜单','done');
+  feed.shellContextMenu(p);
+});
 document.getElementById('mi-open').addEventListener('click',function(){ openPathInExplorer(menuPath,menuSel); hideCtx(); });
 document.getElementById('mi-copy').addEventListener('click',function(){
   copyPath(menuPath,document.getElementById('mi-copy-t')); setTimeout(hideCtx,650); });
@@ -310,12 +330,41 @@ document.getElementById('mi-expand').addEventListener('click',function(){
   hideCtx();
 });
 document.getElementById('mi-rescan').addEventListener('click',function(){
-  var p=menuPath;
+  var p = menuPath;
   hideCtx();
   if(p&&!menuSel){
     setStatus('正在重新扫描此目录…','scanning');
     feed.scanRefresh(p);
   }
+});
+// 右键移入回收站（Windows 系统回收站，可还原）：方块/列表/大文件榜共用此菜单
+document.getElementById('mi-recycle').addEventListener('click',function(){
+  var p = menuPath;
+  hideCtx();
+  if(!p) return;
+  if(scanning){ setStatus('扫描进行中——请先停止再删除','err'); return; }
+  // 防呆：盘根（'c:\'）与虚拟根不可删
+  if(p === THISPC || p.replace(/\\+$/,'').length <= 2){
+    setStatus('盘根不可删除','err'); return;
+  }
+  var n = store.get(p.toLowerCase());
+  var tip = '将「' + p + '」' + (n ? '（' + fmt(n.s) + '）' : '') + ' 移入回收站？\n' +
+    '可在系统回收站还原，确认无误前请勿清空回收站。';
+  if(!window.confirm(tip)) return;
+  setStatus('正在移入回收站…','scanning');
+  feed.recycleDelete([p], function(failed){
+    if(failed && failed.length){
+      setStatus('移入回收站失败（文件被占用？）：' + failed[0],'err');
+      return;
+    }
+    diagLog('info', '右键移入回收站: ' + p);
+    setStatus('已移入回收站：' + p,'done');
+    // 本地即时摘除：removeSubtree 返回被删子树合计，沿祖先链扣减体积。
+    // 监视模式下 watcher 随后也会报 remove，此时节点已不在、天然幂等
+    var rm = removeSubtree(p);
+    propDelta(p, -rm.s, -rm.al);
+    markDirty();
+  });
 });
 document.addEventListener('mousedown',function(ev){
   var c=document.getElementById('ctx');

@@ -523,14 +523,22 @@ function pushAiSnapshot(){
   if(feed.aiSnapshot) feed.aiSnapshot(j);
   aiSnapReady = true;
 }
+var lastAutoRender = 0;   // 监视模式渲染合流的时间戳
 (function loop(){
   if(dirty){
-    dirty = false;
-    try { render(); }
-    catch(e){
-      window.__errs = window.__errs || [];
-      window.__errs.push('render: ' + e.message);
-      try { setStatus('渲染异常：' + e.message, 'err'); } catch(_) {}
+    var now = Date.now();
+    // 监视模式合流：文件事件高频到达时 120ms 全量重排会让方块带着 0.35s
+    // 过渡持续漂移+闪烁（用户反馈"屏幕一直闪"）。合并到至多 ~1.3 次/秒，
+    // 变化攒着一步到位；手动操作（navigate/render 直调）不受影响
+    if(!watchActive || now - lastAutoRender >= 800){
+      dirty = false;
+      lastAutoRender = now;
+      try { render(); }
+      catch(e){
+        window.__errs = window.__errs || [];
+        window.__errs.push('render: ' + e.message);
+        try { setStatus('渲染异常：' + e.message, 'err'); } catch(_) {}
+      }
     }
   }
   try { checkPriorityDone(); } catch(_) {}
@@ -905,6 +913,12 @@ TauriFeed.prototype.open = function(p, sel){
     setStatus(String(e), 'err');
   });
 };
+/* 调出资源管理器的原生右键菜单（shell IContextMenu 托管，菜单出现在光标处） */
+TauriFeed.prototype.shellContextMenu = function(p){
+  window.__TAURI__.core.invoke('shell_context_menu', { path: p }).catch(function(e){
+    setStatus('调出系统右键菜单失败：' + String(e).slice(0, 80), 'err');
+  });
+};
 TauriFeed.prototype.listVolumes = function(cb){
   window.__TAURI__.core.invoke('list_volumes').then(cb).catch(function(){ cb([]); });
 };
@@ -1098,6 +1112,9 @@ MockFeed.prototype.start = function(roots, onDone){
 MockFeed.prototype.stop = function(){ this._clear(); setStatus('已停止','done'); setScanning(false); };
 MockFeed.prototype.open = function(p){
   setStatus('浏览器模式：打开文件夹需在 Tauri 客户端内使用','err');
+};
+MockFeed.prototype.shellContextMenu = function(){
+  setStatus('浏览器模式：调出系统右键菜单需在 Tauri 客户端内使用','err');
 };
 
 /* ===== Mock 迁移：模拟三阶段事务事件流（浏览器演示用） ===== */

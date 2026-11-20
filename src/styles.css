@@ -107,9 +107,11 @@ body[data-view="diff"] #diff{display:block}
 .cell.expd{box-shadow:inset 0 0 0 1.5px var(--accent)}
 .cell.expd>.lbl{left:0;top:0;right:0;height:17px;line-height:17px;padding:0 6px;border-radius:5px 5px 0 0;
   background:rgba(8,12,18,.75);border-bottom:1px solid rgba(76,194,255,.55);color:#dff2ff}
-.cell.counting>.lbl{color:var(--amber)}
-.cell.counting{animation:cpulse 2.4s ease-in-out infinite}
-@keyframes cpulse{0%,100%{opacity:1}50%{opacity:.62}}
+/* 统计中：只让标签文字呼吸+右上角转圈徽标，不整块压透明度——
+   整块 opacity 0.62 的脉冲叠上 opacity transition，方块在
+   counting↔done 间抖动时整屏明暗闪烁（用户反馈"屏幕一直闪"） */
+.cell.counting>.lbl{color:var(--amber);animation:lblPulse 2.4s ease-in-out infinite}
+@keyframes lblPulse{0%,100%{opacity:1}50%{opacity:.4}}
 .cell.counting .badge{position:absolute;width:11px;height:11px;border:2px solid rgba(255,212,121,.25);
   border-top-color:var(--amber);border-radius:50%;animation:spin .8s linear infinite;top:6px;right:6px}
 .cell .lbl{position:absolute;left:6px;top:3px;right:6px;pointer-events:none;font-size:11.5px;font-weight:600;
@@ -240,12 +242,16 @@ body[data-view="diff"] #diff{display:block}
   padding:6px 10px;pointer-events:none;z-index:30;max-width:560px;font-size:12px;user-select:none;
   box-shadow:0 8px 24px rgba(0,0,0,.5)}
 #ctx{position:fixed;display:none;background:rgba(26,33,48,.98);border:1px solid #2c3646;border-radius:9px;
-  padding:4px;z-index:20;min-width:236px;max-width:440px;box-shadow:0 10px 32px rgba(0,0,0,.6);font-size:12px}
+  padding:4px;z-index:20;min-width:236px;max-width:440px;box-shadow:0 10px 32px rgba(0,0,0,.6);font-size:12px;
+  overflow-y:auto;overflow-x:hidden}
 #ctxpath{padding:7px 10px;color:#9aa4b2;font-size:11px;font-family:var(--mono);border-bottom:1px solid #2c3646;
   word-break:break-all;max-height:52px;overflow:hidden;margin-bottom:4px;cursor:default;
   background:rgba(13,17,26,.8);border-radius:6px 6px 0 0;user-select:text}
 .mi{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:5px;cursor:pointer;color:#d6dde8}
 .mi:hover{background:#2b4368;color:#fff}
+/* 破坏性菜单项（移入回收站）：醒目红 */
+.mi.mi-danger{color:#ff8f86}
+.mi.mi-danger:hover{background:rgba(224,91,78,.16);color:#ffc0ba}
 .mi .ic{width:16px;text-align:center;flex:none}
 #ctx .sep{height:1px;background:#2c3646;margin:4px 6px}
 

@@ -27,8 +27,10 @@ jobs:
   release:
     runs-on: windows-latest
     env:
-      # 供「同步更新清单」步骤的条件判断（secrets 不能直接用在 if 里）
+      # 供「同步更新清单」/「Authenticode 签名」步骤的条件判断（secrets 不能直接用在 if 里）
       IKANP_SSH_HOST: ${{ secrets.IKANP_SSH_HOST }}
+      WINDOWS_SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX }}
+      WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,6 +65,61 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
+      - name: 整理免安装版文件名
+        shell: bash
+        run: |
+          cp src-tauri/target/release/disklens.exe "disklens-${{ github.ref_name }}.exe"
+
+      # Authenticode 签名（可选）：仓库 Secrets 配置 WINDOWS_SIGN_PFX（.pfx 文件的 Base64，
+      # 含私钥）与 WINDOWS_SIGN_PFX_PASSWORD 后自动生效。作用：UAC/属性里显示"已验证的
+      # 发布者"、消除 SmartScreen 未签名警告。与 tauri 更新签名（.sig）相互独立——
+      # 签名改变了 exe 字节，下一步会对已签字节重算 .sig
+      - name: Authenticode 签名（可选）
+        if: env.WINDOWS_SIGN_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
+          $b64 = $env:WINDOWS_SIGN_PFX -replace '\s',''
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($b64))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -notmatch 'arm' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw 'runner 上未找到 signtool' }
+          $targets = @(
+            'src-tauri/target/release/disklens.exe',
+            'src-tauri/target/release/bundle/nsis/*-setup.exe',
+            "disklens-${{ github.ref_name }}.exe"
+          )
+          foreach ($pattern in $targets) {
+            foreach ($f in (Resolve-Path $pattern)) {
+              & $signtool sign /f $pfxPath /p "$env:WINDOWS_SIGN_PFX_PASSWORD" `
+                /fd sha256 /tr http://timestamp.digicert.com /td sha256 $f.Path
+              if ($LASTEXITCODE -ne 0) { throw "签名失败：$($f.Path)" }
+              & $signtool verify /pa $f.Path
+              if ($LASTEXITCODE -ne 0) { throw "签名校验失败：$($f.Path)" }
+            }
+          }
+          Remove-Item $pfxPath -Force
+
+      # Authenticode 签名改变了 setup.exe 字节，必须对已签字节重算 tauri 更新签名（.sig），
+      # 否则客户端更新报 The signature verification failed（与 v1.2.0 事故同构：签名与
+      # exe 字节必须出自同一构建）。未配置 WINDOWS_SIGN_PFX 时跳过，.sig 保持原样
+      - name: 重签更新签名（仅 Authenticode 启用时）
+        if: env.WINDOWS_SIGN_PFX != ''
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for f in src-tauri/target/release/bundle/nsis/*-setup.exe; do
+            npx tauri signer sign "$f"
+          done
+
       - name: 生成更新清单（说明取自 tag 说明，lightweight tag 时回退 commit 标题）
         shell: bash
         run: |
@@ -71,11 +128,6 @@ jobs:
           if [ -z "$TAG_MSG" ]; then TAG_MSG="$(git log -1 --format='%s')"; fi
           if [ -z "$TAG_MSG" ]; then TAG_MSG="性能优化与问题修复。"; fi
           node scripts/gen-updater-manifest.mjs "$TAG_MSG"
-
-      - name: 整理免安装版文件名
-        shell: bash
-        run: |
-          cp src-tauri/target/release/disklens.exe "disklens-${{ github.ref_name }}.exe"
 
       # 用 runner 预装的 gh CLI（github.token 授权），避免第三方 action 的解析/权限问题
       - name: 创建 GitHub Release 并上传产物
