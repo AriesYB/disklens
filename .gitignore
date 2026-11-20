@@ -41,3 +41,6 @@ playwright-report/
 
 # AI 联动通道联调时在当前目录生成的提案草稿
 proposal.json
+
+# 软著/上架提交工作区(本地留存,不入库)
+softreg/
