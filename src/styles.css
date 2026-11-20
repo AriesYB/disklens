@@ -431,6 +431,18 @@ body[data-view="diff"] #diff{display:block}
 #prop-close{padding:2px 10px;font-size:13px;border-radius:6px;flex:none}
 .prop-note{font-size:11.5px;color:var(--muted);line-height:1.6;margin-bottom:10px}
 #prop-list{flex:1;min-height:100px;overflow-y:auto;background:#0f141d;border:1px solid var(--line);border-radius:8px}
+/* 多提案切换条：不同盘的提案并存时逐个确认 */
+#prop-tabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+#prop-tabs .prop-tab{padding:3px 10px;font-size:11.5px;border-radius:6px}
+#prop-tabs .prop-tab.active{background:#24344d;border-color:#3b83cf;color:#dfeaff;font-weight:600}
+/* AI 提案待确认悬浮角标：固定右下角（footer 之上），多提案时带数量徽标+呼吸提醒 */
+#prop-fab{position:fixed;right:16px;bottom:42px;z-index:80;display:none;align-items:center;gap:3px;
+  padding:7px 13px;border-radius:999px;font-size:13px;background:#1c2c46;border:1px solid #3b83cf;
+  color:#dfeaff;box-shadow:0 4px 18px rgba(47,125,209,.35);animation:fabPulse 2.2s ease-in-out infinite}
+#prop-fab:hover{background:#24344d;filter:brightness(1.12)}
+#prop-fab-n{min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:#e05b4e;color:#fff;
+  font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center}
+@keyframes fabPulse{0%,100%{box-shadow:0 4px 18px rgba(47,125,209,.35)}50%{box-shadow:0 4px 26px rgba(47,125,209,.75)}}
 .pr-row{padding:8px 12px;border-bottom:1px dashed rgba(255,255,255,.06);font-size:12px}
 .pr-top{display:flex;align-items:center;gap:8px}
 .pr-top input[type=checkbox]{flex:none;accent-color:var(--accent)}
@@ -451,6 +463,9 @@ body[data-view="diff"] #diff{display:block}
 .pr-st.skip{color:var(--dim)}
 .pr-act{margin-left:auto;flex:none;display:flex;gap:6px}
 .pr-act button{padding:2px 8px;font-size:11px}
+/* 移入回收站：醒目红——这是整个面板里唯一的破坏性动作，不能和「定位」长得一样 */
+.pr-act button.pr-recycle{color:#ff7b72;border-color:rgba(255,123,114,.5);background:rgba(255,99,88,.12);font-weight:600}
+.pr-act button.pr-recycle:hover{background:rgba(255,99,88,.28);color:#ffc0ba;border-color:rgba(255,123,114,.85)}
 #prop-foot{display:flex;align-items:center;gap:10px;margin-top:12px}
 #prop-progress{flex:1;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pr-empty{padding:30px 10px;text-align:center;color:var(--dim)}

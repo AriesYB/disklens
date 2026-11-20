@@ -38,3 +38,6 @@ src-tauri/target-dev/
 .zcode/
 test-results/
 playwright-report/
+
+# AI 联动通道联调时在当前目录生成的提案草稿
+proposal.json

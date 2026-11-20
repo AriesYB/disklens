@@ -33,8 +33,14 @@
 
 <table>
   <tr>
-    <td><img src="docs/screenshot-list.png" alt="列表视图" /></td>
-    <td><img src="docs/screenshot-files.png" alt="大文件榜" /></td>
+    <td align="center">
+      <img src="docs/screenshot-ai-analyze.png" alt="AI 辅助迁移 / 清理：一键复制指令，AI 经本地联动通道直读扫描数据" /><br />
+      <sub>🤖 一键复制指令，AI 经本地联动通道直读扫描数据，无需自己扫盘</sub>
+    </td>
+    <td align="center">
+      <img src="docs/screenshot-ai-suggest.png" alt="AI 提案确认面板：逐条勾选，迁移/清理全程由 DiskLens 执行" /><br />
+      <sub>提案确认面板：逐条勾选，迁移/清理全程由 DiskLens 代办，失败原样保留</sub>
+    </td>
   </tr>
 </table>
 

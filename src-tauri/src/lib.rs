@@ -28,6 +28,10 @@ pub struct ScanState {
     /// 大文件登记表（AI 通道 /api/tree 展示用）：lower(父目录) -> [(文件名, 逻辑字节, 占用)]。
     /// 与事件流同口径：仅 ≥MIN_BIG_FILE，且每目录最多 MAX_BIG_FILES_PER_DIR 条
     big_files: Arc<Mutex<HashMap<String, Vec<(String, u64, u64)>>>>,
+    /// 上次扫描的目录基线：lower(path) -> (逻辑字节, 磁盘占用, 目录 mtime 毫秒)。
+    /// 增量扫描依据：目录 mtime 未变 → 子树未增删改名，整棵跳过直接复用基线体积。
+    /// 每次扫描开始从磁盘载入（scan-baseline.json），正常完成整体重写
+    baseline: Arc<Mutex<HashMap<String, (u64, u64, u64)>>>,
 }
 
 /// 扫描完成后的实时监视状态：多盘齐扫时每个根一个 watcher
@@ -167,6 +171,85 @@ fn cluster_for(_path: &str) -> u32 {
     0
 }
 
+/// 目录 mtime → 毫秒时间戳（增量基线的比较键；拿不到返回 None）
+fn mtime_millis(md: &fs::Metadata) -> Option<u64> {
+    md.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// 增量复用判定（纯函数，供单测）：该目录在基线中且 mtime（毫秒）一致 →
+/// 返回基线体积（子树未增删改名，整棵跳过）；否则 None 走全量扫描。
+/// 局限（可接受的漂移）：子树内文件原位改大小不触发目录 mtime，会沿用旧值
+fn baseline_reuse(
+    baseline: &HashMap<String, (u64, u64, u64)>,
+    path_lower: &str,
+    mtime: Option<u64>,
+) -> Option<(u64, u64)> {
+    let mt = mtime?;
+    let &(s, al, bmt) = baseline.get(path_lower)?;
+    if mt == bmt {
+        Some((s, al))
+    } else {
+        None
+    }
+}
+
+/// 基线序列化（纯函数，供单测）：{"v":1,"rows":[[path,s,al,mtime],...]}
+fn baseline_to_json(m: &HashMap<String, (u64, u64, u64)>) -> String {
+    let mut rows: Vec<(&str, u64, u64, u64)> =
+        m.iter().map(|(k, v)| (k.as_str(), v.0, v.1, v.2)).collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    serde_json::to_string(&serde_json::json!({ "v": 1, "rows": rows }))
+        .unwrap_or_else(|_| "{\"v\":1,\"rows\":[]}".into())
+}
+
+/// 基线反序列化：任何结构异常返回空表（等价于本次全量扫描，宁慢勿错）
+fn baseline_from_json(s: &str) -> HashMap<String, (u64, u64, u64)> {
+    let mut out = HashMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return out;
+    };
+    if let Some(rows) = v.get("rows").and_then(|r| r.as_array()) {
+        for r in rows {
+            if let Some(arr) = r.as_array() {
+                if arr.len() == 4 {
+                    if let (Some(p), Some(s), Some(al), Some(mt)) = (
+                        arr[0].as_str(),
+                        arr[1].as_u64(),
+                        arr[2].as_u64(),
+                        arr[3].as_u64(),
+                    ) {
+                        out.insert(p.to_string(), (s, al, mt));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 基线落盘路径（cache_dir/scan-baseline.json）
+fn baseline_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    cache_dir(app).ok().map(|d| d.join("scan-baseline.json"))
+}
+
+fn load_baseline_file(app: &AppHandle) -> HashMap<String, (u64, u64, u64)> {
+    baseline_file(app)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| baseline_from_json(&s))
+        .unwrap_or_default()
+}
+
+/// 基线写盘。调用方都在后台线程，同步写即可
+fn save_baseline_file(app: &AppHandle, m: &HashMap<String, (u64, u64, u64)>) {
+    if let Some(f) = baseline_file(app) {
+        let _ = std::fs::write(f, baseline_to_json(m).as_bytes());
+    }
+}
+
 // 已计数的硬链接文件 ID（仅链接数>1 且 ≥DEDUP_MIN 的文件入集，内存只有几万条）。
 // 全局集合：主扫描、优先扫描、监视补扫共用，保证同一数据只在首见路径计数一次
 #[cfg(windows)]
@@ -274,6 +357,23 @@ fn file_metrics(path: &Path, sm: &fs::Metadata, cluster: u32) -> (u64, u64, bool
 fn file_metrics(_path: &Path, sm: &fs::Metadata, _cluster: u32) -> (u64, u64, bool, bool) {
     (sm.len(), sm.len(), false, false)
 }
+
+/// 扫描线程降到低于正常优先级：满负荷扫描时不与前台/UI 抢 CPU，
+/// 系统鼠标与前台应用保持流畅（扫描是后台任务，慢一点无感知）。
+/// 主扫描 coordinator、各 worker、优先扫描线程都要各自调用一次
+/// （不依赖 CreateThread 的优先级继承语义）
+#[cfg(windows)]
+fn lower_thread_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_thread_priority() {}
 
 fn emit(app: &AppHandle, ev: &NodeEvent) {
     let _ = app.emit("scan-update", ev);
@@ -495,14 +595,26 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
     if let Ok(mut m) = state.big_files.lock() {
         m.clear();
     }
+    // 载入上次扫描的目录基线（scan-baseline.json）：目录 mtime 未变的子树本轮整棵跳过。
+    // 跨会话生效——重启后也能在上次结果的基础上增量扫
+    let baseline = load_baseline_file(app);
+    if let Ok(mut b) = state.baseline.lock() {
+        *b = baseline;
+    }
     #[cfg(windows)]
     hl_seen_clear(); // 新扫描重新去重：同一数据仍然只计首见路径
     if let Ok(mut a) = state.active.lock() {
         *a = 1; // 主扫描占 1 个名额，优先扫描线程各再 +1
     }
 
+    // 通知前端进入扫描 UI 态（AI 经 POST /api/scan 触发时前端没有按钮上下文）。
+    // 必须先于扫描线程启动：否则首批 scan-batch 可能抢在 scan-started 之前到达，
+    // 前端还处于旧范围监视态，事件会被误走 propDelta 祖先链传播、旧 watcher
+    // 还可能对到达路径额外起优先扫描
+    let _ = app.emit("scan-started", &roots);
     let app2 = app.clone();
     std::thread::spawn(move || {
+        lower_thread_priority();   // 扫描让位于前台：满负荷不拖慢系统鼠标与交互
         let t0 = Instant::now();
 
         // ===== 并行扫描引擎：N 个工作线程共享一个任务队列 =====
@@ -531,6 +643,7 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
                 alloc: Mutex::new(0),
                 denied: AtomicBool::new(false),
                 iter_done: AtomicBool::new(false),
+                mtime: Mutex::new(0),
                 parent: None,
             }));
         }
@@ -551,6 +664,9 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
             roots_left: Arc::new(AtomicUsize::new(n_roots)),
             cv: cv.clone(),
             out: Arc::new(Mutex::new(Vec::new())),
+            baseline: st.baseline.clone(),
+            new_baseline: Arc::new(Mutex::new(HashMap::new())),
+            reused: Arc::new(AtomicUsize::new(0)),
         });
         for _ in 0..n_workers {
             let ctx = ctx.clone();
@@ -567,11 +683,28 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
             }
         }
         flush_out(&ctx); // 排空残留事件批次
+        // 正常完成才落盘新基线：停止时的部分体积带着新 mtime 是"毒基线"，
+        // 一旦写入，下次增量会拿残缺体积误判为未变化
+        if finished.load(Ordering::Relaxed) {
+            let nb = ctx
+                .new_baseline
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            save_baseline_file(&app2, &nb);
+        }
+        let reused_n = ctx.reused.load(Ordering::Relaxed);
         let msg = if finished.load(Ordering::Relaxed) {
+            let extra = if reused_n > 0 {
+                format!("，增量复用 {} 个未变化目录", reused_n)
+            } else {
+                String::new()
+            };
             format!(
-                "扫描完成，{} 个盘，用时 {:.1}s",
+                "扫描完成，{} 个盘，用时 {:.1}s{}",
                 n_roots,
-                t0.elapsed().as_secs_f32()
+                t0.elapsed().as_secs_f32(),
+                extra
             )
         } else {
             "已停止".to_string()
@@ -596,8 +729,6 @@ fn do_scan_start(app: &AppHandle, roots: Vec<String>) -> Result<(), String> {
             }
         }
     });
-    // 通知前端进入扫描 UI 态（AI 经 POST /api/scan 触发时前端没有按钮上下文）
-    let _ = app.emit("scan-started", &roots);
     Ok(())
 }
 
@@ -622,6 +753,8 @@ struct DState {
     denied: AtomicBool,
     /// 目录项是否已读完（read_dir 迭代结束）
     iter_done: AtomicBool,
+    /// 目录 mtime 毫秒（进任务时取一次；完成时经 settle 记入新基线，供下次增量比对）
+    mtime: Mutex<u64>,
     parent: Option<Arc<DState>>,
 }
 
@@ -637,6 +770,12 @@ struct EngineCtx {
     cv: Arc<Condvar>,
     /// 待发事件缓冲：攒批合并成 scan-batch 再发，避免并行时事件洪流淹没前端
     out: Arc<Mutex<Vec<NodeEvent>>>,
+    /// 上次扫描的目录基线（扫描开始时载入）：mtime 一致的子树整棵跳过
+    baseline: Arc<Mutex<HashMap<String, (u64, u64, u64)>>>,
+    /// 本轮新基线：每个完成目录经 settle 记入（含复用目录），正常完成后整体落盘
+    new_baseline: Arc<Mutex<HashMap<String, (u64, u64, u64)>>>,
+    /// 本轮增量复用的目录数（完成消息里展示省了多少扫描）
+    reused: Arc<AtomicUsize>,
 }
 
 /// 事件入批；满 256 条立即刷出。并行扫描时事件量是串行的几十倍，
@@ -663,15 +802,22 @@ fn flush_out(ctx: &EngineCtx) {
     let _ = ctx.app.emit("scan-batch", &batch);
 }
 
-/// 完成一步聚合：登记 sizes、向父目录上缴体积；父目录若因此完成则返回它及其总价。
+/// 完成一步聚合：登记 sizes、记入新基线（含目录 mtime，供下次增量比对）、
+/// 向父目录上缴体积；父目录若因此完成则返回它及其总价。
 fn settle(
     state: &Arc<DState>,
     total: u64,
     alloc: u64,
     sizes: &Mutex<HashMap<String, (u64, u64)>>,
+    bnew: &Mutex<HashMap<String, (u64, u64, u64)>>,
 ) -> Option<(Arc<DState>, u64, u64)> {
     if let Ok(mut m) = sizes.lock() {
         m.insert(state.path.to_lowercase(), (total, alloc));
+    }
+    // 新基线：本目录的最终口径 + 进任务时取的 mtime。
+    // mtime=0（stat 失败）也照记——下次比对时任何真实 mtime 都不会等于 0，等价全量重扫
+    if let (Ok(mut nb), Ok(mt)) = (bnew.lock(), state.mtime.lock()) {
+        nb.insert(state.path.to_lowercase(), (total, alloc, *mt));
     }
     let p = state.parent.as_ref()?;
     {
@@ -716,7 +862,7 @@ fn complete_dir(ctx: &EngineCtx, state: &Arc<DState>, total: u64, alloc: u64, al
             );
         }
         first = false;
-        match settle(&cur, t, ta, &ctx.sizes) {
+        match settle(&cur, t, ta, &ctx.sizes, &ctx.new_baseline) {
             Some((p, pt, pa)) => {
                 cur = p;
                 t = pt;
@@ -742,6 +888,7 @@ fn worker_loop(
     cv: Arc<Condvar>,
     alive: Arc<AtomicUsize>,
 ) {
+    lower_thread_priority();   // 扫描让位于前台：满负荷不拖慢系统鼠标与交互
     loop {
         if ctx.finished.load(Ordering::Relaxed) || ctx.stop.load(Ordering::Relaxed) {
             break;
@@ -781,6 +928,13 @@ fn process_job(
     cv: &Condvar,
     job: &Arc<DState>,
 ) {
+    // 目录 mtime（毫秒）：增量复用的比较键。所有完成路径都经 settle 记入新基线
+    let dir_mtime = fs::symlink_metadata(&job.path)
+        .ok()
+        .and_then(|m| mtime_millis(&m));
+    if let Ok(mut mt) = job.mtime.lock() {
+        *mt = dir_mtime.unwrap_or(0);
+    }
     // 已被优先扫描（或其他线程）完成 → 直接按记录值完成聚合，不重扫、不重复发事件
     {
         let known = ctx
@@ -792,6 +946,20 @@ fn process_job(
             complete_dir(ctx, job, sz, al, true);
             return;
         }
+    }
+    // 增量：目录 mtime 与上次基线一致 → 子树未增删改名，整棵跳过直接复用基线体积。
+    // 在 read_dir 之前判定，机械盘上未变化子树的 IO 与 stat 全部省掉。
+    // 局限（接受）：子树内文件原位改大小不触发目录 mtime，沿用基线值；
+    // 硬链接去重在跳过的子树里同样沿用基线口径
+    let reuse = ctx
+        .baseline
+        .lock()
+        .ok()
+        .and_then(|b| baseline_reuse(&b, &job.path.to_lowercase(), dir_mtime));
+    if let Some((bs, bal)) = reuse {
+        ctx.reused.fetch_add(1, Ordering::Relaxed);
+        complete_dir(ctx, job, bs, bal, false);
+        return;
     }
     push_event(
         ctx,
@@ -853,6 +1021,7 @@ fn process_job(
                         alloc: Mutex::new(0),
                         denied: AtomicBool::new(false),
                         iter_done: AtomicBool::new(false),
+                        mtime: Mutex::new(0),
                         parent: Some(job.clone()),
                     });
                     job.remaining.fetch_add(1, Ordering::Relaxed);
@@ -1013,6 +1182,7 @@ fn spawn_priority_scan(app: &AppHandle, path: String, force: bool) -> Result<(),
         .map(|x| x.to_string_lossy().to_string())
         .unwrap_or_default();
     std::thread::spawn(move || {
+        lower_thread_priority();   // 优先扫描同样让位于前台
         let st2 = app2.state::<ScanState>();
         let bp2 = Path::new(&p);
         scan_dir(&app2, bp2, parent, name, 48, &st2.stop, &st2.sizes, &st2.big_files);
@@ -1063,6 +1233,15 @@ fn scan_refresh(app: AppHandle, path: String) -> Result<(), String> {
         if let Ok(mut m) = state.big_files.lock() {
             m.retain(|k, _| k.as_str() != base.as_str() && !k.starts_with(prefix.as_str()));
         }
+    }
+    {
+        // 增量基线按子树清并同步落盘：强制重扫不改变目录 mtime，若留着旧条目，
+        // 下次扫描会 mtime 命中而复用重扫前的旧体积
+        let mut b = state.baseline.lock().map_err(|e| e.to_string())?;
+        b.retain(|k, _| k.as_str() != base.as_str() && !k.starts_with(prefix.as_str()));
+        let snap = b.clone();
+        drop(b);
+        save_baseline_file(&app, &snap);
     }
     spawn_priority_scan(&app, p, true)
 }
@@ -1976,22 +2155,25 @@ fn gen_token() -> String {
 pub struct AiChannelState {
     /// 前端聚合好的扫描快照 JSON 字符串
     snapshot: Mutex<Option<String>>,
-    /// 当前提案 {id, summary, items, status: pending|accepted|rejected|done, results}
-    proposal: Mutex<Option<serde_json::Value>>,
+    /// 提案列表（旧→新）。按范围并存：同范围（盘符组合）同时只允许一条 pending，
+    /// 不同范围互不阻塞——AI 先分析 C 盘再分析 D 盘时，两边的提案可以同时等确认
+    proposals: Mutex<Vec<serde_json::Value>>,
     enabled: AtomicBool,
     /// HTTP 服务端口（0 = 未启动）
     port: AtomicUsize,
-    token: String,
+    /// 联动令牌。持久化在 ai-channel.json，重启不变——AI 侧保存的接入信息跨会话有效；
+    /// setup 里从磁盘载入（没有才新生成），怀疑泄露时经 ai_channel_reset_token 轮换
+    token: std::sync::RwLock<String>,
 }
 
 impl AiChannelState {
     fn new() -> Self {
         Self {
             snapshot: Mutex::new(None),
-            proposal: Mutex::new(None),
+            proposals: Mutex::new(Vec::new()),
             enabled: AtomicBool::new(true),
             port: AtomicUsize::new(0),
-            token: gen_token(),
+            token: std::sync::RwLock::new(gen_token()),
         }
     }
 }
@@ -2067,6 +2249,36 @@ fn norm_query_path(raw: &str) -> String {
     s.to_lowercase()
 }
 
+/// 宽容的容量解析：'1048576'（字节）/ '10MB' / '1.5GB' / '512K' / '2g' 均可
+/// （1024 进制，大小写与尾缀 B 均可省）。AI 习惯直接写 min=100MB——纯字节解析
+/// 会失败并静默回退默认值，悄悄偏离 AI 的意图，必须认得单位写法
+fn parse_size_opt(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    let (num, mult): (&str, u64) = if let Some(r) = s.strip_suffix("kb") {
+        (r, 1024)
+    } else if let Some(r) = s.strip_suffix("mb") {
+        (r, 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix("gb") {
+        (r, 1024 * 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix("tb") {
+        (r, 1024 * 1024 * 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix('k') {
+        (r, 1024)
+    } else if let Some(r) = s.strip_suffix('m') {
+        (r, 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix('g') {
+        (r, 1024 * 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix('t') {
+        (r, 1024 * 1024 * 1024 * 1024)
+    } else if let Some(r) = s.strip_suffix('b') {
+        (r, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    Some((n * mult as f64) as u64)
+}
+
 /// 快照 tree 裁剪到 depth 层（depth=0 即折叠本层全部子项）。
 /// 被 VP 掉的层不丢信息：子项数量与字节并入该节点的 agg{n,s,al}（与已有 agg 合并）
 fn prune_snapshot_tree(node: &mut serde_json::Value, depth: u32) {
@@ -2132,6 +2344,9 @@ fn find_snapshot_tree_node<'a>(
 const TREE_MAX_CHILDREN: usize = 200;
 /// /api/tree 单次响应的全局节点预算：超出即停止下钻并标 truncated
 const TREE_NODE_BUDGET: usize = 2000;
+/// /api/tree?flat=1 默认行数上限（可用 max 调整，钳制到 FLAT_MAX_LIMIT）
+const FLAT_MAX_DEFAULT: usize = 200;
+const FLAT_MAX_LIMIT: usize = 2000;
 
 /// 多层级树节点构建（纯函数，供 /api/tree 与单测）：
 /// 一次返回 path 下 depth 层的目录与大文件（≥min 单列，<min 聚合进 agg），
@@ -2238,16 +2453,216 @@ fn build_tree_node(
     (node, truncated)
 }
 
-/// 设置/覆盖提案；已有 pending 提案时拒绝（AI 需先等用户处理上一个）
-fn try_set_proposal(state: &AiChannelState, v: serde_json::Value) -> Result<(), String> {
-    let mut g = state.proposal.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = g.as_ref() {
-        if p.get("status").and_then(|s| s.as_str()) == Some("pending") {
-            return Err("已有待确认的提案".into());
+/// flat 模式清单构建（纯函数，供 /api/tree 与单测）：
+/// 把 path 子树 depth 层内的目录（sizes 完成表）与文件（big_files 登记表）
+/// 拍平成一份按大小降序的清单——AI 找大头要的就是「路径→大小」，
+/// 不必解析嵌套树。行 = (路径, 逻辑字节, 占用字节, 是否目录)。
+/// 深度语义与 build_tree_node 一致：相对 path 的层数（文件在其父目录的下一层）；
+/// 返回 (行, 未显示条数)
+fn build_flat_list(
+    sizes: &HashMap<String, (u64, u64)>,
+    files: &HashMap<String, Vec<(String, u64, u64)>>,
+    path_lower: &str,
+    depth: u32,
+    min: u64,
+    max: usize,
+) -> (Vec<(String, u64, u64, bool)>, usize) {
+    // 前缀归一：盘根自带尾杠，子目录补尾杠（与 scan_refresh 同款）
+    let prefix = if path_lower.ends_with('\\') {
+        path_lower.to_string()
+    } else {
+        format!("{}\\", path_lower)
+    };
+    let mut rows: Vec<(String, u64, u64, bool)> = Vec::new();
+    for (k, &(s, al)) in sizes.iter() {
+        if let Some(rel) = k.strip_prefix(prefix.as_str()) {
+            if rel.is_empty() {
+                continue; // 根自身不进清单
+            }
+            let lvl = rel.split('\\').filter(|x| !x.is_empty()).count();
+            if lvl <= depth as usize && s >= min {
+                rows.push((k.clone(), s, al, true));
+            }
         }
     }
-    *g = Some(v);
+    for (parent, v) in files.iter() {
+        let Some(relp) = parent.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let lvl_parent = relp.split('\\').filter(|x| !x.is_empty()).count();
+        if lvl_parent >= depth as usize {
+            continue; // 文件在父目录的下一层，超出深度
+        }
+        for (nm, s, al) in v {
+            if *s >= min {
+                let p = if parent.ends_with('\\') {
+                    format!("{}{}", parent, nm)
+                } else {
+                    format!("{}\\{}", parent, nm)
+                };
+                rows.push((p, *s, *al, false));
+            }
+        }
+    }
+    // 大小降序；同大小按路径排，保证输出稳定可复现
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let more = rows.len().saturating_sub(max);
+    rows.truncate(max);
+    (rows, more)
+}
+
+/// flat 清单渲染为 text/plain：AI 直接逐行读，零解析零脚本
+/// （行格式「大小MB  D|F  路径」，与 AI 自己写脚本压缩出的形态一致）
+fn render_flat_text(
+    rows: &[(String, u64, u64, bool)],
+    more: usize,
+    path_lower: &str,
+    root_total: u64,
+    depth: u32,
+    min: u64,
+) -> String {
+    let mb = |b: u64| format!("{:.1}", b as f64 / 1048576.0);
+    let mut out = format!(
+        "# {} 按大小降序 · D=目录 F=文件 · 根合计={}MB · depth={} min={}MB · {} 项\n",
+        path_lower,
+        mb(root_total),
+        depth,
+        mb(min),
+        rows.len() + more
+    );
+    for (p, s, _al, is_dir) in rows {
+        out.push_str(&format!(
+            "{}MB  {}  {}\n",
+            mb(*s),
+            if *is_dir { 'D' } else { 'F' },
+            p
+        ));
+    }
+    if more > 0 {
+        out.push_str(&format!(
+            "# （还有 {} 项未显示：加大 max、提高 min 或减小 depth）\n",
+            more
+        ));
+    }
+    out
+}
+
+/// 提案的范围键：从 items[].src 归一出盘符前缀（小写、排序、逗号连接，如 "c:\,d:\"）。
+/// 无有效 src 的提案归 "global"。AI 不需要（也不会）主动上报范围——从提案目标推导，
+/// 同范围同时只允许一条 pending，不同盘的提案互不阻塞
+fn proposal_scope_key(v: &serde_json::Value) -> String {
+    let mut roots: Vec<String> = Vec::new();
+    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+        for it in items {
+            if let Some(src) = it.get("src").and_then(|s| s.as_str()) {
+                let s = src.trim().replace('/', "\\").to_lowercase();
+                let b = s.as_bytes();
+                if b.len() >= 3 && b[1] == b':' && b[0].is_ascii_lowercase() {
+                    let root = format!("{}:\\", b[0] as char);
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+            }
+        }
+    }
+    if roots.is_empty() {
+        return "global".to_string();
+    }
+    roots.sort();
+    roots.join(",")
+}
+
+/// 追加提案。同范围已有 pending 时拒绝（AI 需先等用户处理该盘的上一条）；
+/// 不同范围并存。列表裁剪：保留全部 pending + 最近 20 条已完结
+fn try_set_proposal(state: &AiChannelState, mut v: serde_json::Value) -> Result<(), String> {
+    // scope 在此统一注入：保证存储的提案必带范围键（HTTP 路由外也成立）
+    let scope = proposal_scope_key(&v);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("scope".into(), serde_json::json!(scope));
+    }
+    let mut g = state.proposals.lock().unwrap_or_else(|e| e.into_inner());
+    let conflict = g.iter().any(|p| {
+        p.get("status").and_then(|s| s.as_str()) == Some("pending")
+            && p.get("scope").and_then(|s| s.as_str()) == Some(scope.as_str())
+    });
+    if conflict {
+        return Err(format!("范围【{}】已有待确认的提案，等用户确认后再发", scope));
+    }
+    g.push(v);
+    let finished: Vec<usize> = g
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.get("status").and_then(|s| s.as_str()) != Some("pending"))
+        .map(|(i, _)| i)
+        .collect();
+    if finished.len() > 20 {
+        let cut = &finished[..finished.len() - 20];
+        let drop: std::collections::HashSet<usize> = cut.iter().copied().collect();
+        let mut i = 0usize;
+        g.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
     Ok(())
+}
+
+/// 提案落盘路径（cache_dir/ai-proposal.json）：误关面板 / 重启应用后可恢复，
+/// 不必让 AI 重头发提案
+fn proposal_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    cache_dir(app).ok().map(|d| d.join("ai-proposal.json"))
+}
+
+/// 提案列表写盘（v2 格式）。小文件，调用方线程同步写即可
+fn save_proposal_file(app: &AppHandle, list: &[serde_json::Value]) {
+    if let Some(f) = proposal_file(app) {
+        let body = serde_json::json!({ "v": 2, "proposals": list });
+        let _ = std::fs::write(f, body.to_string().as_bytes());
+    }
+}
+
+/// 读回落盘提案列表：v2（{v:2,proposals:[...]}）原样；v1 旧格式（单条对象）包成单元素；
+/// 任何异常返回空列表
+fn load_proposal_file(app: &AppHandle) -> Vec<serde_json::Value> {
+    let Some(f) = proposal_file(app) else {
+        return Vec::new();
+    };
+    let Ok(s) = std::fs::read_to_string(f) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&s) {
+        Ok(v) if v.get("proposals").and_then(|p| p.as_array()).is_some() => {
+            v["proposals"].as_array().cloned().unwrap_or_default()
+        }
+        Ok(v) if v.get("id").is_some() => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+// ======================== 联动令牌持久化 ========================
+
+/// 令牌存盘路径（cache_dir/ai-channel.json）
+fn channel_token_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    cache_dir(app).ok().map(|d| d.join("ai-channel.json"))
+}
+
+fn save_channel_token(app: &AppHandle, token: &str) {
+    if let Some(f) = channel_token_file(app) {
+        let body = serde_json::json!({ "v": 1, "token": token });
+        let _ = std::fs::write(f, body.to_string().as_bytes());
+    }
+}
+
+/// 读回持久化令牌：文件缺失/损坏/结构不对返回 None（调用方新生成并补写）
+fn load_channel_token(app: &AppHandle) -> Option<String> {
+    let f = channel_token_file(app)?;
+    let s = std::fs::read_to_string(f).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let t = v.get("token")?.as_str()?;
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// 解析后的请求头（头部名统一小写）
@@ -2305,11 +2720,16 @@ fn host_allowed(host: &str) -> bool {
 }
 
 fn http_res(stream: &mut std::net::TcpStream, status: u16, reason: &str, body: &str) {
+    http_res_ct(stream, status, reason, body, "application/json; charset=utf-8");
+}
+
+/// 指定 Content-Type 的响应（/api/tree?flat=1 返回 text/plain）
+fn http_res_ct(stream: &mut std::net::TcpStream, status: u16, reason: &str, body: &str, ct: &str) {
     use std::io::Write;
     let _ = write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
-        status, reason, body.len(), body
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        status, reason, ct, body.len(), body
     );
     let _ = stream.flush();
 }
@@ -2390,14 +2810,14 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                 "app": "disklens",
                 "version": env!("CARGO_PKG_VERSION"),
                 "root": root,
-                "flow": "推荐：GET /api/tree（不带 path，一次拿根下 3 层全景）→ 对目标目录 GET /api/tree?path=...&depth=3 精准下钻。所有响应都是几 KB 的 JSON，直接读 stdout，不要 -o 落盘再解析；只在需要类型分布/卷口径/受限目录时才拉 /api/scan?tree=0&depth=1",
+                "flow": "找大头用 GET /api/tree?path=<目录>&depth=4&min=1048576&flat=1：直接返回按大小降序的文本清单（每行「大小MB D|F 路径」），零解析零脚本；要看层级构成用 GET /api/tree（不带 path，根下 3 层 JSON 全景）或 ?path=...&depth=3 精准下钻。所有响应直接读 stdout，不要 -o 落盘再解析；只在需要类型分布/卷口径/受限目录时才拉 /api/scan?tree=0&depth=1",
                 "endpoints": [
                     "GET  /api/status    — 扫描状态 {scanning, hasSnapshot, root}（先查这个）",
                     "POST /api/scan      — 触发扫描 {\"root\":\"C:\\\\\"} 或 {\"roots\":[\"C:\\\\\",\"D:\\\\\"]}（未扫描/换盘时用）",
-                    "GET  /api/tree      — 多层级下钻：?path=<目录>&depth=<1..=8,默认3>&min=<字节,默认10MB>。一次返回 depth 层的目录+大文件（含 file 标记），<min 聚合进 agg{n,s}，more=未单列数，truncated=预算截断。path 不带则用根；正/反斜杠等价、大小写不敏感",
+                    "GET  /api/tree      — 多层级下钻：?path=<目录>&depth=<1..=8,默认3>&min=<字节或 100MB/1GB 写法,默认10MB>&max=<flat 行数,默认200>。一次返回 depth 层的目录+大文件（含 file 标记），<min 聚合进 agg{n,s}，more=未单列数，truncated=预算截断；&flat=1 拍平成按大小降序的 text/plain 清单（每行「大小MB D|F 路径」，找大头首选，无需解析 JSON）。path 不带则用根；正/反斜杠等价、大小写不敏感",
                     "GET  /api/scan      — 扫描快照：全量时树+类型+卷口径+受限目录 denied（MB 级）。裁剪参数：?depth=4 树只留 4 层（被裁层折叠进 agg）、?tree=0 不要树只要统计、?path=<目录> 只取子树——带参数的响应为 KB 级",
-                    "GET  /api/proposal  — 当前提案状态（轮询执行结果）",
-                    "POST /api/proposal  — 提交提案 {summary, items:[{action:migrate|cleanup|note, src, dest_root?, reason?}]}"
+                    "GET  /api/proposal  — 提案状态：?id=<POST 返回的 id> 精确轮询某条（多盘提案并存时必带 id），缺省返回最新一条",
+                    "POST /api/proposal  — 提交提案 {summary, items:[{action:migrate|cleanup|note, src, dest_root?, reason?}]}。按范围（盘符）并存：同范围已有待确认提案时 409，不同盘互不阻塞；范围由 items 的 src 自动推导，无需上报"
                 ],
             });
             http_res(&mut stream, 200, "OK", &body.to_string());
@@ -2486,7 +2906,7 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                 .unwrap_or(3)
                 .clamp(1, 8);
             let min = get_p("min")
-                .and_then(|m| m.trim().parse::<u64>().ok())
+                .and_then(|m| parse_size_opt(&m))
                 .unwrap_or(MIN_BIG_FILE);
             let g = scan_state.sizes.lock().unwrap_or_else(|e| e.into_inner());
             if !g.contains_key(&lower) {
@@ -2496,6 +2916,32 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                     "hint": "先 GET /api/tree（不带 path）从根开始；路径传小写、/ 或 \\ 均可；已完成扫描的范围见 GET /api/status 的 root"
                 });
                 http_res(&mut stream, 404, "Not Found", &body.to_string());
+                return;
+            }
+            // flat=1：拍平成按大小降序的文本清单——AI 找大头要的就是「路径→大小」，
+            // 嵌套树 JSON 大且要解析，AI 每次都得自己写脚本拍平（175KB 响应的教训）
+            let want_flat = get_p("flat")
+                .map(|v| v.is_empty() || v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if want_flat {
+                let max = get_p("max")
+                    .and_then(|m| m.trim().parse::<usize>().ok())
+                    .unwrap_or(FLAT_MAX_DEFAULT)
+                    .clamp(10, FLAT_MAX_LIMIT);
+                let f = scan_state
+                    .big_files
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let (rows, more) = build_flat_list(&g, &f, &lower, depth, min, max);
+                let root_total = g.get(&lower).map(|&(s, _)| s).unwrap_or(0);
+                drop(f);
+                http_res_ct(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &render_flat_text(&rows, more, &lower, root_total, depth, min),
+                    "text/plain; charset=utf-8",
+                );
                 return;
             }
             let f = scan_state
@@ -2518,7 +2964,7 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                 }
             }
             root["note"] = serde_json::json!(
-                "children 已展开 depth 层（目录+≥min 的大文件，按大小降序）；<min 的子项聚合成 agg{n,s}；more=超上限未单列数；truncated=节点预算截断，请用更小的 path/depth 精准下钻；路径均为小写；监视中的增量变化可能未反映；受限目录清单见 GET /api/scan 的 denied"
+                "children 已展开 depth 层（目录+≥min 的大文件，按大小降序）；<min 的子项聚合成 agg{n,s}；more=超上限未单列数；truncated=节点预算截断，请用更小的 path/depth 精准下钻；只要大小清单不要层级就加 &flat=1（text/plain，每行「大小MB D|F 路径」，min 支持 100MB/1GB 单位写法）；路径均为小写；监视中的增量变化可能未反映；受限目录清单见 GET /api/scan 的 denied"
             );
             http_res(&mut stream, 200, "OK", &root.to_string());
         }
@@ -2592,8 +3038,22 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
             }
         }
         ("GET", "/api/proposal") => {
-            let g = state.proposal.lock().unwrap_or_else(|e| e.into_inner());
-            let v = g.clone().unwrap_or(serde_json::json!({"status": "none"}));
+            // 多盘提案并存：?id= 精确轮询某条（AI 应带 POST 返回的 id）；缺省返回最新一条
+            let q = head.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let want_id = parse_query(q)
+                .iter()
+                .find(|(k, _)| k == "id")
+                .map(|(_, v)| v.clone());
+            let g = state.proposals.lock().unwrap_or_else(|e| e.into_inner());
+            let found = match want_id.as_deref() {
+                Some(id) if !id.is_empty() => g.iter().rev().find(|p| {
+                    p.get("id").and_then(|i| i.as_str()) == Some(id)
+                }),
+                _ => g.last(),
+            };
+            let v = found
+                .cloned()
+                .unwrap_or(serde_json::json!({"status": "none"}));
             http_res(&mut stream, 200, "OK", &v.to_string());
         }
         ("POST", "/api/proposal") => {
@@ -2617,13 +3077,22 @@ fn handle_ai_conn(app: &AppHandle, mut stream: std::net::TcpStream, token: &str)
                     .unwrap_or_default()
                     .as_millis()
             );
+            // 范围键由后端从 items[].src 推导（前端展示/并存判定用），AI 无需上报
+            let scope = proposal_scope_key(&v);
             if let Some(o) = v.as_object_mut() {
                 o.insert("id".into(), serde_json::json!(id));
                 o.insert("status".into(), serde_json::json!("pending"));
                 o.insert("results".into(), serde_json::json!([]));
+                o.insert("scope".into(), serde_json::json!(scope));
             }
             match try_set_proposal(&state, v.clone()) {
                 Ok(()) => {
+                    let list = state
+                        .proposals
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    save_proposal_file(app, &list); // 落盘:误关/重启后可恢复
                     let _ = app.emit("ai-proposal", &v);
                     http_res(&mut stream, 200, "OK", &format!("{{\"id\":\"{}\"}}", id));
                 }
@@ -2638,14 +3107,24 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// 后台 HTTP 服务：绑定 127.0.0.1 随机端口，thread-per-connection（本机低流量）
+/// 后台 HTTP 服务：固定默认端口优先（AI 侧保存的端点地址跨会话稳定），
+/// 被占用（多开/端口冲突）时退回随机端口。thread-per-connection（本机低流量）
 fn run_ai_channel(app: AppHandle) {
-    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+    const AI_CHANNEL_PORT: u16 = 8284;
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", AI_CHANNEL_PORT)) {
         Ok(l) => l,
-        Err(_) => return, // 端口绑定失败：通道不可用，应用其余功能不受影响
+        Err(_) => match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return, // 端口绑定失败：通道不可用，应用其余功能不受影响
+        },
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-    let token = app.state::<AiChannelState>().token.clone();
+    let token = app
+        .state::<AiChannelState>()
+        .token
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     app.state::<AiChannelState>()
         .port
         .store(port as usize, Ordering::Relaxed);
@@ -2673,9 +3152,14 @@ fn ai_snapshot(state: State<'_, AiChannelState>, json: String) -> Result<(), Str
 
 #[tauri::command]
 fn ai_channel_info(state: State<'_, AiChannelState>) -> serde_json::Value {
+    let token = state
+        .token
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     serde_json::json!({
         "port": state.port.load(Ordering::Relaxed) as u64,
-        "token": state.token,
+        "token": token,
         "enabled": state.enabled.load(Ordering::Relaxed),
     })
 }
@@ -2685,24 +3169,55 @@ fn ai_channel_set_enabled(state: State<'_, AiChannelState>, enabled: bool) {
     state.enabled.store(enabled, Ordering::Relaxed);
 }
 
-/// 前端在提案处理完（执行完毕 / 用户忽略）后回写终态，供 AI 轮询
+/// 轮换令牌：怀疑泄露时用。新生成并写盘，旧的立即失效——
+/// 已发给 AI 的接入信息要重新复制一次
+#[tauri::command]
+fn ai_channel_reset_token(app: AppHandle, state: State<'_, AiChannelState>) -> Result<(), String> {
+    let t = gen_token();
+    if let Ok(mut w) = state.token.write() {
+        *w = t.clone();
+    }
+    save_channel_token(&app, &t);
+    Ok(())
+}
+
+/// 前端在提案处理完（执行完毕 / 用户忽略）后回写终态，供 AI 轮询。
+/// 终态同步落盘（重启后提案历史仍在，pending 的还能重新弹出确认）
 #[tauri::command]
 fn ai_proposal_result(
+    app: AppHandle,
     state: State<'_, AiChannelState>,
     id: String,
     status: String,
     results: serde_json::Value,
 ) -> Result<(), String> {
-    let mut g = state.proposal.lock().map_err(|e| e.to_string())?;
-    if let Some(p) = g.as_mut() {
-        if p.get("id").and_then(|i| i.as_str()) == Some(id.as_str()) {
-            if let Some(o) = p.as_object_mut() {
-                o.insert("status".into(), serde_json::json!(status));
-                o.insert("results".into(), results);
-            }
+    let mut g = state.proposals.lock().map_err(|e| e.to_string())?;
+    if let Some(p) = g
+        .iter_mut()
+        .rev()
+        .find(|p| p.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+    {
+        if let Some(o) = p.as_object_mut() {
+            o.insert("status".into(), serde_json::json!(status));
+            o.insert("results".into(), results);
         }
     }
+    let snap = g.clone();
+    drop(g);
+    save_proposal_file(&app, &snap);
     Ok(())
+}
+
+/// 启动恢复：前端拉取上次会话遗留的提案列表（pending 的会重新弹确认面板）
+#[tauri::command]
+fn ai_proposal_get(state: State<'_, AiChannelState>) -> serde_json::Value {
+    serde_json::Value::Array(
+        state
+            .proposals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    )
 }
 
 /// 评估可迁移性。walk_stats 递归统计大目录可能耗时数秒——async + 线程池执行，
@@ -3137,6 +3652,8 @@ pub fn run() {
             ai_channel_info,
             ai_channel_set_enabled,
             ai_proposal_result,
+            ai_proposal_get,
+            ai_channel_reset_token,
             migrate_check,
             migrate_start,
             migrate_stop,
@@ -3173,10 +3690,37 @@ pub fn run() {
                     ),
                 );
             }
-            // AI 联动通道：本地 127.0.0.1 随机端口的迷你 HTTP 服务（仅桌面端有意义；
+            // 联动令牌持久化：重启不变，AI 侧保存的接入信息跨会话有效；
+            // 首次运行生成并写盘，之后从磁盘载入（怀疑泄露时面板可一键轮换）
+            {
+                let st = app.state::<AiChannelState>();
+                let tok = match load_channel_token(app.handle()) {
+                    Some(t) => t,
+                    None => {
+                        let t = gen_token();
+                        save_channel_token(app.handle(), &t);
+                        t
+                    }
+                };
+                if let Ok(mut w) = st.token.write() {
+                    *w = tok;
+                }
+            }
+            // AI 联动通道：本地 127.0.0.1 的迷你 HTTP 服务（仅桌面端有意义；
             // 端口/token 通过 ai_channel_info 给前端展示）
             let handle = app.handle().clone();
             std::thread::spawn(move || run_ai_channel(handle));
+            // 上次会话遗留的待确认提案：从磁盘恢复进状态（多盘可并存）
+            // （前端启动时经 ai_proposal_get 拉取，pending 的重新弹确认面板）
+            let pend: Vec<serde_json::Value> = load_proposal_file(app.handle())
+                .into_iter()
+                .filter(|p| p.get("status").and_then(|s| s.as_str()) == Some("pending"))
+                .collect();
+            if !pend.is_empty() {
+                if let Ok(mut g) = app.state::<AiChannelState>().proposals.lock() {
+                    *g = pend;
+                }
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -3384,6 +3928,92 @@ mod tests {
     }
 
     #[test]
+    fn flat_list_flattens_sorts_and_filters() {
+        let (sizes, files) = tree_fixture();
+        // depth=3、min=10：目录 a(600)/b(500)/deep(400)/c(300) + 文件 big.iso(120)；
+        // core.vhdx 在第 4 层（deep 的下一层），与 tree 模式深度语义一致不单列
+        let (rows, more) = build_flat_list(&sizes, &files, "c:\\", 3, 10, 200);
+        assert_eq!(more, 0);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], ("c:\\a".into(), 600, 660, true));
+        assert_eq!(rows[2], ("c:\\a\\b\\deep".into(), 400, 440, true));
+        assert_eq!(rows[4], ("c:\\a\\big.iso".into(), 120, 130, false));
+        // <min 不单列，根自身不进清单
+        assert!(rows.iter().all(|r| r.1 >= 10 && r.0 != "c:\\"));
+    }
+
+    #[test]
+    fn flat_list_depth_and_max_truncate() {
+        let (sizes, files) = tree_fixture();
+        // depth=1：只有 a(600) 与 c(300)——b/deep 属更深层，big.iso 在 a 下第 2 层
+        let (rows, _) = build_flat_list(&sizes, &files, "c:\\", 1, 10, 200);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "c:\\a");
+        // max 截断：depth=3 共 5 项，max=2 时 3 项计入 more
+        let (rows2, more2) = build_flat_list(&sizes, &files, "c:\\", 3, 10, 2);
+        assert_eq!(rows2.len(), 2);
+        assert_eq!(more2, 3);
+        // 子目录作根（无尾杠前缀归一）+ 深度内文件单列
+        let (rows3, _) = build_flat_list(&sizes, &files, "c:\\a\\b", 2, 10, 200);
+        assert_eq!(rows3.len(), 2);
+        assert_eq!(rows3[0].0, "c:\\a\\b\\deep");
+        assert_eq!(rows3[1].0, "c:\\a\\b\\deep\\core.vhdx");
+    }
+
+    #[test]
+    fn parse_size_accepts_units_and_bytes() {
+        assert_eq!(parse_size_opt("1048576"), Some(1048576));
+        assert_eq!(parse_size_opt("1MB"), Some(1048576));
+        assert_eq!(parse_size_opt("10mb"), Some(10485760));
+        assert_eq!(parse_size_opt("1.5GB"), Some(1610612736));
+        assert_eq!(parse_size_opt("512K"), Some(524288));
+        assert_eq!(parse_size_opt("2g"), Some(2147483648));
+        assert_eq!(parse_size_opt("100b"), Some(100));
+        assert_eq!(parse_size_opt("abc"), None);
+        assert_eq!(parse_size_opt(""), None);
+    }
+
+    #[test]
+    fn flat_text_renders_lines_with_header() {
+        let rows = vec![
+            ("c:\\a".to_string(), 600, 660, true),
+            ("c:\\a\\big.iso".to_string(), 120, 130, false),
+        ];
+        let t = render_flat_text(&rows, 0, "c:\\", 1000, 3, 10);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("# c:\\ 按大小降序"), "首行元信息：{}", lines[0]);
+        assert_eq!(lines[1], "0.0MB  D  c:\\a");   // fixture 字节远小于 1MB
+        assert_eq!(lines[2], "0.0MB  F  c:\\a\\big.iso");
+        assert_eq!(lines.len(), 3, "more=0 无尾注");
+    }
+
+    #[test]
+    fn baseline_reuse_requires_matching_mtime() {
+        let mut b = HashMap::new();
+        b.insert("c:\\a".to_string(), (600, 660, 111111u64));
+        // mtime 一致 → 复用基线体积；不一致 / stat 失败 / 不在基线 → 全量
+        assert_eq!(baseline_reuse(&b, "c:\\a", Some(111111)), Some((600, 660)));
+        assert_eq!(baseline_reuse(&b, "c:\\a", Some(222222)), None);
+        assert_eq!(baseline_reuse(&b, "c:\\a", None), None);
+        assert_eq!(baseline_reuse(&b, "c:\\x", Some(111111)), None);
+    }
+
+    #[test]
+    fn baseline_json_roundtrip() {
+        let mut m = HashMap::new();
+        m.insert("c:\\".to_string(), (1000, 1100, 12345));
+        m.insert("c:\\a".to_string(), (600, 660, 67890));
+        assert_eq!(baseline_from_json(&baseline_to_json(&m)), m);
+        // 任何异常输入 → 空表（等价全量扫描，宁慢勿错）
+        assert_eq!(baseline_from_json("not json"), HashMap::new());
+        assert_eq!(baseline_from_json("{\"v\":1,\"rows\":[]}"), HashMap::new());
+        assert_eq!(
+            baseline_from_json("{\"v\":1,\"rows\":[[\"c:\\\\a\",1,2]]}"),
+            HashMap::new()
+        );
+    }
+
+    #[test]
     fn tree_multi_depth1_lists_direct_only() {
         let (sizes, files) = tree_fixture();
         let mut budget = TREE_NODE_BUDGET;
@@ -3427,18 +4057,36 @@ mod tests {
     }
 
     #[test]
-    fn ai_proposal_rejects_second_pending() {
+    fn ai_proposal_same_scope_conflicts_other_scope_coexists() {
         let st = AiChannelState::new();
+        // C 盘提案进入 pending
         let p1 = serde_json::json!({"id":"p1","items":[{"action":"migrate","src":"C:\\x"}],"status":"pending"});
         assert!(try_set_proposal(&st, p1).is_ok());
-        // pending 未处理时新提案被拒（409 语义）
+        // 同范围（C:\）第二条 pending 被拒（409 语义）
         let p2 = serde_json::json!({"id":"p2","items":[{"action":"note","src":"C:\\y"}],"status":"pending"});
         assert!(try_set_proposal(&st, p2).is_err());
-        // 终态后可再提交
-        let done = serde_json::json!({"id":"p1","items":[],"status":"done","results":[]});
-        *st.proposal.lock().unwrap() = Some(done);
-        let p3 = serde_json::json!({"id":"p3","items":[{"action":"note","src":"C:\\z"}],"status":"pending"});
+        // 不同范围（D:\）并存不阻塞——先扫 C 再切 D 的工作流互不影响
+        let p3 = serde_json::json!({"id":"p3","items":[{"action":"note","src":"D:\\z"}],"status":"pending"});
         assert!(try_set_proposal(&st, p3).is_ok());
+        // 跨盘提案的范围键是多盘组合
+        let p4 = serde_json::json!({"id":"p4","items":[{"src":"C:\\a"},{"src":"d:/b"}],"status":"pending"});
+        assert_eq!(proposal_scope_key(&p4), "c:\\,d:\\");
+        // C 盘提案完结后，同范围可再提交
+        st.proposals.lock().unwrap()[0]["status"] = serde_json::json!("done");
+        let p5 = serde_json::json!({"id":"p5","items":[{"action":"note","src":"C:\\z"}],"status":"pending"});
+        assert!(try_set_proposal(&st, p5).is_ok());
+    }
+
+    #[test]
+    fn proposal_scope_key_normalizes() {
+        // 盘符大小写 / 正反斜杠归一，去重排序
+        assert_eq!(
+            proposal_scope_key(&serde_json::json!({"items":[{"src":"C:\\a"},{"src":"d:/b"},{"src":"c:\\c"}]})),
+            "c:\\,d:\\"
+        );
+        // 无有效 src（纯 note / 无 src）→ global
+        assert_eq!(proposal_scope_key(&serde_json::json!({"items":[{"action":"note"}]})), "global");
+        assert_eq!(proposal_scope_key(&serde_json::json!({"items":[]})), "global");
     }
 
     #[test]
@@ -3514,6 +4162,7 @@ mod tests {
             alloc: Mutex::new(0),
             denied: AtomicBool::new(false),
             iter_done: AtomicBool::new(false),
+            mtime: Mutex::new(0),
             parent,
         })
     }
@@ -3521,20 +4170,26 @@ mod tests {
     #[test]
     fn settle_propagates_totals_up_the_chain() {
         let sizes: Mutex<HashMap<String, (u64, u64)>> = Mutex::new(HashMap::new());
+        let bnew: Mutex<HashMap<String, (u64, u64, u64)>> = Mutex::new(HashMap::new());
         let root = dstate("C:\\r", None);
         let child = dstate("C:\\r\\c", Some(root.clone()));
         // 父目录有一个未完成的子目录任务
         root.remaining.store(1, Ordering::Relaxed);
         // 子目录完成（体积 100）→ 上缴父目录；但父目录还没读完目录项 → 不级联
-        let r = settle(&child, 100, 110, &sizes);
+        let r = settle(&child, 100, 110, &sizes, &bnew);
         assert!(r.is_none(), "父目录 iter_done=false 不应级联");
         assert_eq!(*root.size.lock().unwrap(), 100);
         assert_eq!(*root.alloc.lock().unwrap(), 110);
         assert_eq!(root.remaining.load(Ordering::Relaxed), 0);
         assert_eq!(sizes.lock().unwrap().get("c:\\r\\c"), Some(&(100, 110)));
+        // 完成目录同时记入新基线（mtime=0 占位，真实 mtime 由 process_job 写入）
+        assert_eq!(
+            bnew.lock().unwrap().get("c:\\r\\c"),
+            Some(&(100, 110, 0u64))
+        );
         // 父目录自己读完（自带 5 字节文件，总计 105）→ 级联条件满足但自身是根 → 返回 None
         root.iter_done.store(true, Ordering::Relaxed);
-        let r = settle(&root, 105, 115, &sizes);
+        let r = settle(&root, 105, 115, &sizes, &bnew);
         assert!(r.is_none(), "根目录没有父级");
         assert_eq!(sizes.lock().unwrap().get("c:\\r"), Some(&(105, 115)));
     }
@@ -3542,19 +4197,20 @@ mod tests {
     #[test]
     fn settle_cascades_when_parent_ready() {
         let sizes: Mutex<HashMap<String, (u64, u64)>> = Mutex::new(HashMap::new());
+        let bnew: Mutex<HashMap<String, (u64, u64, u64)>> = Mutex::new(HashMap::new());
         let root = dstate("C:\\p", None);
         let mid = dstate("C:\\p\\m", Some(root.clone()));
         let leaf = dstate("C:\\p\\m\\l", Some(mid.clone()));
         mid.remaining.store(1, Ordering::Relaxed);
         mid.iter_done.store(true, Ordering::Relaxed);
         // 叶子完成 → mid 减到 0 且已读完 → 级联返回 mid（总价 7 = 自身 0 + 叶子 7）
-        let r = settle(&leaf, 7, 8, &sizes);
+        let r = settle(&leaf, 7, 8, &sizes, &bnew);
         assert_eq!(
             r.map(|(s, t, a)| (s.path.clone(), t, a)),
             Some(("C:\\p\\m".into(), 7, 8))
         );
         // mid 再完成 → 上缴 root；root 未读完 → None
-        let r = settle(&mid, 7, 8, &sizes);
+        let r = settle(&mid, 7, 8, &sizes, &bnew);
         assert!(r.is_none());
         assert_eq!(*root.size.lock().unwrap(), 7);
         assert_eq!(*root.alloc.lock().unwrap(), 8);

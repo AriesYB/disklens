@@ -78,6 +78,9 @@
       <div id="wait"><div><div class="spin"></div><div style="margin-top:12px">等待扫描开始…</div></div></div>
     </main>
 
+    <!-- AI 提案待确认悬浮角标：固定在右下角，不随摘要文字流布局（小窗也不会被挤没） -->
+    <button id="prop-fab" style="display:none">📋<span id="prop-fab-n"></span></button>
+
     <footer id="foot">
       <span id="foot-stats"></span>
       <span id="foot-hint"></span>
@@ -132,7 +135,7 @@
           <details class="ai-ch-adv">
             <summary>高级</summary>
             <div class="ai-ch-row"><span>端点</span><code id="ai-ch-url">—</code><button id="ai-ch-copy">📋 复制</button></div>
-            <div class="ai-ch-row"><span>令牌</span><code id="ai-ch-token">—</code></div>
+            <div class="ai-ch-row"><span>令牌</span><code id="ai-ch-token">—</code><button id="ai-ch-rotate" title="生成新令牌并写盘，旧令牌立即失效（重启后也不再变化）。已发给 AI 的接入信息需重新复制">换新令牌</button></div>
             <label class="ai-ch-tgl"><input type="checkbox" id="ai-ch-enabled" checked> 允许 AI 访问本机数据（仅 127.0.0.1 + 令牌校验）</label>
           </details>
         </div>
@@ -152,10 +155,11 @@
 
     <div id="prop-mask" style="display:none">
       <div id="prop">
-        <div id="prop-title">🤖 AI 提案 <span id="prop-summary"></span> <button id="prop-close" title="关闭">✕</button></div>
+        <div id="prop-title">🤖 AI 提案 <span id="prop-scope" style="color:#8fd0ff;font-weight:600"></span> <span id="prop-summary"></span> <button id="prop-close" title="收起（提案保留，可从状态栏「📋 待确认」重新打开）">✕</button></div>
         <div class="prop-note">来自 AI 助手的建议清单。勾选要执行的<b>迁移</b>项后点击执行——
           复制 → 校验 → junction 切换全程由 DiskLens 完成，任何失败源目录原样保留。
           清理类建议只做展示与定位（删除请自行确认）。</div>
+        <div id="prop-tabs" style="display:none"></div>
         <div id="prop-list"></div>
         <div id="prop-foot">
           <span id="prop-progress"></span>

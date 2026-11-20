@@ -115,16 +115,20 @@ function dropScopeData(roots){
   for(var k in deniedSeen){ if(hit(k)) delete deniedSeen[k]; }
 }
 
-// 记录/刷新当前范围的使用顺序，并逐出超限的最旧范围
+// 记录/刷新当前范围的使用顺序，并逐出超限的最旧范围。
+// 扫描进行中只保留当前范围（maxOthers=0）：AI 连续扫不同盘时，上一盘的整棵树
+// （几十万节点、数百 MB）不再在扫描期间驻留——扫描期内存峰值约减半，扫完
+// 切回上一范围需重扫；空闲态维持 MAX_SCOPES 个范围供秒开切换
 function rememberScope(){
   var key = curScopeKey();
   var i = scopeOrder.indexOf(key);
   if(i >= 0) scopeOrder.splice(i, 1);
   scopeOrder.push(key);
   scopeRoots[key] = ROOTS.slice();
+  var maxOthers = scanning ? 0 : MAX_SCOPES - 1;
   while(true){
     var others = scopeOrder.filter(function(k){ return k !== key; });
-    if(others.length < MAX_SCOPES) break;
+    if(others.length <= maxOthers) break;
     var oldest = others[0];
     dropScopeData(scopeRoots[oldest] || []);
     scopeOrder.splice(scopeOrder.indexOf(oldest), 1);
@@ -359,7 +363,8 @@ function clearViewBodies(){
 /* 扫描启动的统一 UI 接管：用户点按钮与 AI 触发共用（roots 数组）。
    同范围重扫保留现有数据——重扫事件流会覆盖更新，手动与 AI 触发一致，
    避免清空大文件榜等视图后小目录扫描没有新大文件回流、界面"变空"；
-   换范围时不清 store：其他范围扫过的数据留在内存，切回去还能秒开上次结果 */
+   其他范围的数据空闲态留在内存供秒开，但扫描开始时会整体逐出
+   （rememberScope 扫描态只留当前范围，避免扫描期间双树驻留拖垮内存） */
 function beginScanUI(roots, byAI){
   var sameScope = roots.length === ROOTS.length &&
     roots.every(function(r, i){ return String(r).toLowerCase() === String(ROOTS[i]||'').toLowerCase(); });
@@ -367,7 +372,6 @@ function beginScanUI(roots, byAI){
   ROOTS = roots.map(function(r){ return r; });
   window.ROOT = ROOTS[0];
   if (watchActive) setWatch(false);   // AI 触发路径没有按钮前置清理，这里统一关掉旧范围监视
-  rememberScope();                     // 记录本次范围并逐出超限的最旧范围（内存上限）
   if (!keepData) {
     clearViewBodies();
     window.expanded = {}; window.stack = []; selectedRow = '';
@@ -381,6 +385,7 @@ function beginScanUI(roots, byAI){
   window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
   window.rootInput.value = window.ROOT;
   setScanning(true);
+  rememberScope();   // 扫描态下逐出其他范围（scanning=true 时只留当前范围，压内存峰值）
   setStatus(byAI ? 'AI 触发扫描中…' : '扫描中…', 'scanning');
   syncDrivesSelect(); loadDrives();
   render();
@@ -508,7 +513,7 @@ function buildAiSnapshot(){
     rootSize:sum.s, rootAlloc:sum.al, deniedCount:deniedInScope(),
     tree: snapTree(root),      // 树形构成（多盘=虚拟根下各盘一棵；≥10MB 子项 + 每层 agg）
     denied:denied, types:types,
-    drill: 'GET /api/tree?path=<dir>&depth=<1..=8,默认3>&min=<字节,默认10MB> 一次返回多层（目录+大文件，<min 聚合进 agg，预算截断标 truncated）；无需逐层探索'
+    drill: 'GET /api/tree?path=<dir>&depth=<1..=8,默认3>&min=<字节或 100MB/1GB,默认10MB> 一次返回多层（目录+大文件，<min 聚合进 agg，预算截断标 truncated）；找大头加 &flat=1 直接返回按大小降序的文本清单（每行「大小MB D|F 路径」，零解析）；无需逐层探索'
   });
 }
 function pushAiSnapshot(){
@@ -625,6 +630,8 @@ function updateSummary(node){
   }
   var dCnt = deniedInScope();
   if(dCnt) parts.push('<span id="denied-link" style="color:var(--amber);cursor:pointer;text-decoration:underline dotted" title="这些目录无权限读取，体积只含已读到的部分——点击查看清单">⛔ '+dCnt+' 个目录无权限</span>');
+  // AI 提案待确认入口已改为右下角固定悬浮角标（#prop-fab，见 aiassist.js）：
+  // 不随摘要文字流布局，小窗也不会被挤没/截断
   if(scanning&&scanT0) parts.push('用时 '+((Date.now()-scanT0)/1000).toFixed(1)+'s');
   else if(lastScanSecs) parts.push('用时 '+lastScanSecs.toFixed(1)+'s');   // 完成态保留耗时
   if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?' · 已感知 '+watchChanges+' 项变更':'')+'</span>');
@@ -857,7 +864,9 @@ function TauriFeed(){
     setScanning(false);   // 内部已推完成态快照
     autoExpandView();
     prevCacheLoaded = false; prevCache = null;   // prev 缓存已轮换，历史对比下次进视图重读
-    saveScanCache();      // 完整扫描落缓存（轮换 prev 供历史对比）
+    // 落缓存避开完成瞬间：遍历全 store + 大 JSON.stringify 是数百毫秒级的主线程
+    // 重活，先让完成态渲染/快照推送跑完（期间若又开新扫描则跳过，由其完成时统一落）
+    setTimeout(function(){ if(!scanning) saveScanCache(); }, 400);
     scopeAt[curScopeKey()] = Date.now();         // 记录该范围完成时间（切回时显示"多久前"）
     diagLog('info', String(msg) + '（roots=' + ROOTS.join(',') + '）');
     // 完整扫描结束后进入实时监视：文件增删改即时反映到视图（多盘逐根挂 watcher）
@@ -909,8 +918,18 @@ TauriFeed.prototype.aiChannelInfo = function(cb){
 TauriFeed.prototype.aiChannelSetEnabled = function(enabled){
   window.__TAURI__.core.invoke('ai_channel_set_enabled', { enabled: !!enabled }).catch(function(){});
 };
+/* 轮换联动令牌：新生成并写盘，旧令牌立即失效 */
+TauriFeed.prototype.aiChannelRotateToken = function(cb){
+  window.__TAURI__.core.invoke('ai_channel_reset_token')
+    .then(function(){ cb && cb(); }).catch(function(){ cb && cb(); });
+};
 TauriFeed.prototype.aiProposalResult = function(id, status, results){
   window.__TAURI__.core.invoke('ai_proposal_result', { id: id, status: status, results: results }).catch(function(){});
+};
+/* 启动恢复：拉取上次会话遗留的提案（pending 的重新弹确认面板） */
+TauriFeed.prototype.aiProposalGet = function(cb){
+  window.__TAURI__.core.invoke('ai_proposal_get')
+    .then(function(r){ cb(r||null); }).catch(function(){ cb(null); });
 };
 TauriFeed.prototype.migrateCheck = function(src, destRoot, cb){
   window.__TAURI__.core.invoke('migrate_check', { src: src, destRoot: destRoot }).then(cb).catch(function(e){
@@ -1095,7 +1114,9 @@ MockFeed.prototype.listVolumes = function(cb){
 MockFeed.prototype.aiSnapshot = function(){};
 MockFeed.prototype.aiChannelInfo = function(cb){ cb(null); };
 MockFeed.prototype.aiChannelSetEnabled = function(){};
+MockFeed.prototype.aiChannelRotateToken = function(cb){ cb && cb(); };
 MockFeed.prototype.aiProposalResult = function(){};
+MockFeed.prototype.aiProposalGet = function(cb){ cb(null); };
 MockFeed.prototype.migrateCheck = function(src, destRoot, cb){
   setTimeout(function(){
     var node = store.get(src.toLowerCase());
@@ -1230,6 +1251,12 @@ window.addEventListener('DOMContentLoaded', function(){
         rememberScope();
         setStatus('已恢复上次扫描结果（' + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + ' 小时前）· 建议重新扫描刷新', 'done');
         markDirty();
+      }
+    });
+    // 上次会话遗留的待确认提案：落盘恢复（多盘可并存），弹最新一条（误关/重启都不丢）
+    if(feed.aiProposalGet) feed.aiProposalGet(function(list){
+      if(typeof restoreProposals === 'function'){
+        setTimeout(function(){ restoreProposals(list||[]); }, 600);   // 等首帧渲染完再弹
       }
     });
   }

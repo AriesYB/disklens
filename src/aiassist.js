@@ -108,15 +108,17 @@ function renderAiPanel() {
         '（多盘齐扫可传多个，如 {"roots":["C:\\\\","D:\\\\"]}），之后每 5 秒轮询 /api/status 直到 scanning=false 且 hasSnapshot=true（大目录需几十秒到几分钟，期间向我播报进度）；\n' +
         '  · scanning=true（正在扫）：不要重复触发，轮询等它完成即可；\n' +
         '  · hasSnapshot=true 且 scanning=false：直接进第 1 步。\n' +
-        '第 1 步·取数（所有响应都是几 KB 的 JSON，直接读 curl 输出即可；不要用 -o 存文件再读——Git Bash 的 /tmp 与原生 Python 的路径不一致，会 FileNotFoundError；确要落盘请写当前目录相对路径）：\n' +
-        '  · 层级构成：curl -s ' + hd + ' "' + base + '/api/tree?depth=3" —— 根下 3 层的目录+大文件，节点 {name, path, s 大小, al 占用, file 文件叶, agg{n,s} 低于 min 的聚合项, more 未单列数, truncated 预算截断}，可直接看出目录里谁占大头，不需要自己 du；\n' +
-        '  · 要看任意目录更细的分布（突破 10MB 粒度、含小目录）：curl -s ' + hd + ' "' + base + '/api/tree?path=c%3A%5Csome%5Cdir&depth=4&min=1048576"；\n' +
+        '第 1 步·取数（直接读 curl 输出即可；不要用 -o 存文件再读——Git Bash 的 /tmp 与原生 Python 的路径不一致，会 FileNotFoundError；确要落盘请写当前目录相对路径）：\n' +
+        '  · 找大头（先做这步，零解析零脚本）：curl -s ' + hd + ' "' + base + '/api/tree?path=<目录>&depth=4&min=100MB&flat=1" —— 直接返回按大小降序的文本清单，每行「大小MB D|F 路径」；min 支持 100MB/1GB 单位写法；先粗后细（1GB→100MB→10MB），只拉够大的目标，别让细枝末节浪费 token；\n' +
+        '  · 层级构成（要看谁在谁下面时才用，返回 JSON 树）：curl -s ' + hd + ' "' + base + '/api/tree?depth=3" —— 根下 3 层的目录+大文件，节点 {name, path, s 大小, al 占用, file 文件叶, agg{n,s} 低于 min 的聚合项, more 未单列数, truncated 预算截断}；\n' +
+        '  · 要看任意目录更细的分布（突破 10MB 粒度、含小目录，JSON 树）：curl -s ' + hd + ' "' + base + '/api/tree?path=c%3A%5Csome%5Cdir&depth=4&min=1048576"；\n' +
         '  · 类型分布/卷口径/受限目录清单：curl -s ' + hd + ' "' + base + '/api/scan?tree=0&depth=1"（全量快照是 MB 级，别默认拉全量；确需全量树用 /api/scan?depth=4）。\n' +
         '第 2 步·分析并回传提案：curl -s -X POST ' + hd + ' -d "@proposal.json" ' + base + '/api/proposal\n' +
         '  body: {"summary":"一句话结论","items":[\n' +
         '    {"action":"migrate","src":"绝对路径","dest_root":"D:\\\\","reason":"为什么值得 junction 迁移"},\n' +
         '    {"action":"cleanup","src":"…","reason":"可再生缓存/临时文件，说明为什么安全"},\n' +
         '    {"action":"note","src":"…","reason":"需改软件配置才能迁的，给出具体改法"}]}\n' +
+        '  提案按范围（盘符）并存：分析完 C 盘可先提 C 盘的提案，继续分析 D 盘再提 D 盘的，用户会逐个确认——不要因为 C 盘的提案还没确认就卡住不往下走；\n' +
         '第 3 步·执行约定：我会在 DiskLens 弹出的确认面板里勾选，migrate 项由 DiskLens 事务引擎执行' +
         '（复制→校验→junction，失败源目录原样保留）——你不要直接操作我的文件系统。\n' +
         '· 官方配置重定向类（GRADLE_USER_HOME、PIP_CACHE_DIR、Docker/WSL 数据盘等）一律放 note 项写清改法，不要提议 migrate。';
@@ -125,7 +127,7 @@ function renderAiPanel() {
           (kbHit ? '（识别为 ' + kbHit.tool + '）' : '') +
           (node && node.s > 0 ? '，约 ' + fmt(node.s) : '') + '。';
       }
-      prompt += '\n执行结果：curl -s ' + hd + ' ' + base + '/api/proposal 轮询。';
+      prompt += '\n执行结果：curl -s ' + hd + ' ' + base + '/api/proposal?id=<POST 返回的 id> 轮询（多盘提案并存，必带 id）。';
     }
   } else {
     // skill 场景：单目录深度处理（AI 自己动手：重定向 / 配置 / 清理台账）
@@ -258,6 +260,17 @@ function refreshAiChannel(){
     if(!on){ st.textContent='🔌 已停用'; st.className='ai-ch-status off'; }
     else { st.textContent='🔌 已就绪' + (window.aiSnapReady ? '' : '（先扫一次盘）'); st.className='ai-ch-status ok'; }
   });
+  // 轮换令牌：旧令牌立即失效，已发给 AI 的接入信息要重新复制
+  aiChEl('ai-ch-rotate').addEventListener('click', function(){
+    if(!IN_TAURI || !feed.aiChannelRotateToken) return;
+    if(!window.confirm('确定换新令牌？\n旧令牌立即失效，之前发给 AI 助手的接入信息需要重新复制。')){
+      return;
+    }
+    feed.aiChannelRotateToken(function(){
+      refreshAiChannel();
+      setStatus('已生成新令牌（已自动写盘，重启后不变）——请重新复制通道接入信息', 'done');
+    });
+  });
   aiChEl('ai-ch-copy').addEventListener('click', function(){
     if(!aiChInfo || !aiChInfo.port) return;
     var b='http://127.0.0.1:'+aiChInfo.port;
@@ -269,27 +282,93 @@ function refreshAiChannel(){
 })();
 
 /* ===== AI 提案面板：确认 + 串行执行迁移队列 ===== */
-var propData = null;       // 当前提案 {id, summary, items, ...}
+var propData = null;       // 当前展示的提案 {id, summary, items, scope, ...}
+var propQueue = [];        // 待确认提案队列：按盘符范围并存（先扫 C 再切 D，两边可同时等确认）
 var propRunning = false;   // 执行中（禁止关闭/忽略/再次执行）
 var propAborted = false;   // 用户点停：结束当前项后不再继续
 
+// 提案范围口语名（后端从 items[].src 推导的 scope 键 →「C:\」「C:\+D:\」，空=未标注）
+function propScopeLabel(p){
+  var key = String((p && p.scope) || '');
+  if(!key || key === 'global') return '';
+  return key.split(',').filter(Boolean).map(function(r){
+    return String(r).replace(/\\+$/, '').toUpperCase() + '\\';
+  }).join('+');
+}
+
+// 面板顶部多提案切换条：pending ≥2 时出现（按范围并存时逐个确认）
+function renderPropTabs(){
+  var el = aiChEl('prop-tabs');
+  if(!el) return;
+  var pend = propQueue.filter(function(q){ return q.status==='pending'; });
+  if(pend.length < 2){ el.style.display='none'; el.innerHTML=''; return; }
+  var html='';
+  for(var i=0;i<pend.length;i++){
+    var q = pend[i];
+    var act = (propData && propData.id===q.id) ? ' active' : '';
+    html += '<button class="prop-tab'+act+'" data-id="'+escAttr(String(q.id||''))+'">'+
+      esc(propScopeLabel(q)||'通用')+'（'+(q.items||[]).length+'项）</button>';
+  }
+  el.innerHTML = html;
+  el.style.display = 'flex';
+}
+
+// 悬浮角标同步：有 pending 提案才显示，多提案时带数量；title 列出各范围
+function updatePropFab(){
+  var b = document.getElementById('prop-fab');
+  if(!b) return;
+  var pend = propQueue.filter(function(q){ return q.status==='pending'; });
+  if(pend.length){
+    b.style.display = 'flex';
+    document.getElementById('prop-fab-n').textContent = pend.length > 1 ? String(pend.length) : '';
+    var names = pend.map(function(q){ return propScopeLabel(q)||'通用'; }).join('、');
+    b.title = 'AI 提案待确认：' + names + ' —— 点击打开确认面板';
+  } else {
+    b.style.display = 'none';
+  }
+}
+
 function showProposal(p){
   if(!p || !p.items || !p.items.length) return;
-  diagLog('info', '收到 AI 提案「' + (p.summary||'') + '」（' + p.items.length + ' 项）');
-  if(propRunning){   // 正在执行上一批：不弹新面板（后端 409 已挡绝大多数，双保险）
-    setStatus('收到新 AI 提案，但当前批次执行中——稍后请 AI 重发','err');
+  // pending 提案登记进队列（重开/已在队列的不重复）。
+  // 角标无条件同步——启动恢复路径的提案是先入队再弹面板，
+  // 走不到下面的推入分支，只在这里刷角标会漏（悬浮窗消失 bug）
+  if(p.status==='pending' && p.id && !propQueue.some(function(q){ return q.id===p.id; })){
+    propQueue.push(p);
+  }
+  updatePropFab();
+  var reopening = !!(propData && propData.id === p.id);
+  diagLog('info', (reopening ? '重新打开' : '收到') + ' AI 提案「' + (p.summary||'') + '」（' + (p.items.length||0) + ' 项）');
+  if(propRunning){   // 正在执行上一批：不弹面板，提案留在队列（状态栏 chip 可见）
+    setStatus('收到新 AI 提案，但当前批次执行中——完成后可从状态栏「待确认」打开','err');
     return;
   }
   propData = p;
-  propResults = [];
+  if(!reopening) propResults = [];   // 重开同一提案保留已累积的行级结果
+  aiChEl('prop-scope').textContent = propScopeLabel(p) ? '【' + propScopeLabel(p) + '】' : '';
   aiChEl('prop-summary').textContent = p.summary || '';
   aiChEl('prop-progress').textContent = '';
   aiChEl('prop-stop').style.display = 'none';
   renderProposal();
+  renderPropTabs();
   aiChEl('prop-run').disabled = false;
   aiChEl('prop-reject').disabled = false;
   aiChEl('prop-close').disabled = false;
   aiChEl('prop-mask').style.display = 'flex';
+}
+
+// 启动恢复：把落盘的 pending 提案整队登记（多盘并存），弹最新一条
+function restoreProposals(list){
+  var pend = (list||[]).filter(function(p){
+    return p && p.status==='pending' && p.items && p.items.length;
+  });
+  for(var i=0;i<pend.length;i++){
+    if(!propQueue.some(function(q){ return q.id===pend[i].id; })) propQueue.push(pend[i]);
+  }
+  if(pend.length){
+    if(!propRunning) showProposal(pend[pend.length-1]);
+    else updatePropFab();
+  }
 }
 
 function renderProposal(){
@@ -308,7 +387,7 @@ function renderProposal(){
     var actBtns = '';
     if (it.src) {
       actBtns += '<button class="pr-loc" data-p="'+escAttr(it.src)+'">📂 定位</button>';
-      if (act==='cleanup') actBtns += '<button class="pr-recycle" data-i="'+i+'">🗑 移入回收站</button>';
+      if (act==='cleanup') actBtns += '<button class="pr-recycle" data-i="'+i+'" title="移入 Windows 系统回收站（可在回收站还原，勿随手清空回收站）">🗑 移入回收站</button>';
     }
     html+='<div class="pr-row">'
       +'<div class="pr-top">'+cb+badge
@@ -317,7 +396,6 @@ function renderProposal(){
       +'<span class="pr-act">'+actBtns+'</span>'
       +'</div><div class="pr-sub">'
       +(act==='migrate'&&it.dest_root?'<div>目标：<span class="dest">'+esc(it.dest_root)+'</span></div>':'')
-      +(act==='cleanup'?'<div class="reason">移入回收站后可自行还原；确认无问题再清空回收站</div>':'')
       +(it.reason?'<div class="reason">理由：'+esc(it.reason)+'</div>':'')
       +'</div><div class="pr-st" id="pr-st-'+i+'"></div></div>';
   }
@@ -360,6 +438,10 @@ function runProposal(){
       +'（结果已回传，AI 可经 /api/proposal 查询）');
     // 整批执行结果 + 行级操作（回收站/撤销）累积结果一并回传
     var all = results.concat(propResults);
+    propData.status = status;   // 本地同步终态：悬浮角标随之消失
+    propQueue = propQueue.filter(function(q){ return q.id !== propData.id; });
+    renderPropTabs();
+    updatePropFab();
     if(feed.aiProposalResult) feed.aiProposalResult(propData.id, status, all);
     if(doneN>0) setStatus('AI 提案执行完毕（成功 '+doneN+' 项），受影响目录已自动重扫','done');
   }
@@ -413,19 +495,42 @@ function runProposal(){
 
 function closeProposal(reject){
   if(propRunning) return;
-  if(reject && propData && propData.status==='pending' && feed.aiProposalResult){
-    feed.aiProposalResult(propData.id, 'rejected', []);
+  if(reject){
+    // 显式「全部忽略」才作废：提案回写 rejected，AI 可据此重发
+    if(propData && propData.status==='pending' && feed.aiProposalResult){
+      feed.aiProposalResult(propData.id, 'rejected', []);
+    }
+    var rid = propData ? propData.id : null;
+    propQueue = propQueue.filter(function(q){ return q.id !== rid; });
+    propData = null;
+    updatePropFab();
   }
-  propData = null;
+  // 普通关闭（✕/遮罩）只收起面板：提案保持 pending 并落盘，
+  // 状态栏出现「📋 AI 提案待确认」，点击随时重开——误关不再前功尽弃
   aiChEl('prop-mask').style.display = 'none';
 }
 
 (function initProposalUI(){
   aiChEl('prop-run').addEventListener('click', runProposal);
   aiChEl('prop-reject').addEventListener('click', function(){ closeProposal(true); });
-  aiChEl('prop-close').addEventListener('click', function(){ closeProposal(true); });
+  aiChEl('prop-close').addEventListener('click', function(){ closeProposal(false); });
   aiChEl('prop-mask').addEventListener('mousedown', function(ev){
-    if(ev.target===this) closeProposal(true);
+    if(ev.target===this) closeProposal(false);
+  });
+  // 右下角悬浮角标：打开最新的待确认提案（多盘并存时逐个处理）
+  document.addEventListener('click', function(ev){
+    if(!(ev.target.closest && ev.target.closest('#prop-fab'))) return;
+    if(propRunning) return;
+    var pend = propQueue.filter(function(q){ return q.status==='pending'; });
+    var target = pend.length ? pend[pend.length-1] : propData;
+    if(target) showProposal(target);
+  });
+  // 面板顶部的多提案切换条
+  document.addEventListener('click', function(ev){
+    var t = ev.target.closest && ev.target.closest('.prop-tab');
+    if(!t || propRunning) return;
+    var q = propQueue.filter(function(x){ return String(x.id)===t.dataset.id; })[0];
+    if(q) showProposal(q);
   });
   aiChEl('prop-stop').addEventListener('click', function(){
     propAborted = true;
