@@ -1,6 +1,6 @@
 # DiskLens 设计文档
 
-> 磁盘空间分析客户端（Windows / macOS / iOS / Android）
+> 磁盘空间分析客户端（当前支持 Windows；macOS / iOS / Android 为规划中的里程碑）
 > 原型：c-relocator 项目的 Map-Reloc live map（PowerShell + SSE + Web treemap）。
 > 本项目将其产品化：Rust 扫描核心 + Tauri v2 跨端壳 + 移植的 treemap 前端。
 

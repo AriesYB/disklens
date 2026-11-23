@@ -2,7 +2,7 @@
 
 > 看清每一寸磁盘 —— 开源的磁盘空间分析器：实时 treemap 方块视图 + 排序列表 + 大文件榜。
 
-![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-blue)
+![platforms](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![rust](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-dea584)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -91,10 +91,8 @@ Rust DFS worker                        前端 store（唯一事实源）
 
 | 平台 | 状态 |
 |---|---|
-| Windows | ✅ 可用 |
-| Android | M2（SAF 适配） |
-| macOS / Linux | M3（CI 构建） |
-| iOS | M4（沙盒内分析） |
+| Windows | ✅ 已支持 |
+| Android / macOS / Linux / iOS | 规划中（见 [DESIGN.md](DESIGN.md) 里程碑） |
 
 ## License
 
