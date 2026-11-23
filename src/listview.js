@@ -8,6 +8,8 @@ var BIG_FILE_MIN = 1024 * 1024;          // 大文件榜阈值 1MB
 var FILES_MAX_ROWS = 500;                // 榜单上限，防止超大盘卡顿
 var listSort = { key:'size', dir:-1 };   // 列表排序：默认大小降序
 var selectedRow = '';                    // 列表视图当前选中行路径
+var listPage = 0, listPagePath = '';
+var LIST_PAGE_SIZE = 500;
 
 /* ===== 列表视图 ===== */
 function renderList(node){
@@ -18,9 +20,11 @@ function renderList(node){
     html+='<div class="l-up" id="l-up">⬅ 返回上一级（'+esc(stack[stack.length-1].name)+'）</div>';
   }
   var items=(node.c||[]).slice();
+  if(listPagePath!==node.p){ listPage = 0; listPagePath = node.p; }
   if(!items.length){
     html+='<div class="empty"><div class="e-ic">🗂️</div><div>'+
-      (node.done?'空目录，没有子项':'正在统计子项…')+'</div></div>';
+      (node.summarized?'已汇总大小。点击「开始扫描」查看目录明细。':
+        node.done?'空目录，没有子项':'正在统计子项…')+'</div></div>';
     box.innerHTML=html;
     return;
   }
@@ -32,13 +36,21 @@ function renderList(node){
       : (a.s||0)-(b.s||0);
     return r*dir;
   });
+  var pages = Math.ceil(items.length/LIST_PAGE_SIZE);
+  listPage = Math.min(listPage,pages-1);
+  if(pages>1){
+    html+='<div class="l-pages"><button data-list-page="-1"'+(listPage===0?' disabled':'')+
+      '>上一页</button> '+(listPage+1)+' / '+pages+' 页 · '+items.length+
+      ' 项 <button data-list-page="1"'+(listPage===pages-1?' disabled':'')+'>下一页</button></div>';
+  }
   html+='<div class="l-head">'+
     '<div class="th" data-sort="name">名称'+sortArrow('name')+'</div>'+
     '<div class="th rt" data-sort="size">大小'+sortArrow('size')+'</div>'+
     '<div class="th rt">占用</div>'+
     '<div class="th">占比</div>'+
     '<div class="th">状态</div></div>';
-  for(var j=0;j<items.length;j++){
+  var first = listPage*LIST_PAGE_SIZE;
+  for(var j=first;j<Math.min(first+LIST_PAGE_SIZE,items.length);j++){
     var it=items[j];
     var pct=(tot>0&&it.s>0)?(it.s/tot*100):0;
     // 状态列：受限目录 / 云占位 / 硬链接副本优先于普通就绪标记
@@ -72,11 +84,14 @@ function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
   box.addEventListener('click',function(ev){
     var up=ev.target.closest('.l-up');
     if(up){ goUp(); return; }
+    var page=ev.target.closest('button[data-list-page]');
+    if(page && !page.disabled){ listPage += Number(page.dataset.listPage); render(); return; }
     var th=ev.target.closest('.th[data-sort]');
     if(th){
       var k=th.dataset.sort;
       if(listSort.key===k) listSort.dir*=-1;
       else { listSort.key=k; listSort.dir=(k==='name')?1:-1; }
+      listPage = 0;
       render();
       return;
     }

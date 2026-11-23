@@ -12,11 +12,13 @@
         <span id="brand-glyph"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.6 15.6 21 21"/></svg></span>
         <span id="brand-name">DiskLens <i>盘析</i></span>
       </div>
-      <select id="root-drives" title="选择要扫描的磁盘"></select>
-      <input id="root-input" value="C:\" spellcheck="false" />
+      <div id="root-location" role="group" aria-label="当前路径">
+        <select id="root-drives" aria-label="盘符"><option value="C:\">C:</option></select>
+        <input id="root-input" aria-label="盘内相对路径" placeholder="盘内路径（留空为盘根）" spellcheck="false" />
+      </div>
       <button id="scan-btn" class="primary">开始扫描</button>
       <button id="stop-btn" disabled>停止</button>
-      <button id="ai-bar-btn" title="让 AI 拉取实时扫描数据，给出迁移/清理提案，确认后自动执行迁移">🤖 AI 分析</button>
+      <button id="ai-bar-btn" title="让 AI 根据当前路径的扫描数据给出迁移或清理提案">🤖 AI 分析</button>
       <span id="status">就绪</span>
     </header>
 
@@ -129,7 +131,7 @@
         <div id="ai-title">AI 辅助迁移 / 清理 <button id="ai-close" title="关闭">✕</button></div>
         <div id="ai-src"></div>
         <div id="ai-modes">
-          <button class="ai-mode" data-mode="scan">🔍 全盘分析<small>AI 出方案 · 应用内执行</small></button>
+          <button class="ai-mode" data-mode="scan">🔍 扫描分析<small>AI 出方案 · 应用内执行</small></button>
           <button class="ai-mode" data-mode="skill">🔧 深度处理此目录<small>AI 自己动手 · 需装 skill</small></button>
         </div>
         <div id="ai-channel">
@@ -142,6 +144,13 @@
           </details>
         </div>
         <div id="ai-body"></div>
+        <div id="ai-scan-settings">
+          <div class="ai-lab">分析数据</div>
+          <div class="ai-data-choices" role="group" aria-label="分析数据">
+            <button type="button" data-ai-data="fresh" aria-pressed="true">重新扫描</button>
+            <button type="button" data-ai-data="reuse" aria-pressed="false">使用已有记录</button>
+          </div>
+        </div>
         <div id="ai-prompt-wrap">
           <div class="ai-lab" id="ai-prompt-label"></div>
           <div id="ai-actions">

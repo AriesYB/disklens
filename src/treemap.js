@@ -130,8 +130,7 @@ function getCell(kk){
         // 单子链钻取：若内部只有一条大子目录链，继续展开下去，保证点击必有可见变化
         if(typeof drillExpand==='function' && sn && sn.done){ drillExpand(p, 3); }
         // 展开时还没扫完 → 请后端优先扫这个子树（扫描中或监视模式下；已扫完的目录后端会直接忽略）
-        if(typeof feed!=='undefined'&&feed&&typeof feed.scanPriority==='function'&&
-           sn&&!sn.done&&(scanning||watchActive)){ feed.scanPriority(p); }
+        if(watchActive && sn && !sn.done){ queuePriority(p); }
       }
       render();
     });
@@ -173,14 +172,14 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   // 统计中（未 done）的目录永不折叠进"剩余"条，并给一块最小可见面积——
   // 扫描进行中它们带着转圈动画占位，用户能直观看到"哪些正在统计"
   var countingN=0;
-  for(var cq=0;cq<items.length;cq++){ if(!items[cq].done) countingN++; }
+  for(var cq=0;cq<items.length && countingN<120;cq++){ if(!items[cq].done) countingN++; }
   var visFrac=countingN>0?Math.min(0.03,0.15/countingN):0;
   // 最小可见面积对应的字节等效：tot*visFrac（k0 是 px²/byte，量级 1e-6，不能用 max(1,k0) 缩放）
   var minVisBytes=visFrac>0?tot*visFrac:0;
-  var main=[],rest=0,restN=0;
+  var main=[],rest=0,restN=0,countingShown=0;
   for(var q2=0;q2<items.length;q2++){
     var it=items[q2];
-    if(!it.done){ main.push(it); continue; }
+    if(!it.done && countingShown<countingN){ main.push(it); countingShown++; continue; }
     if(it.s*k0>=MINA){ main.push(it); }
     else { rest+=it.s; restN++; }
   }
@@ -256,7 +255,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
         o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,ck,seen,depth);
       ck.style.backgroundColor='#223247';
       var cl=ck.querySelector('.lbl');
-      cl.textContent='⟳ 统计中…（已优先调度，扫到即显示）';
+      cl.textContent='⟳ 统计中…';
       cl.style.fontSize=(o.w>160&&o.h>56)?'14px':'11px';
       cl.style.paddingTop=(o.h>56)?'18px':'2px';
     }
@@ -279,7 +278,8 @@ function renderTreemap(){
   var tot=0; for(var q=0;q<items.length;q++) tot+=items[q].s;
   var wait = document.getElementById('wait');
   if(items.length&&tot>0){ wait.style.display='none'; }
-  else if(node.done){ wait.style.display='flex'; wait.innerHTML='<div><div style="margin-bottom:10px">'+esc(node.n)+'</div><div style="color:#8a8a8a">空目录，或全部子项已折叠进“剩余”条</div></div>'; }
+  else if(node.done){ wait.style.display='flex'; wait.innerHTML='<div><div style="margin-bottom:10px">'+esc(node.n)+'</div><div style="color:#8a8a8a">'+
+    (node.summarized?'已汇总大小。点击「开始扫描」查看目录明细。':'空目录，或全部子项已折叠进“剩余”条')+'</div></div>'; }
   else { wait.style.display='flex'; wait.innerHTML='<div><div class="spin"></div><div style="margin-top:12px">counting directories...</div></div>'; }
   var seen={};
   layoutInto(node,0,0,W,H,curPath,seen);
@@ -298,8 +298,7 @@ function navigate(path,isChild){
   curPath=path; divs={}; map.innerHTML='';
   // 进入还没扫完的目录 → 优先调度扫描（扫描中或监视模式下）
   var n=store.get(path.toLowerCase());
-  if(typeof feed!=='undefined'&&feed&&typeof feed.scanPriority==='function'&&
-     n&&!n.done&&(scanning||watchActive)){ feed.scanPriority(path); }
+  if(watchActive && n && !n.done){ queuePriority(path); }
   render();
 }
 

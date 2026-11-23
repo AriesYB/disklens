@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "disklens"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "notify",
  "serde",
@@ -774,6 +774,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "windows",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 

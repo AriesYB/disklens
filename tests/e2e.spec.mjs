@@ -82,15 +82,37 @@ test.describe('DiskLens 浏览器冒烟', () => {
     })`);
     expect(await page.evaluate("document.getElementById('prop-mask').style.display")).toBe('flex');
     // 回收站
-    await page.evaluate("document.querySelector('button.pr-recycle').click()");
-    await page.waitForTimeout(700);
-    expect(await page.evaluate("document.getElementById('pr-st-0').textContent")).toContain('已移入回收站');
+    const observed = await page.evaluate(() => {
+      const original = feed.recycleDelete;
+      let finish, progress;
+      feed.recycleDelete = (_paths, cb, update) => { finish = cb; progress = update; };
+      try {
+        document.querySelector('button.pr-recycle').click();
+        const row = document.getElementById('pr-st-0');
+        const bar = row.querySelector('progress');
+        const hiddenBeforeEstimate = bar.hidden;
+        progress({ total: 2, done: 1 });
+        progress({ total: 5, done: 1 });
+        progress({ total: 0, done: 0 });
+        const result = { hiddenBeforeEstimate, sameBar: row.querySelector('progress') === bar, value: bar.value };
+        return result;
+      } finally {
+        setTimeout(() => finish([]), 300);
+        feed.recycleDelete = original;
+      }
+    });
+    expect(observed).toEqual({ hiddenBeforeEstimate: true, sameBar: true, value: 50 });
+    await expect(page.locator('#pr-st-0 .pr-current')).toContainText('Temp');
+    await expect(page.locator('#pr-st-0')).toContainText('已移入回收站');
     // 执行迁移 → done → 撤销按钮出现（轮询等待 mock 12 tick 跑完）→ 点击 → 完成
     await page.evaluate("document.getElementById('prop-run').click()");
+    await expect(page.locator('#pr-st-1 progress[value]')).toBeVisible();
+    await expect(page.locator('#pr-st-1 .pr-current')).toBeVisible();
     await page.waitForSelector('button.pr-undo', { timeout: 15000 });
     await page.evaluate("document.querySelector('button.pr-undo').click()");
     await page.waitForTimeout(1500);
     expect(await page.evaluate("document.getElementById('pr-st-1').textContent")).toContain('撤销完成');
+    await page.locator('#prop-close').click();
   });
 
   test('无权限面板：列出受限目录', async () => {
@@ -136,6 +158,95 @@ test.describe('DiskLens 浏览器冒烟', () => {
     expect(await page.evaluate("document.getElementById('status').textContent")).toContain('上次扫描结果');
     const rows = await page.evaluate("document.querySelectorAll('#files-body .f-row').length");
     expect(rows).toBeGreaterThan(0);
+  });
+
+  test('盘符和相对路径组合后同步到页脚和 AI 指令', async () => {
+    await page.locator('#root-drives').selectOption('D:\\');
+    await page.locator('#root-input').fill('Projects/Build Cache');
+    await page.locator('#root-input').press('Enter');
+    await expect(page.locator('#root-input')).toHaveValue('Projects\\Build Cache');
+    await expect(page.locator('#foot-stats')).toContainText('D:\\Projects\\Build Cache');
+    await page.locator('#ai-bar-btn').click();
+    await expect(page.locator('#ai-src')).toContainText('D:\\Projects\\Build Cache');
+    const fresh = page.getByRole('button', { name: '重新扫描', exact: true });
+    const reuse = page.getByRole('button', { name: '使用已有记录', exact: true });
+    await expect(fresh).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('#ai-copy')).toBeVisible();
+    const readPrompt = () => page.evaluate(() => {
+      const original = IN_TAURI;
+      IN_TAURI = true;
+      aiChInfo = { enabled: true, port: 12345, token: 'test-token' };
+      try {
+        renderAiPanel();
+        return document.getElementById('ai-prompt').textContent;
+      } finally {
+        IN_TAURI = original;
+        aiChInfo = null;
+      }
+    });
+    const refreshPrompt = await readPrompt();
+    expect(refreshPrompt).toMatch(/-X POST[^\n]*\/api\/scan/);
+    expect(refreshPrompt).toContain(JSON.stringify({
+      roots: ['D:\\Projects\\Build Cache'], policy: 'refresh'
+    }));
+    expect(refreshPrompt).toContain('scanId 与本次一致且 scanState=completed');
+    expect(refreshPrompt).toContain('只要这些指标还在推进就继续等待');
+    expect(refreshPrompt).not.toContain('最多 24 次');
+
+    await reuse.click();
+    await expect(reuse).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('#ai-copy')).toBeVisible();
+    expect(await page.evaluate('scanning')).toBe(false);
+    const prompt = await readPrompt();
+    expect(prompt).toContain('/api/status?path=D%3A%5CProjects%5CBuild%20Cache&policy=reuse');
+    expect(prompt).toContain('/api/scan?path=D%3A%5CProjects%5CBuild%20Cache&depth=3');
+    expect(prompt).toContain('若 ready=false、scanning=true 或请求失败');
+    expect(prompt).not.toMatch(/-X POST[^\n]*\/api\/scan/);
+    await page.locator('#ai-close').click();
+
+    const scanUi = await page.evaluate(() => {
+      const events = {};
+      const original = window.__TAURI__;
+      window.__TAURI__ = { event: { listen: (name, listener) => { events[name] = listener; } } };
+      try {
+        new TauriFeed();
+        const path = 'D:\\Projects\\Build Cache';
+        events['scan-started']({ payload: { roots: [path], full: true, byAi: true, scanId: 9 } });
+        const gib = 1024 ** 3;
+        events['scan-batch']({ payload: [
+          { path, size: gib, done: false },
+          { path: path + '\\large', size: 72 * gib, done: true },
+        ] });
+        events['scan-progress']({ payload: { scanId: 9, progress: {
+          bytesScanned: 73 * gib, allocatedBytes: 73 * gib, rootsTotal: 1,
+          filesVisited: 30, directoriesVisited: 2,
+          roots: [{ path, bytesScanned: 73 * gib, allocatedBytes: 73 * gib, done: false }],
+        } } });
+        render();
+        const state = {
+          running: scanning,
+          canStop: !document.getElementById('stop-btn').disabled,
+          status: document.getElementById('status').textContent,
+          crumb: document.getElementById('bar').textContent.includes('73.00 GB'),
+          summary: document.getElementById('summary').textContent.includes('已扫描 73.00 GB'),
+        };
+        events['scan-finished']({ payload: '扫描已停止' });
+        return { ...state, stopped: !scanning };
+      } finally {
+        window.__TAURI__ = original;
+      }
+    });
+    expect(scanUi).toEqual({
+      running: true, canStop: true, status: 'AI 发起的后台扫描中…',
+      crumb: true, summary: true, stopped: true,
+    });
+    const needsDetails = await page.evaluate(() => {
+      applyEvent({ path: curPath, name: 'Build Cache', size: 1024, done: true, file: false, summarized: true });
+      render();
+      return needsDetailedScan([curPath]);
+    });
+    expect(needsDetails).toBe(true);
+    await expect(page.locator('#summary')).toContainText('部分明细已聚合');
   });
 
   test('收尾：全程零渲染错误', async () => {

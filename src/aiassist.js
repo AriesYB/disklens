@@ -39,14 +39,22 @@ var ACT_LABEL = { redirect:'官方配置重定向（最干净，软件无感）'
                   clean:'可清理缓存（先列清单再删）',
                   tool:'到软件内迁移（不适合直接搬）' };
 
-/* ===== AI 面板：双场景（scan=通道全盘分析 / skill=单目录深度处理） ===== */
+/* ===== AI 面板：扫描分析 / 单目录深度处理 ===== */
 var aiMode = 'scan';   // 当前场景
-var aiPath = null;     // 右键选中的目录（顶栏入口为 null = 全盘）
+var aiPath = null;     // 右键选中的目录
+var aiScope = null;    // 手动选定的盘符范围
+var aiDataChoice = 'fresh';
+
+function aiScanRoots(){
+  return aiScope || (aiPath ? [aiPath] : curPath===THISPC ? ROOTS.slice() : [curPath]);
+}
 
 function openAiAssist(path, mode) {
   var el = function(id){ return document.getElementById(id); };
   window.__migHandler = null;
   aiPath = path || null;
+  aiScope = null;   // 每次打开重置为跟随当前扫描范围
+  aiDataChoice = 'fresh';
   el('ai-mask').style.display = 'flex';
   setAiMode(mode || 'scan');
 }
@@ -58,12 +66,24 @@ function setAiMode(m) {
     modes[i].classList.toggle('active', modes[i].dataset.mode === aiMode);
   // 场景专属区块显隐：通道只在 scan 场景出现；skill 专属按钮/安装提示只在 skill 场景
   document.getElementById('ai-channel').style.display = (aiMode === 'scan') ? '' : 'none';
+  document.getElementById('ai-scan-settings').hidden = aiMode !== 'scan';
   document.getElementById('ai-github').style.display = (aiMode === 'skill') ? '' : 'none';
   document.getElementById('ai-migrate').style.display = (aiMode === 'skill' && aiPath) ? '' : 'none';
   var inst = document.querySelector('.ai-install');
   if (inst) inst.style.display = (aiMode === 'skill') ? '' : 'none';
   if (aiMode === 'scan') refreshAiChannel();   // 通道区块随场景出现并刷新状态
   renderAiPanel();
+}
+
+function syncAiScanControls(){
+  document.querySelectorAll('[data-ai-data]').forEach(function(button){
+    button.setAttribute('aria-pressed', button.dataset.aiData===aiDataChoice);
+  });
+  if(aiMode==='scan'){
+    aiChEl('ai-prompt-label').textContent = aiDataChoice==='fresh'
+      ? '将指令发给 AI 后，DiskLens 会扫描所选范围。可在主界面停止。'
+      : 'AI 会读取已有记录，并说明数据时间。';
+  }
 }
 
 function renderAiPanel() {
@@ -83,42 +103,118 @@ function renderAiPanel() {
   }
 
   // 顶部对象行
-  el('ai-src').textContent = aiPath
-    ? aiPath + sizeTxt
-    : '全盘范围：' + (window.ROOT || '') + '（AI 从扫描快照里自行找目标）';
+  if (aiPath) {
+    el('ai-src').textContent = aiPath + sizeTxt;
+  } else {
+    // 盘根范围可增减盘符，目录范围跟随当前路径。
+    var scopeRoots = aiScanRoots();
+    var drives = (typeof drivesCache !== 'undefined' && drivesCache) ? drivesCache : [];
+    var chips = '';
+    for (var ci = 0; ci < scopeRoots.length; ci++) {
+      var rp = scopeRoots[ci];
+      var lab = rp;
+      for (var di = 0; di < drives.length; di++) {
+        if (String(drives[di].mount).toLowerCase() === String(rp).toLowerCase()) {
+          lab = drives[di].mount + (drives[di].label ? ' ' + drives[di].label : '');
+          break;
+        }
+      }
+      chips += '<span class="ai-scope-chip">' + esc(lab) +
+        (scopeRoots.length > 1 ? '<button class="ai-scope-x" data-p="' + escAttr(rp) + '" title="移出分析范围">×</button>' : '') +
+        '</span>';
+    }
+    var rest = '';
+    for (var ri = 0; ri < drives.length; ri++) {
+      var dm = drives[ri].mount, hit = false;
+      for (var rj = 0; rj < scopeRoots.length; rj++) {
+        if (String(scopeRoots[rj]).toLowerCase() === String(dm).toLowerCase()) { hit = true; break; }
+      }
+      if (!hit) rest += '<option value="' + escAttr(dm) + '">' + esc(dm + (drives[ri].label ? ' ' + drives[ri].label : '')) + '</option>';
+    }
+    var adder = rest && scopeRoots.every(function(path){ return /^[a-z]:\\$/i.test(path); })
+      ? '<select id="ai-scope-add" title="添加分析范围"><option value="">＋ 添加盘…</option>' + rest + '</select>'
+      : '';
+    el('ai-src').innerHTML = '分析范围：' + chips + adder;
+    var xBtns = el('ai-src').querySelectorAll('button.ai-scope-x');
+    for (var xb = 0; xb < xBtns.length; xb++) {
+      xBtns[xb].addEventListener('click', function(){
+        var p = this.dataset.p, next = [];
+        var cur0 = aiScanRoots();
+        for (var k = 0; k < cur0.length; k++) {
+          if (String(cur0[k]).toLowerCase() !== String(p).toLowerCase()) next.push(cur0[k]);
+        }
+        if (next.length) { aiScope = next; renderAiPanel(); }   // 至少保留一个盘
+      });
+    }
+    var addEl = document.getElementById('ai-scope-add');
+    if (addEl) {
+      addEl.addEventListener('change', function(){
+        if (!this.value) return;
+        var cur1 = aiScanRoots().slice();
+        cur1.push(this.value);
+        aiScope = cur1;
+        renderAiPanel();
+      });
+    }
+  }
 
   var prompt = '';
   if (aiMode === 'scan') {
-    el('ai-prompt-label').textContent = '① 复制下面的指令发给 AI 助手。分析完成后，这里会弹出确认面板。';
     el('ai-body').innerHTML = '';   // 说明都在指令里，面板只留复制动作
     var chOk = aiChInfo && aiChInfo.enabled && aiChInfo.port;
     if (!IN_TAURI) {
-      prompt = '（浏览器演示模式无联动通道——请在桌面客户端内使用全盘分析。）';
+      prompt = '（AI 联动通道可在桌面客户端使用。）';
     } else if (!chOk) {
       prompt = '（正在获取通道端点，稍候…若长时间无响应请重启应用。）';
     } else {
       var base = 'http://127.0.0.1:' + aiChInfo.port;
       var hd = '-H "X-DiskLens-Token: ' + aiChInfo.token + '"';
-      prompt = '请作为磁盘清理顾问，全程只通过 DiskLens 联动通道工作（数据与执行均以此为准，' +
-        '在拿到通道数据前不要用 du/PowerShell 等自己扫盘）：\n' +
-        '第 0 步·查状态：curl -s ' + hd + ' ' + base + '/api/status\n' +
-        '  → {"scanning":…,"hasSnapshot":…,"root":"…"}\n' +
-        '  · hasSnapshot=false（还没扫过）：先触发扫描 curl -s -X POST ' + hd + ' -d \'{"roots":["' +
-        String((ROOTS[0] || 'C:\\\\')).replace(/\\\\$/, '') + '"}\' ' + base + '/api/scan' +
-        '（多盘齐扫可传多个，如 {"roots":["C:\\\\","D:\\\\"]}），之后每 5 秒轮询 /api/status 直到 scanning=false 且 hasSnapshot=true（大目录需几十秒到几分钟，期间向我播报进度）；\n' +
-        '  · scanning=true（正在扫）：不要重复触发，轮询等它完成即可；\n' +
-        '  · hasSnapshot=true 且 scanning=false：直接进第 1 步。\n' +
-        '第 1 步·取数（直接读 curl 输出即可；不要用 -o 存文件再读——Git Bash 的 /tmp 与原生 Python 的路径不一致，会 FileNotFoundError；确要落盘请写当前目录相对路径）：\n' +
-        '  · 找大头（先做这步，零解析零脚本）：curl -s ' + hd + ' "' + base + '/api/tree?path=<目录>&depth=4&min=100MB&flat=1" —— 直接返回按大小降序的文本清单，每行「大小MB D|F 路径」；min 支持 100MB/1GB 单位写法；先粗后细（1GB→100MB→10MB），只拉够大的目标，别让细枝末节浪费 token；\n' +
-        '  · 层级构成（要看谁在谁下面时才用，返回 JSON 树）：curl -s ' + hd + ' "' + base + '/api/tree?depth=3" —— 根下 3 层的目录+大文件，节点 {name, path, s 大小, al 占用, file 文件叶, agg{n,s} 低于 min 的聚合项, more 未单列数, truncated 预算截断}；\n' +
-        '  · 要看任意目录更细的分布（突破 10MB 粒度、含小目录，JSON 树）：curl -s ' + hd + ' "' + base + '/api/tree?path=c%3A%5Csome%5Cdir&depth=4&min=1048576"；\n' +
-        '  · 类型分布/卷口径/受限目录清单：curl -s ' + hd + ' "' + base + '/api/scan?tree=0&depth=1"（全量快照是 MB 级，别默认拉全量；确需全量树用 /api/scan?depth=4）。\n' +
+      var scanRoots = aiScanRoots();
+      var policy = aiDataChoice==='reuse' ? 'reuse' : 'auto';
+      var paths = scanRoots.map(function(path){ return 'path='+encodeURIComponent(path).replace(/'/g,'%27'); });
+      var read = 'curl -sS --max-time 5 ' + hd + ' "' + base;
+      var statusCommand = read + '/api/status?' + paths.join('&') + '&policy=' + policy + '"';
+      var treeCommands = paths.map(function(path){
+        return read + '/api/tree?' + path + '&depth=4&min=100MB&flat=1"';
+      }).join('\n    ');
+      var snapshotCommands = paths.map(function(path){
+        return read + '/api/scan?' + path + '&depth=3"';
+      }).join('\n    ');
+      var scopeNote = scanRoots.length > 1
+        ? '本次分析范围为 ' + scanRoots.join('、')
+        : '本次分析和提案范围仅限「' + scanRoots[0] + '」及其子目录';
+      var fresh = aiDataChoice === 'fresh';
+      var prepare;
+      if(fresh){
+        var scanRequest = {roots:scanRoots, policy:'refresh'};
+        if(needsDetailedScan(scanRoots)) scanRequest.full = true;
+        var request = JSON.stringify(scanRequest).replace(/'/g,'\\u0027');
+        var start = 'curl -sS --max-time 8 -X POST ' + hd +
+          ' -H "Content-Type: application/json" --data-binary ' + "'" + request + "'" + ' ' + base + '/api/scan';
+        prepare = '第 0 步·按所选范围启动一次后台扫描。DiskLens 会按列表顺序逐盘扫描，盘内并行。执行下方命令。\n    ' + start + '\n' +
+          '  · 仅在返回 started=true 时记录 scanId。若请求失败、超时或已有扫描在运行，请说明情况并结束，勿重发 POST。\n' +
+          '  · 每 5 秒分次执行下方 GET。运行时使用 progress 的已访问文件、目录、已统计字节和完成扫描根数来报告进展。' +
+          '只要这些指标还在推进就继续等待。若连续 120 秒无推进，告知我当前 scanId 和进度，并保留本次任务供后续查询。\n    ' + statusCommand + '\n' +
+          '  · 仅在 scanId 与本次一致且 scanState=completed、ready=true 时取数。若 source=snapshot，另需 snapshotScanId 等于本次 scanId；扫描完成后最多再等 30 秒发布快照。' +
+          '若已停止或 scanId 改变，说明情况并结束。勿读取以前的快照或重新发起扫描。\n';
+      } else {
+        prepare = '第 0 步·只读检查一次。请执行下方 GET 命令。\n    ' + statusCommand + '\n' +
+          '  · 若 ready=false、scanning=true 或请求失败，告诉我现有数据不可用或扫描正在进行，然后结束。不要自动重试或轮询。\n' +
+          '  · 若 ready=true，说明结果已有 scanAgeSeconds 秒，根据 source 读取对应的数据。\n';
+      }
+      prompt = '请作为磁盘清理顾问，通过 DiskLens 分析数据。禁止用其他工具自行遍历磁盘。\n' +
+        scopeNote + '。\n' + prepare +
+        '第 1 步·读取已有数据。\n' +
+        '  · 若状态返回 detailsLimited=true，目录总量包含已聚合内容，明细只保留部分目录。分析时请说明这一点。\n' +
+        '  · 若 source=detail，执行以下大小清单查询。\n    ' + treeCommands + '\n' +
+        '  · 若 source=snapshot，执行以下快照查询。快照可能只包含部分子项，请说明这一限制，并依据列出的条目分析。\n    ' + snapshotCommands + '\n' +
+        '  · 下钻只允许本次范围内的目录。读数失败时请结束并告知我。\n' +
         '第 2 步·分析并回传提案：curl -s -X POST ' + hd + ' -d "@proposal.json" ' + base + '/api/proposal\n' +
         '  body: {"summary":"一句话结论","items":[\n' +
         '    {"action":"migrate","src":"绝对路径","dest_root":"D:\\\\","reason":"为什么值得 junction 迁移"},\n' +
         '    {"action":"cleanup","src":"…","reason":"可再生缓存/临时文件，说明为什么安全"},\n' +
         '    {"action":"note","src":"…","reason":"需改软件配置才能迁的，给出具体改法"}]}\n' +
-        '  提案按范围（盘符）并存：分析完 C 盘可先提 C 盘的提案，继续分析 D 盘再提 D 盘的，用户会逐个确认——不要因为 C 盘的提案还没确认就卡住不往下走；\n' +
+        '  提案按范围（盘符）并存：范围含多个盘时，可逐盘分析、每盘各回传一份提案（哪些盘以第 0 步确认的本次范围为准），用户会逐个确认——不要等所有盘都分析完才回传，也不要分析范围之外的盘；\n' +
         '第 3 步·执行约定：我会在 DiskLens 弹出的确认面板里勾选，migrate 项由 DiskLens 事务引擎执行' +
         '（复制→校验→junction，失败源目录原样保留）——你不要直接操作我的文件系统。\n' +
         '· 官方配置重定向类（GRADLE_USER_HOME、PIP_CACHE_DIR、Docker/WSL 数据盘等）一律放 note 项写清改法，不要提议 migrate。';
@@ -172,6 +268,7 @@ function renderAiPanel() {
     }
   }
   el('ai-prompt').textContent = prompt;
+  syncAiScanControls();
   el('ai-prompt-wrap').style.display = (aiMode === 'skill' && isSystem) ? 'none' : '';
 }
 
@@ -193,11 +290,17 @@ function openExternal(url) {
   document.getElementById('mi-ai').addEventListener('click', function () {
     var p = menuPath;
     hideCtx();
-    openAiAssist(p, 'scan');   // 右键进入：默认全盘分析（可切换单目录深度处理）
+    openAiAssist(p, 'scan');
   });
-  // 顶栏直达：全盘分析（不依赖选中目录）
+  // 顶栏入口以当前展示路径为分析范围。
   document.getElementById('ai-bar-btn').addEventListener('click', function () {
     openAiAssist(null, 'scan');
+  });
+  document.querySelectorAll('[data-ai-data]').forEach(function(button){
+    button.addEventListener('click', function(){
+      aiDataChoice = this.dataset.aiData;
+      renderAiPanel();
+    });
   });
   // 场景卡片切换
   var modes = document.querySelectorAll('#ai-modes .ai-mode');
@@ -245,8 +348,8 @@ function refreshAiChannel(){
     tok.textContent=info.token;
     tgl.checked=!!info.enabled; tgl.disabled=false;
     if(!info.enabled){ st.textContent='🔌 已停用'; st.className='ai-ch-status off'; }
-    else { st.textContent='🔌 已就绪' + (window.aiSnapReady ? '' : '（先扫一次盘）'); st.className='ai-ch-status ok'; }
-    // 通道端点就绪后，全盘分析提示词从占位刷新为完整版
+    else { st.textContent='🔌 已就绪 · 读取已有结果'; st.className='ai-ch-status ok'; }
+    // 通道端点就绪后刷新提示词。
     if (aiMode === 'scan' && document.getElementById('ai-mask').style.display !== 'none') renderAiPanel();
   });
 }
@@ -258,7 +361,7 @@ function refreshAiChannel(){
     var st = aiChEl('ai-ch-status');
     if(aiChInfo){ aiChInfo.enabled = on; }
     if(!on){ st.textContent='🔌 已停用'; st.className='ai-ch-status off'; }
-    else { st.textContent='🔌 已就绪' + (window.aiSnapReady ? '' : '（先扫一次盘）'); st.className='ai-ch-status ok'; }
+    else { st.textContent='🔌 已就绪 · 读取已有结果'; st.className='ai-ch-status ok'; }
   });
   // 轮换令牌：旧令牌立即失效，已发给 AI 的接入信息要重新复制
   aiChEl('ai-ch-rotate').addEventListener('click', function(){
@@ -429,6 +532,67 @@ function prSt(i, cls, text){
 
 function propProg(t){ aiChEl('prop-progress').textContent = t; }
 
+function propItemProgress(i, label, pct, current){
+  var row = document.getElementById('pr-st-'+i);
+  if(!row) return;
+  var bar = row.querySelector('progress');
+  if(!bar){
+    row.className = 'pr-st run';
+    var status = document.createElement('div');
+    status.className = 'pr-progress-label';
+    bar = document.createElement('progress');
+    bar.max = 100;
+    var currentPath = document.createElement('div');
+    currentPath.className = 'pr-current';
+    row.replaceChildren(status,bar,currentPath);
+  }
+  bar.hidden = pct===null;
+  if(pct!==null && bar.value!==pct) bar.value = pct;
+  bar.setAttribute('aria-label',label);
+  row.querySelector('.pr-progress-label').textContent = label+(pct===null?'':' · '+Math.floor(pct)+'%');
+  var path = row.querySelector('.pr-current');
+  path.hidden = !current;
+  if(path.textContent!==(current||'')){
+    path.textContent = current||'';
+    path.title = current||'';
+  }
+}
+
+function recycleProposalItem(i, src, cb){
+  var start = Date.now();
+  var current = src, pct = null;
+  var active = true;
+  function render(){
+    propItemProgress(i,'正在移入回收站 · 已用 '+Math.floor((Date.now()-start)/1000)+' 秒'+
+      (pct===null?'':' · 系统估算'),
+      pct, current);
+  }
+  render();
+  var timer = setInterval(render, 1000);
+  feed.recycleDelete([src], function(failed){
+    active = false;
+    clearInterval(timer);
+    if(!failed.length){
+      var path = src.replace(/[\\/]+$/,'').replace(/\//g,'\\');
+      var rm = removeSubtree(path);
+      propDelta(path, -rm.s, -rm.al);
+      markDirty();
+      var cbEl = document.querySelector('.pr-cb[data-i="'+i+'"]');
+      cbEl.checked = false;
+      cbEl.disabled = true;
+      document.querySelector('.pr-recycle[data-i="'+i+'"]').disabled = true;
+    }
+    cb(failed);
+  }, function(ev){
+    if(!active) return;
+    if(ev.current) current = ev.current;
+    if(ev.total>0 && Number.isFinite(ev.done)){
+      pct = Math.max(pct||0, Math.min(99,ev.done/ev.total*100));
+    }
+    render();
+  });
+}
+
 // 串行执行：预检 → 迁移 → done/error 后下一项（后端 MigrateState 单实例互斥）
 function runProposal(){
   if(!propData || propRunning) return;
@@ -463,19 +627,18 @@ function runProposal(){
     renderPropTabs();
     updatePropFab();
     if(feed.aiProposalResult) feed.aiProposalResult(propData.id, status, all);
-    if(doneN>0) setStatus('AI 提案执行完毕（成功 '+doneN+' 项），受影响目录已自动重扫','done');
+    if(doneN>0) setStatus('AI 提案执行完毕（成功 '+doneN+' 项）','done');
   }
 
   (function next(){
     if(k>=sel.length || propAborted) return finish(propAborted?'aborted':'done');
     var i = sel[k], it = items[i] || {};
     var src = it.src||'', dest = it.dest_root||'';
+    window.__migHandler = null;
     // 清理项：整目录移入系统回收站（可在回收站还原），不走迁移事务
     if((it.action||'note')==='cleanup'){
-      prSt(i,'run','⟳ 移入回收站…');
       propProg('第 '+(k+1)+'/'+sel.length+' 项：清理 '+src);
-      feed.recycleDelete([src], function(failed){
-        if(propAborted) return finish('aborted');
+      recycleProposalItem(i, src, function(failed){
         if(failed && failed.length){
           prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
           results.push({src:src,ok:false,error:'回收站删除失败'});
@@ -483,14 +646,14 @@ function runProposal(){
         }
         prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
         results.push({src:src,ok:true,action:'recycled'});
-        if(feed.scanRefresh) feed.scanRefresh(src);
         doneN++; k++; return next();
       });
       return;
     }
-    prSt(i,'run','⟳ 预检中…');
+    propItemProgress(i,'预检中',null,src);
     propProg('第 '+(k+1)+'/'+sel.length+' 项：预检 '+src);
     feed.migrateCheck(src, dest, function(r){
+      if(propAborted){ prSt(i,'skip','已停止'); return finish('aborted'); }
       if(!r){ prSt(i,'err','⛔ 预检失败'); results.push({src:src,ok:false,error:'预检失败'});
         failN++; k++; return next(); }
       if(!r.ok){
@@ -498,12 +661,16 @@ function runProposal(){
         prSt(i,'err','⛔ '+msg); results.push({src:src,ok:false,error:msg});
         failN++; k++; return next();
       }
-      prSt(i,'run','⟳ 迁移中… 0%');
+      propItemProgress(i,'准备迁移',null,src);
       window.__migHandler = function(ev){
         if(ev.stage==='copy'||ev.stage==='verify'||ev.stage==='switch'){
-          var pct = ev.bytes_total>0 ? Math.round(ev.bytes_done/ev.bytes_total*100) : 100;
           var ph = ev.stage==='copy'?'复制':(ev.stage==='verify'?'校验':'切换 junction');
-          prSt(i,'run','⟳ '+ph+'… '+pct+'%'+(ev.current?' · '+ev.current:''));
+          var pct = ev.stage!=='copy' ? null :
+            ev.bytes_total>0 ? Math.min(100,ev.bytes_done/ev.bytes_total*100) :
+            ev.files_total>0 ? Math.min(100,ev.files_done/ev.files_total*100) : null;
+          var bytes = ev.stage==='copy' && ev.bytes_total>0
+            ? ' · '+fmt(ev.bytes_done)+' / '+fmt(ev.bytes_total) : '';
+          propItemProgress(i,ph+bytes,pct,ev.current||src);
           return;
         }
         if(ev.stage==='done'){
@@ -573,7 +740,7 @@ function closeProposal(reject){
   aiChEl('prop-stop').addEventListener('click', function(){
     propAborted = true;
     propProg('正在停止（当前项完成后结束）…');
-    if(feed.migrateStop) feed.migrateStop();
+    if(window.__migHandler && feed.migrateStop) feed.migrateStop();
   });
   aiChEl('prop-list').addEventListener('change', function(ev){
     if(ev.target && ev.target.classList && ev.target.classList.contains('pr-cb')) updateRunBtn();
@@ -617,16 +784,23 @@ function closeProposal(reject){
     if(rc){
       var i = parseInt(rc.dataset.i, 10);
       var it = (propData && propData.items) ? propData.items[i] : null;
-      if(!it || !it.src || propRunning) return;
-      prSt(i,'run','⟳ 移入回收站…');
-      feed.recycleDelete([it.src], function(failed){
+      if(!it || !it.src || propRunning || rc.disabled) return;
+      propRunning = true;
+      rc.disabled = true;
+      updateRunBtn();
+      aiChEl('prop-close').disabled = true;
+      aiChEl('prop-reject').disabled = true;
+      recycleProposalItem(i, it.src, function(failed){
+        propRunning = false;
+        updateRunBtn();
+        aiChEl('prop-close').disabled = false;
+        aiChEl('prop-reject').disabled = false;
+        rc.disabled = !failed.length;
         if(failed.length){ prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
           resultsPush(propData.id, {src:it.src, ok:false, error:'回收站删除失败'}); }
         else{
           prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
           resultsPush(propData.id, {src:it.src, ok:true, action:'recycled'});
-          if(feed.scanRefresh) feed.scanRefresh(it.src);
-          rc.disabled = true;
         }
       });
     }

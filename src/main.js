@@ -7,6 +7,11 @@ var IN_TAURI = !!window.__TAURI__;
 var viewMode = 'treemap';
 var fileIndex = new Map();   // lower(path) -> 文件节点（供大文件榜使用）
 var scanning = false;
+var scanPending = false;
+var currentScanId = null;
+var scanProgress = null;
+var localScanning = false;
+var localStopPending = false;
 var scanT0 = 0;
 var watchActive = false;     // 扫描完成后的实时监视（fs-batch 增量应用）
 var watchChanges = 0;        // 本次监视会话累计收到的变更条数
@@ -28,8 +33,6 @@ function diagLog(level, msg){
 var deniedSeen = {};         // 无权限目录（会话级累计，展示时按范围过滤；同一目录去重）
 var volUsed = 0;             // 当前根所在卷的已用空间（list_volumes 的 total-free；0=未知）
 var volTotal = 0;            // 同上：卷总容量（0=未知）
-var aiSnapReady = false;     // 已向 AI 通道推送过至少一次扫描快照
-var aiPushTimer = null;      // 监视模式下周期性重推快照的定时器
 
 // ===== 多盘齐扫：统一虚拟根模型 =====
 // ROOTS = 本次扫描的盘根列表；单盘时 length===1，行为与旧单根完全一致。
@@ -57,13 +60,11 @@ function scopeLabel(){
 }
 // 路径是否属于当前展示范围：多盘=任一根前缀命中；单盘=该盘前缀
 function inScope(p){
-  var pl = String(p||'').toLowerCase();
-  var roots = isMultiRoot() ? ROOTS : [String(window.ROOT||'C:\\')];
-  for(var i=0;i<roots.length;i++){
-    var r = String(roots[i]).toLowerCase();
-    if(r && pl.indexOf(r)===0) return true;
-  }
-  return false;
+  return ROOTS.some(function(root){ return pathWithin(p, root); });
+}
+function pathWithin(path, root){
+  var p = path.toLowerCase(), r = root.toLowerCase();
+  return p===r || p.startsWith(r.endsWith('\\') ? r : r+'\\');
 }
 // 当前范围内的无权限目录数
 function deniedInScope(){
@@ -91,23 +92,26 @@ var scopeRoots = {};        // scopeKey -> roots 数组
 var MAX_SCOPES = 2;
 
 // 把一组盘根的数据从 store/fileIndex/deniedSeen/expanded 里整体移除
-function dropScopeData(roots){
+function dropScopeData(roots, keep){
   diagLog('info', '逐出范围数据（内存上限）: ' + roots.join(','));
-  var prefixes = roots.map(function(r){ return String(r).toLowerCase(); });
   var hit = function(p){
-    var pl = String(p||'').toLowerCase();
-    for(var i=0;i<prefixes.length;i++){
-      if(prefixes[i] && pl.indexOf(prefixes[i])===0) return true;
-    }
-    return false;
+    return roots.some(function(root){ return pathWithin(p, root); }) &&
+      !keep.some(function(root){ return pathWithin(p, root); });
   };
   var dead = [];
   store.forEach(function(n, k){ if(hit(n.p || k)) dead.push(k); });
+  var parents = new Set();
   dead.forEach(function(k){
     var n = store.get(k);
     if(n) delete expanded[n.p];
+    var p = parentPathOf(k);
+    if(p) parents.add(p);
     store.delete(k);
     fileIndex.delete(k);
+  });
+  parents.forEach(function(key){
+    var node = store.get(key);
+    if(node) node.c = node.c.filter(function(child){ return store.has(child.p.toLowerCase()); });
   });
   var deadFiles = [];
   fileIndex.forEach(function(n, k){ if(hit(n.p || k)) deadFiles.push(k); });
@@ -130,8 +134,9 @@ function rememberScope(){
     var others = scopeOrder.filter(function(k){ return k !== key; });
     if(others.length <= maxOthers) break;
     var oldest = others[0];
-    dropScopeData(scopeRoots[oldest] || []);
     scopeOrder.splice(scopeOrder.indexOf(oldest), 1);
+    var keep = scopeOrder.flatMap(function(k){ return scopeRoots[k]; });
+    dropScopeData(scopeRoots[oldest] || [], keep);
     delete scopeRoots[oldest];
     delete scopeAt[oldest];
   }
@@ -179,14 +184,13 @@ function ensureChain(path){
   var n = store.get(k);
   if(n) return n;
   var idx = path.lastIndexOf('\\');
-  var parent = idx > 0 ? path.slice(0, idx + 1) : '';   // 含反斜杠：'C:\Users'→'C:\'
-  if(parent === path) parent = '';                       // 盘根自身即顶，无上级
+  var parent = parentPathOf(path);
   var name = idx > 0 ? path.slice(idx+1) : path;
   if(!name) name = path;                                 // 盘根 'C:\' 的尾反斜杠让末段为空
   var pn = parent ? ensureChain(parent) : null;
   n = { n: name, s: 0, al: 0, done: false, p: path, f: false, c: [] };
   store.set(k, n);
-  if(pn && !pn.c.includes(n)) pn.c.push(n);
+  if(pn) pn.c.push(n);
   return n;
 }
 function applyEvent(ev){
@@ -198,6 +202,7 @@ function applyEvent(ev){
   n.s = ev.size;
   n.al = (ev.al != null) ? ev.al : ev.size;
   n.done = ev.done;
+  n.summarized = !!ev.summarized;
   // 标记字段只置位不清除：done 事件晚于占位事件，不能回滚已知的受限/占位状态
   if(ev.dup) n.dup = true;
   if(ev.cloud) n.cloud = true;
@@ -205,15 +210,10 @@ function applyEvent(ev){
     n.denied = true;
     deniedSeen[ev.path.toLowerCase()] = 1;
   }
-  var idx = ev.path.lastIndexOf('\\');
-  var parentPath = idx > 0 ? ev.path.slice(0, idx) : '';
-  if(parentPath){
-    var pn = store.get(parentPath.toLowerCase());
-    if(pn && !pn.c.includes(n)) pn.c.push(n);   // 时序原因成孤儿的自动回挂
-  }
   // 监视模式下优先扫描把体积带回来：差值沿祖先传播（子目录 done 只补差值，
   // 级联天然自洽）。扫描期间严禁传播——祖先体积由引擎统一结算
-  if(!scanning && watchActive) propDelta(ev.path, (n.s||0) - oldS, n.al - oldAl);
+  // 汇总明细在父目录结算后补发，其体积已经计入祖先。
+  if(!scanning && watchActive && !ev.summarized) propDelta(ev.path, (n.s||0) - oldS, n.al - oldAl);
   if(n.f) fileIndex.set(ev.path.toLowerCase(), n);   // 文件入索引，大文件榜用
   markDirty();
 }
@@ -245,7 +245,7 @@ function propDelta(path, delta, deltaAl) {
 function removeSubtree(path) {
   var lower = path.toLowerCase();
   var n = store.get(lower);
-  if (!n) return 0;
+  if (!n) return { s: 0, al: 0 };
   var total = n.s || 0;
   var totalAl = alOf(n);
   (function walk(x) {
@@ -267,7 +267,7 @@ function removeSubtree(path) {
   return { s: total, al: totalAl };   // 目录节点自带整棵子树的合计，直接作差值
 }
 // 新目录出现：占位（统计中）并排队优先扫描，扫完 done 事件把真实体积带回来
-var priQueue = [], priQueued = {}, priInflight = [], PRI_MAX = 2;
+var priQueue = [], priQueued = {}, priInflight = [], PRI_MAX = 1;
 function queuePriority(path) {
   var k = path.toLowerCase();
   if (priQueued[k]) return;
@@ -283,16 +283,13 @@ function pumpPriority() {
   }
 }
 // 渲染循环每帧调：在飞的优先扫描对应节点 done 即释放并发额度
-function checkPriorityDone() {
-  for (var i = 0; i < priInflight.length; i++) {
-    var n = store.get(priInflight[i].toLowerCase());
-    if (n && n.done) {
-      delete priQueued[priInflight[i].toLowerCase()];
-      priInflight.splice(i, 1);
-      i--;
-      pumpPriority();
-    }
-  }
+function completePriority(path) {
+  var key = path.toLowerCase();
+  var i = priInflight.findIndex(function(p){ return p.toLowerCase()===key; });
+  if(i<0) return;
+  delete priQueued[key];
+  priInflight.splice(i,1);
+  pumpPriority();
 }
 function applyFsBatch(batch) {
   if (!watchActive || !Array.isArray(batch) || !batch.length) return;
@@ -309,12 +306,9 @@ function applyFsBatch(batch) {
       var n = store.get(lower);
       if (ev.is_dir) {
         if (!n) {
-          // 新目录：入树占位（统计中），祖先体积不变（其内容体积随后由优先扫描结算）
+          // 新目录先占位，用户进入或展开时再安排局部遍历。
           applyEvent({ path: ev.path, size: 0, done: false, file: false });
-          queuePriority(ev.path);
           changed++;
-        } else if (!n.done) {
-          queuePriority(ev.path);   // 之前占位还没扫完（或上次队列没轮到），再排一次
         }
       } else {
         // 文件：与扫描同语义，只关心 ≥10MB 的大文件或已在树里的（小文件本就不入树）
@@ -338,15 +332,11 @@ function setWatch(on, root) {
     // root 兼容单根字符串与多根数组；多盘逐根挂 watcher
     var roots = Array.isArray(root) ? root : [root];
     for(var i=0;i<roots.length;i++) feed.watchStart(roots[i]);
-    // 监视模式：快照周期性重推，AI 拉到的始终接近实时
-    if (aiPushTimer) clearInterval(aiPushTimer);
-    aiPushTimer = setInterval(pushAiSnapshot, 15000);
   } else {
     watchActive = false;
     priQueue = []; priQueued = {}; priActive = 0; priInflight = [];
     document.body.classList.remove('watching');
     feed.watchStop();
-    if (aiPushTimer) { clearInterval(aiPushTimer); aiPushTimer = null; }
   }
 }
 
@@ -365,13 +355,17 @@ function clearViewBodies(){
    避免清空大文件榜等视图后小目录扫描没有新大文件回流、界面"变空"；
    其他范围的数据空闲态留在内存供秒开，但扫描开始时会整体逐出
    （rememberScope 扫描态只留当前范围，避免扫描期间双树驻留拖垮内存） */
-function beginScanUI(roots, byAI){
+function beginScanUI(roots, full){
   var sameScope = roots.length === ROOTS.length &&
     roots.every(function(r, i){ return String(r).toLowerCase() === String(ROOTS[i]||'').toLowerCase(); });
-  var keepData = sameScope && !scanning && store.size > 0;
+  var keepData = !full && sameScope && !scanning && store.size > 0;
   ROOTS = roots.map(function(r){ return r; });
   window.ROOT = ROOTS[0];
-  if (watchActive) setWatch(false);   // AI 触发路径没有按钮前置清理，这里统一关掉旧范围监视
+  if (watchActive) setWatch(false);
+  if(full){
+    dropScopeData(ROOTS, []);
+    delete scopeAt[curScopeKey()];
+  }
   if (!keepData) {
     clearViewBodies();
     window.expanded = {}; window.stack = []; selectedRow = '';
@@ -380,13 +374,13 @@ function beginScanUI(roots, byAI){
     var fsInp = document.getElementById('file-search');
     if(fsInp) fsInp.value = '';
   }
-  volUsed = 0; volTotal = 0; aiSnapReady = false;
+  volUsed = 0; volTotal = 0;
   ensurePcRoot();                              // 多盘时建/刷新虚拟根
   window.curPath = isMultiRoot() ? THISPC : ROOTS[0];
-  window.rootInput.value = window.ROOT;
+  syncPathControls();
   setScanning(true);
   rememberScope();   // 扫描态下逐出其他范围（scanning=true 时只留当前范围，压内存峰值）
-  setStatus(byAI ? 'AI 触发扫描中…' : '扫描中…', 'scanning');
+  setStatus('后台扫描中…', 'scanning');
   syncDrivesSelect(); loadDrives();
   render();
 }
@@ -405,7 +399,7 @@ function buildCacheJson(){
   var nodes = [];
   store.forEach(function(n){
     if(!n.f && n.s >= 1024*1024 && n.p !== THISPC && inScope(n.p))
-      nodes.push([n.p, n.n, n.s, alOf(n), n.done?1:0, n.denied?1:0]);
+      nodes.push([n.p, n.n, n.s, alOf(n), n.done?1:0, n.denied?1:0, n.summarized?1:0]);
   });
   var files = [];
   fileIndex.forEach(function(n){
@@ -428,13 +422,13 @@ function saveScanCache(){
 function restoreScanCache(cb){
   if(!feed.readScanCache) return cb && cb(null);
   feed.readScanCache('current', function(json){
-    if(!json) return cb && cb(null);
+    if(!json || scanning || scanPending) return cb && cb(null);
     try {
       var d = JSON.parse(json);
       if(!d || !d.nodes) return cb && cb(null);
       for(var i=0;i<d.nodes.length;i++){
         var r = d.nodes[i];
-        applyEvent({ path:r[0], name:r[1], size:r[2], al:r[3], done:r[4], file:false, denied:!!r[5] });
+        applyEvent({ path:r[0], name:r[1], size:r[2], al:r[3], done:r[4], file:false, denied:!!r[5], summarized:!!r[6] });
       }
       for(var j=0;j<d.files.length;j++){
         var f = d.files[j];
@@ -466,13 +460,14 @@ function snapTree(n){
   var kids = n.c || [];
   for (var i = 0; i < kids.length; i++) {
     var k = kids[i];
-    if ((k.s || 0) >= AI_SNAP_MIN) { if (k.f) fileLeaves.push(k); else dirs.push(k); }
+    if (n.p === THISPC || (k.s || 0) >= AI_SNAP_MIN) { if (k.f) fileLeaves.push(k); else dirs.push(k); }
     else { agg.n++; agg.s += k.s || 0; agg.al += alOf(k); }
   }
   dirs.sort(function(a,b){ return b.s-a.s; });
   fileLeaves.sort(function(a,b){ return b.s-a.s; });
   var o = { n: n.n, p: n.p, s: n.s || 0, al: alOf(n) };
   if (n.denied) o.d = true;
+  if (n.summarized) o.summarized = true;
   var c = [];
   for (var d = 0; d < dirs.length; d++) {
     if (aiSnapBudget <= 0) { o.truncated = true; break; }
@@ -494,7 +489,7 @@ function snapTree(n){
 }
 // 快照 = 树形构成 + 卷口径 + 类型分布 + 受限目录。
 // Rust 侧原样存取（零解析），HTTP GET /api/scan 直接回传
-function buildAiSnapshot(){
+function buildAiSnapshot(scannedAt, scanId){
   var root = isMultiRoot() ? store.get(THISPC.toLowerCase()) : store.get(String(window.ROOT||'').toLowerCase());
   if(!root) return null;   // 扫描早期（s=0）也推：AI 靠 scanning 字段区分进行中/完成
   var denied = [];
@@ -504,11 +499,10 @@ function buildAiSnapshot(){
     if(dn) denied.push({ path:dn.p, s:dn.s||0, al:alOf(dn) });
   }
   var types = (typeof typesPool === 'function') ? typesPool().slice(0, 50) : [];
-  aiSnapBudget = 20000;   // 树节点预算：正常盘远用不完，仅防极端结构
+  aiSnapBudget = 6000;
   var sum = isMultiRoot() ? rootsSummary() : { s:root.s, al:alOf(root) };
   return JSON.stringify({
-    app:'disklens', root:ROOTS.join(','), generatedAt:new Date().toISOString(),
-    scanning:scanning, volUsed:volUsed||null, volTotal:volTotal||null,
+    app:'disklens', root:ROOTS.join(','), scanId:scanId||null, scannedAtMs:scannedAt, volUsed:volUsed||null, volTotal:volTotal||null,
     gap:(volUsed ? volUsed - sum.al : null),
     rootSize:sum.s, rootAlloc:sum.al, deniedCount:deniedInScope(),
     tree: snapTree(root),      // 树形构成（多盘=虚拟根下各盘一棵；≥10MB 子项 + 每层 agg）
@@ -516,12 +510,12 @@ function buildAiSnapshot(){
     drill: 'GET /api/tree?path=<dir>&depth=<1..=8,默认3>&min=<字节或 100MB/1GB,默认10MB> 一次返回多层（目录+大文件，<min 聚合进 agg，预算截断标 truncated）；找大头加 &flat=1 直接返回按大小降序的文本清单（每行「大小MB D|F 路径」，零解析）；无需逐层探索'
   });
 }
-function pushAiSnapshot(){
+function pushAiSnapshot(scannedAt, scanId){
+  if(scanning || !scannedAt || !feed.aiSnapshot) return;
   var j = null;
-  try { j = buildAiSnapshot(); } catch(e) { return; }
+  try { j = buildAiSnapshot(scannedAt,scanId); } catch(e) { return; }
   if(!j) return;
-  if(feed.aiSnapshot) feed.aiSnapshot(j);
-  aiSnapReady = true;
+  feed.aiSnapshot(j);
 }
 var lastAutoRender = 0;   // 监视模式渲染合流的时间戳
 (function loop(){
@@ -530,7 +524,7 @@ var lastAutoRender = 0;   // 监视模式渲染合流的时间戳
     // 监视模式合流：文件事件高频到达时 120ms 全量重排会让方块带着 0.35s
     // 过渡持续漂移+闪烁（用户反馈"屏幕一直闪"）。合并到至多 ~1.3 次/秒，
     // 变化攒着一步到位；手动操作（navigate/render 直调）不受影响
-    if(!watchActive || now - lastAutoRender >= 800){
+    if((!scanning && !localScanning && !watchActive) || now - lastAutoRender >= 800){
       dirty = false;
       lastAutoRender = now;
       try { render(); }
@@ -541,13 +535,13 @@ var lastAutoRender = 0;   // 监视模式渲染合流的时间戳
       }
     }
   }
-  try { checkPriorityDone(); } catch(_) {}
   setTimeout(loop, 120);
 })();
 
 /* ===== 视图调度 ===== */
 function render(){
   if(!curPath) return;
+  if(curPath !== pathInControls) syncPathControls();
   var node = store.get(curPath.toLowerCase());
   if(!node){
     // 该范围还没有数据（切到没扫过的盘）：不用转圈 spinner（会被误读成正在扫描），
@@ -563,7 +557,10 @@ function render(){
       sm.innerHTML=parts.join(' · ');
     }
     var st=document.getElementById('foot-stats');
-    if(st) st.innerHTML='当前 <b>'+esc(scopeLabel())+'</b> · 尚未扫描';
+    if(st){
+      st.title = scopeLabel();
+      st.innerHTML='当前 <b>'+esc(scopeLabel())+'</b> · 尚未扫描';
+    }
     var wt = document.getElementById('wait');
     if(wt){ wt.style.display='flex';
       wt.innerHTML='<div><div style="font-size:46px;margin-bottom:14px">🗂️</div>'+
@@ -589,6 +586,19 @@ function setView(m){
   document.getElementById('foot-hint').textContent = VIEW_HINTS[m] || '';
   render();
 }
+function scanDisplayTotals(node){
+  if(node && node.p===THISPC){
+    return scanning && scanProgress
+      ? {s:scanProgress.bytesScanned, al:scanProgress.allocatedBytes, done:false}
+      : rootsSummary();
+  }
+  if(scanning && scanProgress && node){
+    var live = scanProgress.roots.find(function(root){ return root.path.toLowerCase()===node.p.toLowerCase(); });
+    if(live) return {s:live.bytesScanned, al:live.allocatedBytes, done:live.done};
+  }
+  return node;
+}
+
 function updateCrumb(node){
   var b=document.getElementById('bar'); b.innerHTML='';
   if(stack.length){
@@ -611,24 +621,29 @@ function updateCrumb(node){
   }
   var cb=document.createElement('b');
   // 目录双口径：逻辑大小 = 展示主口径；占用 = 簇对齐后的真实磁盘占用
-  cb.textContent=node.n+' = '+fmt(node.s)+(node.f?'':' · 占用 '+fmt(alOf(node)));
+  var totals = scanDisplayTotals(node);
+  cb.textContent=node.n+' = '+fmt(totals.s)+(node.f?'':' · 占用 '+fmt(alOf(totals)));
   b.appendChild(cb);
 }
 function updateSummary(node){
   // 多盘：聚合各盘根（引擎不更新虚拟根，这里现场求和）
-  var root = isMultiRoot() ? (function(){
-    var r = rootsSummary();
-    return { s:r.s, al:r.al, done:r.done };
-  })() : store.get((window.ROOT||'C:\\').toLowerCase());
+  var root = scanDisplayTotals(store.get(curRootKey()));
   var parts=[];
+  if(node.summarized) parts.push('<span title="可对当前目录开始扫描，展开更多明细">部分明细已聚合</span>');
   if(root&&root.s>0){
     // 双口径：逻辑大小为主展示，磁盘占用（簇对齐/去重后的真实占用）括号补充
     parts.push((scanning?'已扫描 ':'根目录总计 ')+'<b>'+fmt(root.s)+'</b>'+'（占用 '+fmt(alOf(root))+'）');
   }
   if(volUsed) parts.push('卷已用 <b>'+fmt(volUsed)+'</b>');
+  if(scanning && scanProgress){
+    parts.push('已访问 '+scanProgress.directoriesVisited.toLocaleString()+' 个目录、'+
+      scanProgress.filesVisited.toLocaleString()+' 个文件');
+    if(scanProgress.rootsTotal>1)
+      parts.push('已完成 '+scanProgress.rootsDone+'/'+scanProgress.rootsTotal+' 个扫描根');
+  }
   // 扫描完成后的差额透明化：扫描器看不到的部分 = 卷已用 - 扫描占用
   // （还原点/NTFS 元数据/无权限目录；负值说明占用估算偏高，如压缩文件近似）
-  if(root&&root.done&&volUsed){
+  if(!scanning&&root&&root.done&&volUsed&&(isMultiRoot() || /^[a-z]:\\$/i.test(window.ROOT))){
     var gap=volUsed-alOf(root);
     if(gap>=100*1024*1024){
       parts.push('<span style="color:var(--amber)" title="扫描器看不到的部分：System Volume Information（还原点）等受保护目录、NTFS 元数据（$MFT/USN 日志）、无权限目录">未计入 '+fmt(gap)+'</span>');
@@ -645,7 +660,11 @@ function updateSummary(node){
   if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?' · 已感知 '+watchChanges+' 项变更':'')+'</span>');
   document.getElementById('summary').innerHTML=parts.join(' · ');
   var st=document.getElementById('foot-stats');
-  if(node) st.innerHTML='当前 <b>'+esc(node.n)+'</b> · '+node.c.length+' 项';
+  if(node){
+    var location = curPath===THISPC ? scopeLabel() : curPath;
+    st.title = location;
+    st.innerHTML='当前 <b>'+esc(location)+'</b> · '+node.c.length+' 项';
+  }
 }
 
 /* ===== 无权限目录面板 ===== */
@@ -770,12 +789,16 @@ function setScanning(on){
   scanning = on;
   if(on){ scanT0 = Date.now(); }
   else if(scanT0){ lastScanSecs = (Date.now()-scanT0)/1000; }   // 记录本次扫描耗时（完成态 summary 用）
-  document.getElementById('scan-btn').disabled = on;
-  document.getElementById('stop-btn').disabled = !on;
+  syncScanButtons();
   document.body.classList.toggle('scanning', on);
   if(!on) document.body.classList.remove('scanning');
-  // 扫描状态变化即推快照：AI 能从 /api/status、/api/scan 的 scanning 字段感知进度
-  setTimeout(pushAiSnapshot, on ? 600 : 0);   // 开始时稍等首批事件；结束立即推
+  markDirty();
+}
+
+function syncScanButtons(){
+  var busy = scanning || localScanning || scanPending;
+  document.getElementById('scan-btn').disabled = busy;
+  document.getElementById('stop-btn').disabled = !busy;
 }
 
 /* 沿"单一大子目录"链钻取展开：把 start 的子目录展开后，若其下只有一条
@@ -853,33 +876,57 @@ function applyExpandSettings(){
 
 /* ===== Tauri Feed：invoke 扫描命令 + 监听事件流 ===== */
 function TauriFeed(){
-  window.__TAURI__.event.listen('scan-update', function(ev){ applyEvent(ev.payload); });
-  // 并行引擎的批量事件：一批最多 256 条，一次 IPC 应用整批
+  window.__TAURI__.event.listen('scan-started', function(ev){
+    scanPending = false;
+    currentScanId = ev.payload.scanId;
+    scanProgress = null;
+    beginScanUI(ev.payload.roots, ev.payload.full);
+    if(ev.payload.byAi) setStatus('AI 发起的后台扫描中…', 'scanning');
+  });
+  window.__TAURI__.event.listen('scan-progress', function(ev){
+    if(!scanning || currentScanId!==ev.payload.scanId) return;
+    scanProgress = ev.payload.progress;
+    markDirty();
+  });
+  // 主扫描与局部扫描共用批量事件。
   window.__TAURI__.event.listen('scan-batch', function(ev){
     var arr = ev.payload || [];
     for(var i=0;i<arr.length;i++) applyEvent(arr[i]);
   });
-  // AI 经 POST /api/scan 触发扫描（用户按钮路径已自己接管 UI，此处只在空闲态生效）
-  window.__TAURI__.event.listen('scan-started', function(ev){
-    if (scanning) return;
-    var roots = ev.payload || [];
-    if(!roots.length) return;
-    beginScanUI(roots, true);
-  });
   window.__TAURI__.event.listen('scan-finished', function(ev){
     var msg = ev.payload || '完成';
-    setStatus(msg, 'done');
-    setScanning(false);   // 内部已推完成态快照
+    var completed = msg.indexOf('扫描完成') === 0;
+    setStatus(msg, completed ? 'done' : 'err');
+    setScanning(false);
+    if(!completed) return;
     autoExpandView();
     prevCacheLoaded = false; prevCache = null;   // prev 缓存已轮换，历史对比下次进视图重读
-    // 落缓存避开完成瞬间：遍历全 store + 大 JSON.stringify 是数百毫秒级的主线程
-    // 重活，先让完成态渲染/快照推送跑完（期间若又开新扫描则跳过，由其完成时统一落）
-    setTimeout(function(){ if(!scanning) saveScanCache(); }, 400);
-    scopeAt[curScopeKey()] = Date.now();         // 记录该范围完成时间（切回时显示"多久前"）
+    var key = curScopeKey(), at = Date.now(), scanId = currentScanId;
+    scopeAt[key] = at;
+    function sameScan(){ return !scanning && currentScanId===scanId && curScopeKey()===key && scopeAt[key]===at; }
+    setTimeout(function(){ if(sameScan()) pushAiSnapshot(at,scanId); }, 300);
+    setTimeout(function(){ if(sameScan()) saveScanCache(); }, 1200);
     diagLog('info', String(msg) + '（roots=' + ROOTS.join(',') + '）');
     // 完整扫描结束后进入实时监视：文件增删改即时反映到视图（多盘逐根挂 watcher）
-    if (!watchActive && String(msg).indexOf('扫描完成') >= 0 && ROOTS.length) {
+    if (!watchActive && ROOTS.length) {
       setWatch(true, ROOTS);
+    }
+  });
+  window.__TAURI__.event.listen('scan-refresh-finished', function(ev){
+    var result = ev.payload;
+    if(result[1]) setStatus(result[1], result[1].startsWith('目录刷新完成') ? 'done' : 'err');
+    completePriority(result[0]);
+  });
+  window.__TAURI__.event.listen('scan-refresh-running', function(ev){
+    localScanning = !!ev.payload;
+    syncScanButtons();
+    if(localScanning){
+      setStatus('后台刷新目录中…', 'scanning');
+    } else if(localStopPending){
+      localStopPending = false;
+      setStatus('目录刷新已停止', 'done');
+    } else if(!scanning && lastStatusCls==='scanning'){
+      setStatus('目录刷新结束', 'done');
     }
   });
   window.__TAURI__.event.listen('fs-batch', function(ev){
@@ -897,15 +944,23 @@ function TauriFeed(){
   });
   window.__migHandler = null;   // migrate.js 对话框打开时接管
 }
-TauriFeed.prototype.start = function(roots){
-  setStatus('扫描中…', 'scanning');
+TauriFeed.prototype.start = function(roots, full){
+  var self = this;
+  self.stopping = false;
+  scanPending = true;
+  syncScanButtons();
+  setStatus('准备后台扫描…', 'scanning');
   var arr = Array.isArray(roots) ? roots : [roots];
-  window.__TAURI__.core.invoke('scan_start', { roots: arr }).catch(function(e){
-    setStatus(String(e), 'err');
-    setScanning(false);
+  window.__TAURI__.core.invoke('scan_start', { roots: arr, full: !!full }).then(function(){
+    if(self.stopping && (scanning || scanPending)) self.stop();
+  }).catch(function(e){
+    scanPending = false;
+    syncScanButtons();
+    if(!scanning) setStatus(String(e), 'err');
   });
 };
 TauriFeed.prototype.stop = function(){
+  this.stopping = true;
   window.__TAURI__.core.invoke('scan_stop').catch(function(){});
 };
 TauriFeed.prototype.open = function(p, sel){
@@ -959,15 +1014,19 @@ TauriFeed.prototype.migrateStop = function(){
   window.__TAURI__.core.invoke('migrate_stop').catch(function(){});
 };
 TauriFeed.prototype.scanPriority = function(p){
-  window.__TAURI__.core.invoke('scan_priority', { path: p }).catch(function(){});
+  window.__TAURI__.core.invoke('scan_priority', { path: p }).catch(function(){ completePriority(p); });
 };
 /* 强制重扫子树（右键「重新扫描此目录」/ 提案执行后的局部刷新） */
 TauriFeed.prototype.scanRefresh = function(p){
   window.__TAURI__.core.invoke('scan_refresh', { path: p }).catch(function(e){ setStatus(String(e),'err'); });
 };
 /* 清理类操作：移入回收站（可还原）。cb(failedPaths) */
-TauriFeed.prototype.recycleDelete = function(paths, cb){
-  window.__TAURI__.core.invoke('recycle_delete', { paths: paths }).then(function(f){ cb(f||[]); }).catch(function(){ cb(paths); });
+TauriFeed.prototype.recycleDelete = function(paths, cb, onProgress){
+  var core = window.__TAURI__.core;
+  var progress = new core.Channel(onProgress || function(){});
+  core.invoke('recycle_delete', { paths: paths, progress: progress }).then(
+    function(f){ cb(f||[]); }, function(){ cb(paths); }
+  );
 };
 /* 撤销迁移：删 junction + 数据回原位；进度/结果经 migrate-update 事件流（__migHandler） */
 TauriFeed.prototype.migrateUndo = function(src, destRoot){
@@ -1109,7 +1168,9 @@ MockFeed.prototype.start = function(roots, onDone){
     else { setStatus(msg, 'done'); setScanning(false); autoExpandView(); }
   }, 13200+(ticks2+1)*620));
 };
-MockFeed.prototype.stop = function(){ this._clear(); setStatus('已停止','done'); setScanning(false); };
+MockFeed.prototype.stop = function(){
+  this._clear(); setStatus('已停止','done'); setScanning(false);
+};
 MockFeed.prototype.open = function(p){
   setStatus('浏览器模式：打开文件夹需在 Tauri 客户端内使用','err');
 };
@@ -1180,7 +1241,12 @@ MockFeed.prototype.migrateStart = function(src, destRoot){
 MockFeed.prototype.migrateStop = function(){ this._migStopped = true; };
 /* Mock 优先扫描：600ms 后把该目录补成 done 并造几个子项，让"优先调度"在浏览器里可演示 */
 MockFeed.prototype.scanRefresh = function(){};
-MockFeed.prototype.recycleDelete = function(paths, cb){ setTimeout(function(){ cb([]); }, 300); };
+MockFeed.prototype.recycleDelete = function(paths, cb, onProgress){
+  if(onProgress) setTimeout(function(){
+    onProgress({current:paths[0], done:1, total:2});
+  }, 100);
+  setTimeout(function(){ cb([]); }, 300);
+};
 MockFeed.prototype.migrateUndo = function(src, destRoot){
   // 模拟撤销：switch（删链接）→ done，走 __migHandler 事件流
   var handler = window.__migHandler || function(){};
@@ -1188,9 +1254,9 @@ MockFeed.prototype.migrateUndo = function(src, destRoot){
   setTimeout(function(){ handler({ stage:'done', message:'撤销完成：数据已回到原位', current:'', bytes_done:0, bytes_total:0, files_done:0, files_total:0, locked:[] }); }, 700);
 };
 MockFeed.prototype.scanPriority = function(p){
-  var self = this;
   this.timers.push(setTimeout(function(){
     var n = store.get(p.toLowerCase());
+    completePriority(p);
     if(!n || n.done || n.f) return;
     var GB = 1073741824;
     var base = Math.max(n.s, 3*GB);
@@ -1240,7 +1306,7 @@ window.addEventListener('DOMContentLoaded', function(){
   window.map = document.getElementById('map');
   window.rootInput = document.getElementById('root-input');
   window.statusEl = document.getElementById('status');
-  ROOTS = [window.rootInput.value || 'C:\\'];
+  ROOTS = ['C:\\'];
   window.ROOT = ROOTS[0];
   window.curPath = window.ROOT;
   feed = IN_TAURI ? new TauriFeed() : new MockFeed();
@@ -1266,6 +1332,10 @@ window.addEventListener('DOMContentLoaded', function(){
         ensurePcRoot();
         scopeAt[scopeKey(ROOTS)] = meta.at;   // 该范围完成时间（切走再切回时提示用）
         rememberScope();
+        var restored = scopeKey(ROOTS);
+        setTimeout(function(){
+          if(!scanning && curScopeKey()===restored && scopeAt[restored]===meta.at) pushAiSnapshot(meta.at);
+        }, 300);
         setStatus('已恢复上次扫描结果（' + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + ' 小时前）· 建议重新扫描刷新', 'done');
         markDirty();
       }
@@ -1293,7 +1363,14 @@ window.addEventListener('DOMContentLoaded', function(){
   document.getElementById('expand-pct').addEventListener('change', applyExpandSettings);
   document.getElementById('expand-depth').addEventListener('change', applyExpandSettings);
   document.getElementById('scan-btn').addEventListener('click', startScan);
-  document.getElementById('stop-btn').addEventListener('click', function(){ feed.stop(); });
+  document.getElementById('stop-btn').addEventListener('click', function(){
+    setStatus('正在停止扫描…', 'scanning');
+    if(localScanning){
+      localStopPending = true;
+      priQueue = []; priQueued = {}; priInflight = [];
+    }
+    feed.stop();
+  });
 
   /* 盘符下拉：列出本地卷，选中只切换展示范围（上次结果秒开），不自动扫描 */
   var drivesSel = document.getElementById('root-drives');
@@ -1302,11 +1379,14 @@ window.addEventListener('DOMContentLoaded', function(){
     if (scanning) {
       // 扫描进行中切换范围会与引擎状态错位——先恢复选中项再提示
       setStatus('扫描进行中——请先「停止」再切换扫描范围', 'err');
-      syncDrivesSelect();
-      this.value = isMultiRoot() ? THISPC : String(window.ROOT||'');
+      syncPathControls();
       return;
     }
     switchScope(this.value);
+  });
+  window.rootInput.addEventListener('change', commitPathInput);
+  window.rootInput.addEventListener('keydown', function(ev){
+    if(ev.key==='Enter'){ ev.preventDefault(); commitPathInput(); }
   });
   window.addEventListener('focus', loadDrives);   // 插拔 U 盘等场景重新枚举
   loadDrives();
@@ -1336,14 +1416,14 @@ function switchScope(picked){
   if(fsInp) fsInp.value = '';
   prevCacheLoaded = false; prevCache = null;   // 历史对比基线按新范围重读
   ensurePcRoot();
-  window.rootInput.value = window.ROOT;
+  syncPathControls();
   volUsed = 0; volTotal = 0;
   loadDrives();                        // 卷已用/容量跟随新范围
   var rootKey = String(window.ROOT).toLowerCase();
   var rootNode = store.get(rootKey);
   var hasData = isMultiRoot()
-    ? (function(){ var s = rootsSummary(); return s.s > 0; })()
-    : !!(rootNode && rootNode.s > 0);
+    ? ROOTS.every(function(root){ var n = store.get(root.toLowerCase()); return n && n.done; })
+    : !!(rootNode && rootNode.done);
   var place = isMultiRoot() ? '全部磁盘' : String(window.ROOT);
   var at = scopeAt[curScopeKey()];
   if(hasData){
@@ -1357,10 +1437,50 @@ function switchScope(picked){
 
 /* ===== 开始扫描：输入框/盘符下拉/「全部磁盘」共用 ===== */
 var drivesCache = [];   // loadDrives 枚举的卷列表（「全部磁盘」的 roots 来源）
+var pathInControls;
+
+function pathFromControls(){
+  var mount = document.getElementById('root-drives').value;
+  if(mount===THISPC) return THISPC;
+  var input = window.rootInput.value.trim().replace(/\//g,'\\');
+  var absolute = input.match(/^[a-z]:(?:\\|$)/i);
+  if(absolute){
+    mount = input.slice(0,2).toUpperCase()+'\\';
+    input = input.slice(2);
+  }
+  if(!mount || input.startsWith('\\\\') || /[:*?"<>|\x00-\x1f]/.test(input)) return null;
+  var segments = [];
+  for(var part of input.split('\\')){
+    if(!part || part==='.') continue;
+    if(part==='..'){
+      if(!segments.length) return null;
+      segments.pop();
+    } else {
+      segments.push(part);
+    }
+  }
+  return mount+segments.join('\\');
+}
+
+function commitPathInput(){
+  if(scanning){ syncPathControls(); return; }
+  var path = pathFromControls();
+  if(!path){ setStatus('请输入有效的盘内路径', 'err'); return; }
+  if(path.toLowerCase()===curPath.toLowerCase()){
+    syncPathControls();
+  } else if(path!==THISPC && inScope(path) && store.has(path.toLowerCase())){
+    var node = store.get(path.toLowerCase());
+    if(node.f){ setStatus('请输入文件夹路径', 'err'); return; }
+    navigate(node.p);
+  } else {
+    switchScope(path);
+  }
+}
+
 function startScan(){
   if (scanning) { setStatus('扫描进行中——请先「停止」再切换扫描范围', 'err'); return; }
-  var picked = window.rootInput.value || 'C:\\';
-  if (watchActive) setWatch(false);   // 换范围重扫前先停掉旧监视
+  var picked = pathFromControls();
+  if(!picked){ setStatus('请输入有效的盘内路径', 'err'); return; }
   var roots;
   if (picked === THISPC) {
     roots = drivesCache.map(function(v){ return v.mount; });
@@ -1368,10 +1488,24 @@ function startScan(){
   } else {
     roots = [picked];
   }
-  beginScanUI(roots, false);
-  feed.start(roots);
+  startScanRoots(roots, needsDetailedScan(roots));
+}
+
+function needsDetailedScan(roots){
+  return roots.some(function(path){
+    var node = store.get(path.toLowerCase());
+    return node && node.summarized;
+  });
+}
+
+function startScanRoots(roots, full){
+  if(scanning || localScanning || scanPending){
+    setStatus('已有扫描在进行，请先等它结束或点击「停止」', 'scanning');
+    return;
+  }
+  if(!IN_TAURI) beginScanUI(roots, full);
+  feed.start(roots, full);
   diagLog('info', '开始扫描: ' + roots.join(','));
-  loadDrives();   // 重新枚举卷：volUsed 跟随新扫描范围
 }
 
 /* ===== 盘符下拉：枚举本地卷（复用迁移对话框的 list_volumes） ===== */
@@ -1380,9 +1514,9 @@ function loadDrives(){
     var sel = document.getElementById('root-drives');
     if(!sel) return;
     var list = (vols || []).filter(function (v) { return v.mount && v.mount.length >= 3; });
-    if(!list.length){ sel.style.display = 'none'; return; }   // 枚举失败则隐藏，不占顶栏位置
+    if(!list.length) return;
     drivesCache = list;
-    var html = '<option value="">磁盘…</option>';
+    var html = '';
     if (IN_TAURI && list.length > 1) {
       var totFree = 0, totAll = 0;
       for (var q = 0; q < list.length; q++) { totFree += list[q].free_bytes||0; totAll += list[q].total_bytes||0; }
@@ -1415,14 +1549,21 @@ function loadDrives(){
   });
 }
 
-/* 输入框路径与下拉选中项保持一致；自定义路径时回落到占位项 */
-/* 输入框路径与下拉选中项保持一致；自定义路径时回落到占位项 */
 function syncDrivesSelect(){
   var sel = document.getElementById('root-drives');
-  if(!sel || sel.style.display === 'none') return;
-  var cur = (isMultiRoot() ? THISPC : String(window.ROOT||'')).toUpperCase();
-  sel.selectedIndex = 0;
-  for (var i = 0; i < sel.options.length; i++) {
-    if (sel.options[i].value.toUpperCase() === cur) { sel.selectedIndex = i; break; }
+  var mount = curPath===THISPC ? THISPC : String(curPath||window.ROOT).slice(0,3).toUpperCase();
+  var option = Array.from(sel.options).find(function(o){ return o.value.toUpperCase()===mount; });
+  if(!option){
+    option = new Option(mount===THISPC ? '全部磁盘' : mount, mount);
+    sel.add(option);
   }
+  sel.value = option.value;
+}
+
+function syncPathControls(){
+  pathInControls = curPath;
+  syncDrivesSelect();
+  window.rootInput.disabled = curPath===THISPC;
+  window.rootInput.value = curPath===THISPC ? '' : curPath.slice(3);
+  window.rootInput.title = curPath===THISPC ? '全部磁盘' : curPath;
 }

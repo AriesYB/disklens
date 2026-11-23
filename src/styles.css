@@ -22,13 +22,15 @@ body{font:13px/1.5 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
 #brand-glyph{width:23px;height:23px;display:grid;place-items:center;color:#fff;flex:none;
   background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:7px;
   box-shadow:0 2px 8px rgba(76,194,255,.35)}
-#root-input{flex:0 1 380px;min-width:120px;background:#0f141d;border:1px solid var(--line);border-radius:8px;
+#root-location{display:flex;align-items:stretch;flex:0 1 630px;min-width:0}
+#root-input{flex:1;min-width:0;background:#0f141d;border:1px solid var(--line);border-radius:0 8px 8px 0;
   color:var(--text);padding:7px 12px;font:13px var(--mono);outline:none;transition:border-color .15s,box-shadow .15s}
 #root-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(76,194,255,.14)}
-#root-drives{flex:none;max-width:250px;background:#0f141d;border:1px solid var(--line);border-radius:8px;
+#root-drives{flex:0 1 250px;min-width:84px;max-width:50%;margin-right:-1px;background:#0f141d;border:1px solid var(--line);border-radius:8px 0 0 8px;
   color:var(--text);padding:7px 8px;font:13px var(--mono);outline:none;cursor:pointer;
   transition:border-color .15s,box-shadow .15s}
 #root-drives:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(76,194,255,.14)}
+#root-location :focus{position:relative;z-index:1}
 #root-drives option{background:#0f141d;color:var(--text)}
 button{font:12.5px/1 "Segoe UI",system-ui,sans-serif;border-radius:8px;border:1px solid var(--line);
   background:#1b2330;color:#cfd8e3;padding:8px 14px;cursor:pointer;white-space:nowrap;
@@ -338,6 +340,15 @@ body[data-view="diff"] #diff{display:block}
 #ai-close{padding:2px 10px;font-size:13px;border-radius:6px}
 #ai-src{font-family:var(--mono);font-size:12px;color:#9fc6ea;background:#0f141d;border:1px solid var(--line);
   border-radius:8px;padding:8px 10px;margin-bottom:12px;word-break:break-all;user-select:text}
+#ai-scope-add{font-family:var(--mono);font-size:12px;color:#9fc6ea;background:#1a2130;
+  border:1px solid #2c3646;border-radius:6px;padding:3px 6px;margin-left:4px;vertical-align:middle}
+.ai-scope-chip{display:inline-flex;align-items:center;gap:2px;font-family:var(--mono);font-size:12px;
+  color:#9fc6ea;background:#1a2130;border:1px solid #2c3646;border-radius:6px;
+  padding:3px 4px 3px 8px;margin:1px 4px 1px 0;vertical-align:middle}
+.ai-scope-chip .ai-scope-x{background:none;border:none;color:#7d8ca3;font-size:13px;line-height:1;
+  padding:0 4px;cursor:pointer;border-radius:4px}
+.ai-scope-chip .ai-scope-x:hover{color:#ff8b8b;background:#2a1c1c}
+.ai-scope-hint{color:var(--muted)}
 .ai-card{background:#1a2130;border:1px solid #2c3646;border-radius:9px;padding:10px 12px;margin:8px 0}
 .ai-card-t{font-size:13px;font-weight:600;color:#cfe3f8;margin-bottom:4px}
 .ai-card-s{font-size:12px;color:var(--muted);line-height:1.6}
@@ -408,6 +419,13 @@ body[data-view="diff"] #diff{display:block}
 
 /* ===== AI 联动通道（AI 面板内：一行状态 + 高级折叠） ===== */
 #ai-channel{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:12px}
+#ai-scan-settings{margin:0 0 14px}
+.ai-data-choices{display:inline-flex;flex-wrap:wrap;gap:4px;padding:4px;background:#0f141d;border:1px solid var(--line);border-radius:9px}
+.ai-data-choices button{padding:8px 12px;background:transparent;border-color:transparent;color:var(--muted)}
+.ai-data-choices button:hover{background:#202b3c;color:var(--text)}
+.ai-data-choices button[aria-pressed="true"]{background:#203a58;border-color:#456990;color:#e4f2ff}
+#ai-scan-settings[hidden],#ai-actions button[hidden]{display:none}
+.l-pages{padding:6px 10px;color:var(--muted);font-size:12px}
 .ai-ch-status{color:rgba(74,222,128,.85)}
 .ai-ch-status.off{color:var(--dim)}
 .ai-ch-status.err{color:#f3b0b0}
@@ -464,6 +482,9 @@ body[data-view="diff"] #diff{display:block}
 .pr-sub .reason{color:#b9c6d8}
 .pr-st{margin-top:4px;padding-left:26px;font-size:11.5px}
 .pr-st.run{color:var(--amber)}
+.pr-st progress{display:block;width:100%;height:7px;margin:5px 0;accent-color:var(--amber)}
+.pr-st progress[hidden]{display:none}
+.pr-current{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left;font-family:var(--mono)}
 .pr-st.ok{color:rgba(74,222,128,.85)}
 .pr-st.err{color:#f3b0b0}
 .pr-st.skip{color:var(--dim)}
