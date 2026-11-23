@@ -382,8 +382,10 @@ function renderProposal(){
               : '<span class="pr-badge note">📝 说明</span>';
     var node = store.get(String(it.src||'').toLowerCase());
     var size = node ? fmt(node.s) : (it.est_bytes ? fmt(it.est_bytes) : '');
+    // 迁移默认勾选；清理默认不勾（由用户主动勾选，按钮文案随勾选实时刷新）；说明项不可执行
     var cb = act==='migrate' ? '<input type="checkbox" class="pr-cb" data-i="'+i+'" checked>'
-                             : '<span style="display:inline-block;width:13px"></span>';
+              : act==='cleanup' ? '<input type="checkbox" class="pr-cb" data-i="'+i+'" title="勾选后随「执行」一并移入回收站">'
+              : '<span style="display:inline-block;width:13px"></span>';
     var actBtns = '';
     if (it.src) {
       actBtns += '<button class="pr-loc" data-p="'+escAttr(it.src)+'">📂 定位</button>';
@@ -400,6 +402,24 @@ function renderProposal(){
       +'</div><div class="pr-st" id="pr-st-'+i+'"></div></div>';
   }
   aiChEl('prop-list').innerHTML = html || '<div class="pr-empty">提案没有条目</div>';
+  updateRunBtn();
+}
+
+// 底部按钮文案随勾选实时刷新：展示本次将处理的条目数（迁移几个 / 清理几个）
+function updateRunBtn(){
+  var cbs = document.querySelectorAll('#prop-list .pr-cb');
+  var mig=0, cln=0;
+  for(var c=0;c<cbs.length;c++){
+    if(!cbs[c].checked) continue;
+    var it = (propData && propData.items) ? propData.items[parseInt(cbs[c].dataset.i,10)] : null;
+    if(!it) continue;
+    if((it.action||'note')==='cleanup') cln++; else mig++;
+  }
+  var b = aiChEl('prop-run');
+  var total = mig+cln;
+  b.textContent = !total ? '执行选中的迁移'
+    : '执行选中项（'+mig+' 迁移'+(cln?' · '+cln+' 清理':'')+'）';
+  b.disabled = propRunning ? true : !total;
 }
 
 function prSt(i, cls, text){
@@ -420,7 +440,7 @@ function runProposal(){
   var sel = [];
   var cbs = document.querySelectorAll('#prop-list .pr-cb');
   for(var c=0;c<cbs.length;c++){ if(cbs[c].checked) sel.push(parseInt(cbs[c].dataset.i,10)); }
-  if(!sel.length){ propProg('没有勾选任何迁移项'); return; }
+  if(!sel.length){ propProg('没有勾选任何可执行项'); return; }
   propRunning = true; propAborted = false;
   aiChEl('prop-run').disabled = true;
   aiChEl('prop-reject').disabled = true;
@@ -450,6 +470,24 @@ function runProposal(){
     if(k>=sel.length || propAborted) return finish(propAborted?'aborted':'done');
     var i = sel[k], it = items[i] || {};
     var src = it.src||'', dest = it.dest_root||'';
+    // 清理项：整目录移入系统回收站（可在回收站还原），不走迁移事务
+    if((it.action||'note')==='cleanup'){
+      prSt(i,'run','⟳ 移入回收站…');
+      propProg('第 '+(k+1)+'/'+sel.length+' 项：清理 '+src);
+      feed.recycleDelete([src], function(failed){
+        if(propAborted) return finish('aborted');
+        if(failed && failed.length){
+          prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
+          results.push({src:src,ok:false,error:'回收站删除失败'});
+          failN++; k++; return next();
+        }
+        prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
+        results.push({src:src,ok:true,action:'recycled'});
+        if(feed.scanRefresh) feed.scanRefresh(src);
+        doneN++; k++; return next();
+      });
+      return;
+    }
     prSt(i,'run','⟳ 预检中…');
     propProg('第 '+(k+1)+'/'+sel.length+' 项：预检 '+src);
     feed.migrateCheck(src, dest, function(r){
@@ -536,6 +574,9 @@ function closeProposal(reject){
     propAborted = true;
     propProg('正在停止（当前项完成后结束）…');
     if(feed.migrateStop) feed.migrateStop();
+  });
+  aiChEl('prop-list').addEventListener('change', function(ev){
+    if(ev.target && ev.target.classList && ev.target.classList.contains('pr-cb')) updateRunBtn();
   });
   aiChEl('prop-list').addEventListener('click', function(ev){
     var loc = ev.target.closest('button.pr-loc');
