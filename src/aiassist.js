@@ -120,7 +120,7 @@ function renderAiPanel() {
         }
       }
       chips += '<span class="ai-scope-chip">' + esc(lab) +
-        (scopeRoots.length > 1 ? '<button class="ai-scope-x" data-p="' + escAttr(rp) + '" title="移出分析范围">×</button>' : '') +
+        (scopeRoots.length > 1 ? '<button class="ai-scope-x" data-p="' + escAttr(rp) + dlText('" title="移出分析范围">×</button>') : '') +
         '</span>';
     }
     var rest = '';
@@ -132,9 +132,9 @@ function renderAiPanel() {
       if (!hit) rest += '<option value="' + escAttr(dm) + '">' + esc(dm + (drives[ri].label ? ' ' + drives[ri].label : '')) + '</option>';
     }
     var adder = rest && scopeRoots.every(function(path){ return /^[a-z]:\\$/i.test(path); })
-      ? '<select id="ai-scope-add" title="添加分析范围"><option value="">＋ 添加盘…</option>' + rest + '</select>'
+      ? dlText('<select id="ai-scope-add" title="添加分析范围"><option value="">＋ 添加盘…</option>') + rest + '</select>'
       : '';
-    el('ai-src').innerHTML = '分析范围：' + chips + adder;
+    el('ai-src').innerHTML = dlText('分析范围：') + chips + adder;
     var xBtns = el('ai-src').querySelectorAll('button.ai-scope-x');
     for (var xb = 0; xb < xBtns.length; xb++) {
       xBtns[xb].addEventListener('click', function(){
@@ -220,16 +220,16 @@ function renderAiPanel() {
         '· 官方配置重定向类（GRADLE_USER_HOME、PIP_CACHE_DIR、Docker/WSL 数据盘等）一律放 note 项写清改法，不要提议 migrate。';
       if (aiPath) {
         prompt += '\n\n本次重点关注：「' + aiPath + '」' +
-          (kbHit ? '（识别为 ' + kbHit.tool + '）' : '') +
+          (kbHit ? '（识别为 ' + kbHit.tool + dlText('）') : '') +
           (node && node.s > 0 ? '，约 ' + fmt(node.s) : '') + '。';
       }
       prompt += '\n执行结果：curl -s ' + hd + ' ' + base + '/api/proposal?id=<POST 返回的 id> 轮询（多盘提案并存，必带 id）。';
     }
   } else {
     // skill 场景：单目录深度处理（AI 自己动手：重定向 / 配置 / 清理台账）
-    el('ai-prompt-label').textContent = '复制指令发给已装 c-relocator skill 的 AI 助手：';
+    el('ai-prompt-label').textContent = dlText('复制指令发给已装 c-relocator skill 的 AI 助手：');
     if (!aiPath) {
-      el('ai-body').innerHTML = '<div class="ai-card"><div class="ai-card-t">未选定目录</div>' +
+      el('ai-body').innerHTML = dlText('<div class="ai-card"><div class="ai-card-t">未选定目录</div>') +
         '<div class="ai-card-s">深度处理针对单个目录——请先在方块/列表视图里右键一个目录再进此场景。</div></div>';
       el('ai-prompt').textContent = '';
       el('ai-prompt-wrap').style.display = 'none';
@@ -260,7 +260,7 @@ function renderAiPanel() {
       prompt = '「' + aiPath + '」属于 ' + kbHit.tool + ' 的数据，官方迁移方式：' + kbHit.via +
         '。请协助我完成迁移（不要直接搬目录）。';
     } else {
-      var via = kbHit ? ('该目录属于 ' + kbHit.tool + '，优先走官方重定向（' + kbHit.via + '）')
+      var via = kbHit ? ('该目录属于 ' + kbHit.tool + '，优先走官方重定向（' + kbHit.via + dlText('）'))
                   : '优先检查所属软件是否支持官方改路径/重定向';
       prompt = '请使用 c-relocator skill 迁移「' + aiPath + '」到剩余空间最大的 NTFS 盘：'
         + via + '；无法重定向的部分用 NTFS junction 兜底；'
@@ -334,21 +334,21 @@ function refreshAiChannel(){
   var tgl = aiChEl('ai-ch-enabled');
   if(!IN_TAURI){
     url.textContent='—'; tok.textContent='—'; tgl.checked=false; tgl.disabled=true;
-    st.textContent='🔌 浏览器模式不可用'; st.className='ai-ch-status off';
+    st.textContent=dlText('🔌 浏览器模式不可用'); st.className='ai-ch-status off';
     return;
   }
   feed.aiChannelInfo(function(info){
     if(!info || !info.port){
       url.textContent='—'; tok.textContent='—';
-      st.textContent='🔌 通道未启动'; st.className='ai-ch-status err';
+      st.textContent=dlText('🔌 通道未启动'); st.className='ai-ch-status err';
       return;
     }
     aiChInfo = info;
     url.textContent='http://127.0.0.1:'+info.port;
     tok.textContent=info.token;
     tgl.checked=!!info.enabled; tgl.disabled=false;
-    if(!info.enabled){ st.textContent='🔌 已停用'; st.className='ai-ch-status off'; }
-    else { st.textContent='🔌 已就绪 · 读取已有结果'; st.className='ai-ch-status ok'; }
+    if(!info.enabled){ st.textContent=dlText('🔌 已停用'); st.className='ai-ch-status off'; }
+    else { st.textContent=dlText('🔌 已就绪 · 读取已有结果'); st.className='ai-ch-status ok'; }
     // 通道端点就绪后刷新提示词。
     if (aiMode === 'scan' && document.getElementById('ai-mask').style.display !== 'none') renderAiPanel();
   });
@@ -360,18 +360,18 @@ function refreshAiChannel(){
     if (IN_TAURI && feed.aiChannelSetEnabled) feed.aiChannelSetEnabled(on);
     var st = aiChEl('ai-ch-status');
     if(aiChInfo){ aiChInfo.enabled = on; }
-    if(!on){ st.textContent='🔌 已停用'; st.className='ai-ch-status off'; }
-    else { st.textContent='🔌 已就绪 · 读取已有结果'; st.className='ai-ch-status ok'; }
+    if(!on){ st.textContent=dlText('🔌 已停用'); st.className='ai-ch-status off'; }
+    else { st.textContent=dlText('🔌 已就绪 · 读取已有结果'); st.className='ai-ch-status ok'; }
   });
   // 轮换令牌：旧令牌立即失效，已发给 AI 的接入信息要重新复制
   aiChEl('ai-ch-rotate').addEventListener('click', function(){
     if(!IN_TAURI || !feed.aiChannelRotateToken) return;
-    if(!window.confirm('确定换新令牌？\n旧令牌立即失效，之前发给 AI 助手的接入信息需要重新复制。')){
+    if(!window.confirm(dlText('确定换新令牌？\n旧令牌立即失效，之前发给 AI 助手的接入信息需要重新复制。'))){
       return;
     }
     feed.aiChannelRotateToken(function(){
       refreshAiChannel();
-      setStatus('已生成新令牌（已自动写盘，重启后不变）——请重新复制通道接入信息', 'done');
+      setStatus(dlText('已生成新令牌（已自动写盘，重启后不变）——请重新复制通道接入信息'), 'done');
     });
   });
   aiChEl('ai-ch-copy').addEventListener('click', function(){
@@ -380,7 +380,7 @@ function refreshAiChannel(){
     var txt='DiskLens AI 联动通道\n端点: '+b+'\n令牌: '+aiChInfo.token+
       '\n示例: curl -s -H "X-DiskLens-Token: '+aiChInfo.token+'" "'+b+'/api/tree?depth=3"（响应几 KB，直接读 stdout）';
     copyPath(txt,null);
-    setStatus('已复制通道接入信息','done');
+    setStatus(dlText('已复制通道接入信息'),'done');
   });
 })();
 
@@ -410,7 +410,7 @@ function renderPropTabs(){
     var q = pend[i];
     var act = (propData && propData.id===q.id) ? ' active' : '';
     html += '<button class="prop-tab'+act+'" data-id="'+escAttr(String(q.id||''))+'">'+
-      esc(propScopeLabel(q)||'通用')+'（'+(q.items||[]).length+'项）</button>';
+      esc(propScopeLabel(q)||dlText('通用'))+'（'+(q.items||[]).length+'项）</button>';
   }
   el.innerHTML = html;
   el.style.display = 'flex';
@@ -424,8 +424,8 @@ function updatePropFab(){
   if(pend.length){
     b.style.display = 'flex';
     document.getElementById('prop-fab-n').textContent = pend.length > 1 ? String(pend.length) : '';
-    var names = pend.map(function(q){ return propScopeLabel(q)||'通用'; }).join('、');
-    b.title = 'AI 提案待确认：' + names + ' —— 点击打开确认面板';
+    var names = pend.map(function(q){ return propScopeLabel(q)||dlText('通用'); }).join('、');
+    b.title = dlText('AI 提案待确认：') + names + dlText(' —— 点击打开确认面板');
   } else {
     b.style.display = 'none';
   }
@@ -443,7 +443,7 @@ function showProposal(p){
   var reopening = !!(propData && propData.id === p.id);
   diagLog('info', (reopening ? '重新打开' : '收到') + ' AI 提案「' + (p.summary||'') + '」（' + (p.items.length||0) + ' 项）');
   if(propRunning){   // 正在执行上一批：不弹面板，提案留在队列（状态栏 chip 可见）
-    setStatus('收到新 AI 提案，但当前批次执行中——完成后可从状态栏「待确认」打开','err');
+    setStatus(dlText('收到新 AI 提案，但当前批次执行中——完成后可从状态栏「待确认」打开'),'err');
     return;
   }
   propData = p;
@@ -480,19 +480,19 @@ function renderProposal(){
   for(var i=0;i<items.length;i++){
     var it = items[i] || {};
     var act = it.action || 'note';
-    var badge = act==='migrate' ? '<span class="pr-badge migrate">📦 迁移</span>'
-              : act==='cleanup' ? '<span class="pr-badge cleanup">🧹 清理建议</span>'
-              : '<span class="pr-badge note">📝 说明</span>';
+    var badge = act==='migrate' ? dlText('<span class="pr-badge migrate">📦 迁移</span>')
+              : act==='cleanup' ? dlText('<span class="pr-badge cleanup">🧹 清理建议</span>')
+              : dlText('<span class="pr-badge note">📝 说明</span>');
     var node = store.get(String(it.src||'').toLowerCase());
     var size = node ? fmt(node.s) : (it.est_bytes ? fmt(it.est_bytes) : '');
     // 迁移默认勾选；清理默认不勾（由用户主动勾选，按钮文案随勾选实时刷新）；说明项不可执行
     var cb = act==='migrate' ? '<input type="checkbox" class="pr-cb" data-i="'+i+'" checked>'
-              : act==='cleanup' ? '<input type="checkbox" class="pr-cb" data-i="'+i+'" title="勾选后随「执行」一并移入回收站">'
+              : act==='cleanup' ? '<input type="checkbox" class="pr-cb" data-i="'+i+dlText('" title="勾选后随「执行」一并移入回收站">')
               : '<span style="display:inline-block;width:13px"></span>';
     var actBtns = '';
     if (it.src) {
-      actBtns += '<button class="pr-loc" data-p="'+escAttr(it.src)+'">📂 定位</button>';
-      if (act==='cleanup') actBtns += '<button class="pr-recycle" data-i="'+i+'" title="移入 Windows 系统回收站（可在回收站还原，勿随手清空回收站）">🗑 移入回收站</button>';
+      actBtns += '<button class="pr-loc" data-p="'+escAttr(it.src)+dlText('">📂 定位</button>');
+      if (act==='cleanup') actBtns += '<button class="pr-recycle" data-i="'+i+dlText('" title="移入 Windows 系统回收站（可在回收站还原，勿随手清空回收站）">🗑 移入回收站</button>');
     }
     html+='<div class="pr-row">'
       +'<div class="pr-top">'+cb+badge
@@ -500,11 +500,11 @@ function renderProposal(){
       +(size?'<span class="pr-size">'+size+'</span>':'')
       +'<span class="pr-act">'+actBtns+'</span>'
       +'</div><div class="pr-sub">'
-      +(act==='migrate'&&it.dest_root?'<div>目标：<span class="dest">'+esc(it.dest_root)+'</span></div>':'')
-      +(it.reason?'<div class="reason">理由：'+esc(it.reason)+'</div>':'')
+      +(act==='migrate'&&it.dest_root?dlText('<div>目标：<span class="dest">')+esc(it.dest_root)+'</span></div>':'')
+      +(it.reason?dlText('<div class="reason">理由：')+esc(it.reason)+'</div>':'')
       +'</div><div class="pr-st" id="pr-st-'+i+'"></div></div>';
   }
-  aiChEl('prop-list').innerHTML = html || '<div class="pr-empty">提案没有条目</div>';
+  aiChEl('prop-list').innerHTML = html || dlText('<div class="pr-empty">提案没有条目</div>');
   updateRunBtn();
 }
 
@@ -520,8 +520,8 @@ function updateRunBtn(){
   }
   var b = aiChEl('prop-run');
   var total = mig+cln;
-  b.textContent = !total ? '执行选中的迁移'
-    : '执行选中项（'+mig+' 迁移'+(cln?' · '+cln+' 清理':'')+'）';
+  b.textContent = !total ? dlText('执行选中的迁移')
+    : dlText('执行选中项（')+mig+dlText(' 迁移')+(cln?' · '+cln+dlText(' 清理'):'')+dlText('）');
   b.disabled = propRunning ? true : !total;
 }
 
@@ -597,14 +597,14 @@ function recycleProposalItem(i, src, cb){
 function runProposal(){
   if(!propData || propRunning) return;
   if(typeof migRunning!=='undefined' && migRunning){
-    propProg('⛔ 迁移对话框正在执行——请先等它完成或关闭');
+    propProg(dlText('⛔ 迁移对话框正在执行——请先等它完成或关闭'));
     return;
   }
   var items = propData.items || [];
   var sel = [];
   var cbs = document.querySelectorAll('#prop-list .pr-cb');
   for(var c=0;c<cbs.length;c++){ if(cbs[c].checked) sel.push(parseInt(cbs[c].dataset.i,10)); }
-  if(!sel.length){ propProg('没有勾选任何可执行项'); return; }
+  if(!sel.length){ propProg(dlText('没有勾选任何可执行项')); return; }
   propRunning = true; propAborted = false;
   aiChEl('prop-run').disabled = true;
   aiChEl('prop-reject').disabled = true;
@@ -618,7 +618,7 @@ function runProposal(){
     window.__migHandler = null;
     aiChEl('prop-stop').style.display = 'none';
     aiChEl('prop-close').disabled = false;
-    propProg('完成：✓ '+doneN+' 成功 · ⛔ '+failN+' 失败'+(propAborted?' · 已手动停止':'')
+    propProg(dlText('完成：✓ ')+doneN+dlText(' 成功 · ⛔ ')+failN+dlText(' 失败')+(propAborted?dlText(' · 已手动停止'):'')
       +'（结果已回传，AI 可经 /api/proposal 查询）');
     // 整批执行结果 + 行级操作（回收站/撤销）累积结果一并回传
     var all = results.concat(propResults);
@@ -640,11 +640,11 @@ function runProposal(){
       propProg('第 '+(k+1)+'/'+sel.length+' 项：清理 '+src);
       recycleProposalItem(i, src, function(failed){
         if(failed && failed.length){
-          prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
+          prSt(i,'err',dlText('⛔ 移入回收站失败（文件被占用？）'));
           results.push({src:src,ok:false,error:'回收站删除失败'});
           failN++; k++; return next();
         }
-        prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
+        prSt(i,'ok',dlText('🗑 已移入回收站（可在回收站还原）'));
         results.push({src:src,ok:true,action:'recycled'});
         doneN++; k++; return next();
       });
@@ -653,8 +653,8 @@ function runProposal(){
     propItemProgress(i,'预检中',null,src);
     propProg('第 '+(k+1)+'/'+sel.length+' 项：预检 '+src);
     feed.migrateCheck(src, dest, function(r){
-      if(propAborted){ prSt(i,'skip','已停止'); return finish('aborted'); }
-      if(!r){ prSt(i,'err','⛔ 预检失败'); results.push({src:src,ok:false,error:'预检失败'});
+      if(propAborted){ prSt(i,'skip',dlText('已停止')); return finish('aborted'); }
+      if(!r){ prSt(i,'err',dlText('⛔ 预检失败')); results.push({src:src,ok:false,error:'预检失败'});
         failN++; k++; return next(); }
       if(!r.ok){
         var msg=(r.blockers||[]).join('；')||'预检未通过';
@@ -664,7 +664,7 @@ function runProposal(){
       propItemProgress(i,'准备迁移',null,src);
       window.__migHandler = function(ev){
         if(ev.stage==='copy'||ev.stage==='verify'||ev.stage==='switch'){
-          var ph = ev.stage==='copy'?'复制':(ev.stage==='verify'?'校验':'切换 junction');
+          var ph = ev.stage==='copy'?dlText('复制'):(ev.stage==='verify'?dlText('校验'):'切换 junction');
           var pct = ev.stage!=='copy' ? null :
             ev.bytes_total>0 ? Math.min(100,ev.bytes_done/ev.bytes_total*100) :
             ev.files_total>0 ? Math.min(100,ev.files_done/ev.files_total*100) : null;
@@ -674,7 +674,7 @@ function runProposal(){
           return;
         }
         if(ev.stage==='done'){
-          prSt(i,'ok','✓ 迁移完成（原位置已建 junction）· 建议先验证相关软件可用，确认后再决定是否撤销');
+          prSt(i,'ok',dlText('✓ 迁移完成（原位置已建 junction）· 建议先验证相关软件可用，确认后再决定是否撤销'));
           // 完成行给出撤销入口（验证可用后可一键回迁；数据仍需人工确认才删）
           var stEl = document.getElementById('pr-st-'+i);
           if(stEl) stEl.innerHTML = '✓ 迁移完成 · 建议先验证相关软件可用 <button class="pr-undo" data-i="'+i+'" style="padding:2px 8px;font-size:11px;margin-left:6px">↩ 撤销迁移</button>';
@@ -739,7 +739,7 @@ function closeProposal(reject){
   });
   aiChEl('prop-stop').addEventListener('click', function(){
     propAborted = true;
-    propProg('正在停止（当前项完成后结束）…');
+    propProg(dlText('正在停止（当前项完成后结束）…'));
     if(window.__migHandler && feed.migrateStop) feed.migrateStop();
   });
   aiChEl('prop-list').addEventListener('change', function(ev){
@@ -751,21 +751,21 @@ function closeProposal(reject){
     // 撤销迁移（行级）：验证相关软件没问题后，删 junction 并把数据搬回原位
     var undo = ev.target.closest('button.pr-undo');
     if(undo){
-      if(propRunning){ prSt(parseInt(undo.dataset.i,10)||0,'err','当前批次执行中，稍后再撤销'); return; }
+      if(propRunning){ prSt(parseInt(undo.dataset.i,10)||0,'err',dlText('当前批次执行中，稍后再撤销')); return; }
       var ui = parseInt(undo.dataset.i, 10);
       var uit = (propData && propData.items) ? propData.items[ui] : null;
       if(!uit || !uit.src || !uit.dest_root) return;
       undo.disabled = true;
-      prSt(ui,'run','⟳ 撤销迁移中…');
+      prSt(ui,'run',dlText('⟳ 撤销迁移中…'));
       window.__migHandler = function(ev){
         var pct = ev.bytes_total>0 ? Math.round(ev.bytes_done/ev.bytes_total*100) : 100;
         if(ev.stage==='copy'||ev.stage==='verify'||ev.stage==='switch'){
-          var ph = ev.stage==='copy'?'回移':(ev.stage==='verify'?'校验':'恢复目录');
+          var ph = ev.stage==='copy'?'回移':(ev.stage==='verify'?dlText('校验'):'恢复目录');
           prSt(ui,'run','⟳ 撤销·'+ph+'… '+pct+'%'+(ev.current?' · '+ev.current:''));
           return;
         }
         if(ev.stage==='done'){
-          prSt(ui,'ok','↩ 撤销完成：数据已回到原位（目标侧已清理）');
+          prSt(ui,'ok',dlText('↩ 撤销完成：数据已回到原位（目标侧已清理）'));
           resultsPush(propData.id, {src:uit.src, ok:true, action:'undo'});
           if(feed.scanRefresh){ feed.scanRefresh(uit.src); feed.scanRefresh(uit.dest_root); }
           window.__migHandler = null;
@@ -796,10 +796,10 @@ function closeProposal(reject){
         aiChEl('prop-close').disabled = false;
         aiChEl('prop-reject').disabled = false;
         rc.disabled = !failed.length;
-        if(failed.length){ prSt(i,'err','⛔ 移入回收站失败（文件被占用？）');
+        if(failed.length){ prSt(i,'err',dlText('⛔ 移入回收站失败（文件被占用？）'));
           resultsPush(propData.id, {src:it.src, ok:false, error:'回收站删除失败'}); }
         else{
-          prSt(i,'ok','🗑 已移入回收站（可在回收站还原）');
+          prSt(i,'ok',dlText('🗑 已移入回收站（可在回收站还原）'));
           resultsPush(propData.id, {src:it.src, ok:true, action:'recycled'});
         }
       });

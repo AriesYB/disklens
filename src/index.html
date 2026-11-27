@@ -20,6 +20,10 @@
       <button id="stop-btn" disabled>停止</button>
       <button id="ai-bar-btn" title="让 AI 根据当前路径的扫描数据给出迁移或清理提案">🤖 AI 分析</button>
       <span id="status">就绪</span>
+      <select id="app-language" aria-label="界面语言" title="界面语言">
+        <option value="zh-CN" lang="zh-CN">简体中文</option>
+        <option value="en" lang="en">English</option>
+      </select>
     </header>
 
     <div id="viewbar">
@@ -287,6 +291,7 @@
       </div>
     </div>
 
+    <script src="/i18n.js"></script>
     <script src="/treemap.js?v=0.21"></script>
     <script src="/listview.js?v=0.13"></script>
     <script src="/migrate.js?v=0.14"></script>

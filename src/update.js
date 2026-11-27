@@ -30,7 +30,7 @@
       try {
         var scanningNow = document.body.classList.contains('scanning');
         if (!scanningNow && typeof lastStatusMsg !== 'undefined') setStatus(lastStatusMsg, lastStatusCls);
-        else setStatus('就绪', 'done');
+        else setStatus(dlText('就绪'), 'done');
       } catch (_) {}
     }, 4000);
   }
@@ -44,31 +44,31 @@
 
   /* ===== 检查入口 ===== */
   function checkForUpdate(manual) {
-    if (!TAURI || checking || installing) { if (manual) flashStatus('正在检查中…'); return; }
+    if (!TAURI || checking || installing) { if (manual) flashStatus(dlText('正在检查中…')); return; }
     checking = true;
-    if (manual) setBtnState('检查中…', true);
+    if (manual) setBtnState(dlText('检查中…'), true);
 
     window.__TAURI__.updater.check({ timeout: 15000 }).then(function (update) {
       checking = false;
-      setBtnState('⟳ 检查更新', false);
+      setBtnState(dlText('⟳ 检查更新'), false);
       if (!update) {
-        if (manual) flashStatus('✓ 已是最新版本', 'done');
+        if (manual) flashStatus(dlText('✓ 已是最新版本'), 'done');
         return;
       }
       diagLog('info', '发现新版本 v' + update.version + '（current=' + update.currentVersion + '）');
       showUpdate(update);
     }).catch(function (e) {
       checking = false;
-      setBtnState('⟳ 检查更新', false);
+      setBtnState(dlText('⟳ 检查更新'), false);
       // 启动静默检查失败不打扰；手动检查才提示（多为断网/服务器未就绪）
-      if (manual) flashStatus('检查更新失败：' + String(e).slice(0, 80), 'err');
+      if (manual) flashStatus(dlText('检查更新失败：') + String(e).slice(0, 80), 'err');
     });
   }
 
   function showUpdate(update) {
     $('upd-ver').textContent = 'v' + update.version;
     var notes = (update.body || '').trim();
-    $('upd-notes').textContent = notes || '性能优化与问题修复。';
+    $('upd-notes').textContent = notes || dlText('性能优化与问题修复。');
     $('upd-prog').style.display = 'none';
     $('upd-actions').style.display = 'flex';
     $('upd-later').style.display = '';
@@ -80,7 +80,7 @@
       installing = true;
       $('upd-actions').style.display = 'none';
       $('upd-prog').style.display = '';
-      $('upd-stage').textContent = '下载中…';
+      $('upd-stage').textContent = dlText('下载中…');
       $('upd-fill').style.width = '0';
       update.downloadAndInstall(function (ev) {
         if (ev.event === 'Started' && ev.data.contentLength) {
@@ -92,11 +92,11 @@
           var next = total > 0 ? Math.min(99, cur + 100 * ev.data.chunkLength / total) : Math.min(99, cur + 1.5);
           $('upd-fill').style.width = next.toFixed(1) + '%';
         } else if (ev.event === 'Finished') {
-          $('upd-stage').textContent = '安装中…（完成后自动重启）';
+          $('upd-stage').textContent = dlText('安装中…（完成后自动重启）');
           $('upd-fill').style.width = '100%';
         }
       }).then(function () {
-        $('upd-stage').textContent = '更新完成，正在重启…';
+        $('upd-stage').textContent = dlText('更新完成，正在重启…');
         diagLog('info', '更新下载完成，重启安装');
         // 自定义重启：新进程带 --no-focus，窗口回来时不抢用户正在用的前台应用
         window.__TAURI__.core.invoke('relaunch_no_focus').catch(function () {
@@ -107,7 +107,7 @@
         $('upd-stage').textContent = '';
         $('upd-prog').style.display = 'none';
         $('upd-actions').style.display = 'flex';
-        $('upd-err').textContent = '更新失败：' + String(e).slice(0, 120);
+        $('upd-err').textContent = dlText('更新失败：') + String(e).slice(0, 120);
         $('upd-err').style.display = '';
         diagLog('error', '更新安装失败: ' + String(e).slice(0, 300));
       });
@@ -119,8 +119,8 @@
     if (!TAURI) return;   // 浏览器模式：不注入入口、不检查
     var btn = document.createElement('button');
     btn.id = 'upd-btn';
-    btn.title = '检查 DiskLens 新版本';
-    btn.textContent = '⟳ 检查更新';
+    btn.title = dlText('检查 DiskLens 新版本');
+    btn.textContent = dlText('⟳ 检查更新');
     btn.addEventListener('click', function () { checkForUpdate(true); });
     $('appbar').insertBefore(btn, $('status'));
 

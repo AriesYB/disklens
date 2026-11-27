@@ -11,7 +11,7 @@ test.describe('DiskLens 浏览器冒烟', () => {
   let page;
 
   test.beforeAll(async ({ browser }) => {
-    page = await browser.newPage();
+    page = await browser.newPage({ locale: 'zh-CN' });
     await page.goto('/');
     await waitScanDone(page);
   });

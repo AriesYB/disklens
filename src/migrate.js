@@ -27,12 +27,12 @@ function migrationGuidance(paths) {
       var g = migGuidanceMap[j];
       if (g.re.test(paths[i]) && !seen[g.t]) {
         seen[g.t] = 1;
-        cards.push('<div class="mig-card"><div class="mig-card-t">💡 ' + esc(g.t) + ' —— 请到软件里改</div><div class="mig-card-s">' + esc(g.s) + '</div></div>');
+        cards.push('<div class="mig-card"><div class="mig-card-t">💡 ' + esc(dlText(g.t)) + dlText(' —— 请到软件里改</div><div class="mig-card-s">') + esc(dlText(g.s)) + '</div></div>');
       }
     }
   }
   if (!cards.length) {
-    cards.push('<div class="mig-card"><div class="mig-card-t">💡 文件被程序占用 —— 关闭程序后重试</div><div class="mig-card-s">下列文件正被某个程序使用。关闭占用它们的程序（或直接退出该软件）后点「重试」。若该软件把数据写死在此路径且无法关闭，请到该软件的设置里修改存储位置（多数软件支持自定义数据目录）。</div></div>');
+    cards.push(dlText('<div class="mig-card"><div class="mig-card-t">💡 文件被程序占用 —— 关闭程序后重试</div><div class="mig-card-s">下列文件正被某个程序使用。关闭占用它们的程序（或直接退出该软件）后点「重试」。若该软件把数据写死在此路径且无法关闭，请到该软件的设置里修改存储位置（多数软件支持自定义数据目录）。</div></div>'));
   }
   return cards.join('');
 }
@@ -46,16 +46,16 @@ function openMigrate(path) {
   el('mig-undo').style.display = 'none';
   el('mig-mask').style.display = 'flex';
   el('mig-src').textContent = path;
-  el('mig-vol').innerHTML = '<option>加载卷…</option>';
+  el('mig-vol').innerHTML = dlText('<option>加载卷…</option>');
   el('mig-vol-info').textContent = '';
   el('mig-dest').textContent = '';
-  el('mig-check').innerHTML = '<div class="mig-note">正在枚举本地卷…</div>';
+  el('mig-check').innerHTML = dlText('<div class="mig-note">正在枚举本地卷…</div>');
   el('mig-prog').style.display = 'none';
   el('mig-locked').style.display = 'none';
   el('mig-locked').innerHTML = '';
   el('mig-start').style.display = '';
   el('mig-start').disabled = true;
-  el('mig-start').textContent = '检查中…';
+  el('mig-start').textContent = dlText('检查中…');
   el('mig-stop').style.display = 'none';
   el('mig-rescan').style.display = 'none';
   el('mig-cancel').disabled = false;
@@ -70,7 +70,7 @@ function openMigrate(path) {
     for (var i = 0; i < migVolumes.length; i++) {
       var v = migVolumes[i];
       html += '<option value="' + escAttr(v.mount) + '">' + esc(v.mount) +
-        '  ' + esc(v.fs || '?') + '  剩余 ' + fmt(v.free_bytes) + '</option>';
+        '  ' + esc(v.fs || '?') + dlText('  剩余 ') + fmt(v.free_bytes) + '</option>';
     }
       el('mig-vol').innerHTML = html;
     migDestDir = '';   // 重开对话框回到卷根选择
@@ -100,7 +100,7 @@ function pickMigrateFolder() {
   if (migChecking || migRunning) return;
   var dlg = window.__TAURI__ && window.__TAURI__.dialog;
   if (!dlg || !dlg.open) return;
-  dlg.open({ directory: true, multiple: false, title: '选择迁移目标文件夹' }).then(function (picked) {
+  dlg.open({ directory: true, multiple: false, title: dlText('选择迁移目标文件夹') }).then(function (picked) {
     if (!picked) return;   // 用户取消
     migDestDir = picked.replace(/\\+$/, '');
     runMigrateCheck();
@@ -113,27 +113,27 @@ function runMigrateCheck() {
   var basename = migSrc.replace(/\\+$/, '').split('\\').pop();
   el('mig-dest').textContent = destRoot.replace(/\\+$/, '') + '\\' + basename;
   el('mig-start').disabled = true;
-  el('mig-start').textContent = '检查中…';
-  el('mig-check').innerHTML = '<div class="mig-note"><span class="spin" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:-3px;margin-right:8px"></span>正在评估：统计体积、检查空间与可迁移性…</div>';
+  el('mig-start').textContent = dlText('检查中…');
+  el('mig-check').innerHTML = dlText('<div class="mig-note"><span class="spin" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:-3px;margin-right:8px"></span>正在评估：统计体积、检查空间与可迁移性…</div>');
   migChecking = true;
   feed.migrateCheck(migSrc, destRoot, function (r) {
     migChecking = false;
-    if (!r) { el('mig-check').innerHTML = '<div class="mig-err">预检失败</div>'; return; }
+    if (!r) { el('mig-check').innerHTML = dlText('<div class="mig-err">预检失败</div>'); return; }
     var html = '';
     for (var i = 0; i < r.blockers.length; i++)
-      html += '<div class="mig-item err">⛔ ' + esc(r.blockers[i]) + '</div>';
+      html += '<div class="mig-item err">⛔ ' + esc(dlNativeText(r.blockers[i])) + '</div>';
     for (var j = 0; j < r.warnings.length; j++)
-      html += '<div class="mig-item warn">⚠ ' + esc(r.warnings[j]) + '</div>';
+      html += '<div class="mig-item warn">⚠ ' + esc(dlNativeText(r.warnings[j])) + '</div>';
     if (r.ok) {
-      var fast = r.same_volume ? '（同卷：rename 瞬时完成）' : '（跨卷：复制 → 校验 → 切换，全程可断点续传）';
-      html += '<div class="mig-item ok">✓ 可以迁移：' + fmt(r.src_bytes) + ' · ' + r.src_files.toLocaleString() + ' 个文件 ' + fast + '</div>';
+      var fast = r.same_volume ? dlText('（同卷：rename 瞬时完成）') : dlText('（跨卷：复制 → 校验 → 切换，全程可断点续传）');
+      html += dlText('<div class="mig-item ok">✓ 可以迁移：') + fmt(r.src_bytes) + ' · ' + r.src_files.toLocaleString() + dlText(' 个文件 ') + fast + '</div>';
     } else {
-      html += '<div class="mig-card"><div class="mig-card-t">💡 无法自动迁移？</div><div class="mig-card-s">系统文件与被程序写死的数据目录不适合 junction 迁移——请到对应软件的设置里修改存储位置（虚拟内存、Docker、WSL、OneDrive、Steam 等常见项的改法见本页指引）。</div></div>';
+      html += dlText('<div class="mig-card"><div class="mig-card-t">💡 无法自动迁移？</div><div class="mig-card-s">系统文件与被程序写死的数据目录不适合 junction 迁移——请到对应软件的设置里修改存储位置（虚拟内存、Docker、WSL、OneDrive、Steam 等常见项的改法见本页指引）。</div></div>');
     }
     el('mig-check').innerHTML = html;
-    el('mig-vol-info').textContent = '目标剩余 ' + fmt(r.dest_free);
+    el('mig-vol-info').textContent = dlText('目标剩余 ') + fmt(r.dest_free);
     el('mig-start').disabled = !r.ok;
-    el('mig-start').textContent = r.ok ? '开始迁移' : '不可迁移';
+    el('mig-start').textContent = r.ok ? dlText('开始迁移') : dlText('不可迁移');
   });
 }
 
@@ -141,7 +141,7 @@ function renderMigProgress(ev) {
   el('mig-prog').style.display = '';
   var pct = ev.bytes_total > 0 ? Math.min(100, ev.bytes_done / ev.bytes_total * 100) : (ev.stage === 'done' ? 100 : 0);
   el('mig-fill').style.width = pct.toFixed(1) + '%';
-  var stageNames = { copy: '复制', verify: '校验', switch: '切换' };
+  var stageNames = { copy: dlText('复制'), verify: dlText('校验'), switch: dlText('切换') };
   var st = stageNames[ev.stage] || '';
   if (ev.stage === 'verify' || ev.stage === 'switch') pct = 100; // 两阶段瞬间完成
   el('mig-stage').textContent = st ? st + '… ' + fmt(ev.bytes_done) + ' / ' + fmt(ev.bytes_total) : ev.message;
@@ -150,13 +150,13 @@ function renderMigProgress(ev) {
 
 function renderMigLocked(ev) {
   el('mig-locked').style.display = '';
-  var html = '<div class="mig-item err">⛔ ' + esc(ev.message) + '</div>';
+  var html = '<div class="mig-item err">⛔ ' + esc(dlNativeText(ev.message)) + '</div>';
   html += migrationGuidance(ev.locked);
   html += '<div class="mig-locked-list">';
   for (var i = 0; i < ev.locked.length && i < 20; i++)
     html += '<div class="mig-mono mig-locked-row">' + esc(ev.locked[i]) + '</div>';
   if (ev.locked.length > 20)
-    html += '<div class="mig-locked-row">…共 ' + ev.locked.length + ' 个</div>';
+    html += dlText('<div class="mig-locked-row">…共 ') + ev.locked.length + dlText(' 个</div>');
   html += '</div>';
   el('mig-locked').innerHTML = html;
 }
@@ -174,12 +174,12 @@ function onMigrateEvent(ev) {
     el('mig-stop').style.display = 'none';
     el('mig-start').style.display = '';
     el('mig-start').disabled = false;
-    el('mig-start').textContent = '重试';
+    el('mig-start').textContent = dlText('重试');
     return;
   }
   if (ev.stage === 'done') {
     renderMigProgress(ev);
-    el('mig-stage').textContent = '✓ ' + ev.message;
+    el('mig-stage').textContent = '✓ ' + dlNativeText(ev.message);
     el('mig-fill').style.width = '100%';
     el('mig-fill').classList.add('ok');
     migRunning = false;
@@ -193,7 +193,7 @@ function onMigrateEvent(ev) {
   }
   if (ev.stage === 'error' || ev.stage === 'aborted') {
     el('mig-prog').style.display = '';
-    el('mig-stage').textContent = (ev.stage === 'error' ? '⛔ ' : '⏹ ') + ev.message;
+    el('mig-stage').textContent = (ev.stage === 'error' ? '⛔ ' : '⏹ ') + dlNativeText(ev.message);
     migRunning = false;
     el('mig-stop').style.display = 'none';
     if (ev.locked && ev.locked.length) {
@@ -204,11 +204,11 @@ function onMigrateEvent(ev) {
         }).join('') + '</div>';
       el('mig-start').style.display = '';
       el('mig-start').disabled = false;
-      el('mig-start').textContent = '重试';
+      el('mig-start').textContent = dlText('重试');
     } else {
       el('mig-start').style.display = '';
       el('mig-start').disabled = ev.stage === 'error' && /不可迁移|系统目录|盘根/.test(ev.message);
-      if (!el('mig-start').disabled) el('mig-start').textContent = '重试';
+      if (!el('mig-start').disabled) el('mig-start').textContent = dlText('重试');
     }
     el('mig-cancel').disabled = false;
   }
@@ -255,7 +255,7 @@ function closeMigrate() {
     el('mig-fill').classList.remove('ok');
     migRunning = true;
     el('mig-cancel').disabled = true;
-    el('mig-stage').textContent = '撤销中…';
+    el('mig-stage').textContent = dlText('撤销中…');
     feed.migrateUndo(migSrc, migSelectedRoot());
     // 进度/结果由 migrate-update 事件流驱动 onMigrateEvent（撤销事件同构）
   });

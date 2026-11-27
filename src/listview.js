@@ -17,14 +17,14 @@ function renderList(node){
   if(!box) return;
   var html='';
   if(stack.length){
-    html+='<div class="l-up" id="l-up">⬅ 返回上一级（'+esc(stack[stack.length-1].name)+'）</div>';
+    html+=dlText('<div class="l-up" id="l-up">⬅ 返回上一级（')+esc(stack[stack.length-1].name)+'）</div>';
   }
   var items=(node.c||[]).slice();
   if(listPagePath!==node.p){ listPage = 0; listPagePath = node.p; }
   if(!items.length){
     html+='<div class="empty"><div class="e-ic">🗂️</div><div>'+
-      (node.summarized?'已汇总大小。点击「开始扫描」查看目录明细。':
-        node.done?'空目录，没有子项':'正在统计子项…')+'</div></div>';
+      (node.summarized?dlText('已汇总大小。点击「开始扫描」查看目录明细。'):
+        node.done?dlText('空目录，没有子项'):dlText('正在统计子项…'))+'</div></div>';
     box.innerHTML=html;
     return;
   }
@@ -40,25 +40,25 @@ function renderList(node){
   listPage = Math.min(listPage,pages-1);
   if(pages>1){
     html+='<div class="l-pages"><button data-list-page="-1"'+(listPage===0?' disabled':'')+
-      '>上一页</button> '+(listPage+1)+' / '+pages+' 页 · '+items.length+
-      ' 项 <button data-list-page="1"'+(listPage===pages-1?' disabled':'')+'>下一页</button></div>';
+      dlText('>上一页</button> ')+(listPage+1)+' / '+pages+dlText(' 页 · ')+items.length+
+      dlText(' 项 <button data-list-page="1"')+(listPage===pages-1?' disabled':'')+dlText('>下一页</button></div>');
   }
   html+='<div class="l-head">'+
-    '<div class="th" data-sort="name">名称'+sortArrow('name')+'</div>'+
-    '<div class="th rt" data-sort="size">大小'+sortArrow('size')+'</div>'+
-    '<div class="th rt">占用</div>'+
-    '<div class="th">占比</div>'+
-    '<div class="th">状态</div></div>';
+    dlText('<div class="th" data-sort="name">名称')+sortArrow('name')+'</div>'+
+    dlText('<div class="th rt" data-sort="size">大小')+sortArrow('size')+'</div>'+
+    dlText('<div class="th rt">占用</div>')+
+    dlText('<div class="th">占比</div>')+
+    dlText('<div class="th">状态</div></div>');
   var first = listPage*LIST_PAGE_SIZE;
   for(var j=first;j<Math.min(first+LIST_PAGE_SIZE,items.length);j++){
     var it=items[j];
     var pct=(tot>0&&it.s>0)?(it.s/tot*100):0;
     // 状态列：受限目录 / 云占位 / 硬链接副本优先于普通就绪标记
-    var st = !it.done ? '⟳ 统计中'
-      : it.denied ? '⛔ 受限'
-      : it.cloud ? '☁ 云端'
-      : it.dup ? '⛓ 硬链接'
-      : '✓ 就绪';
+    var st = !it.done ? dlText('⟳ 统计中')
+      : it.denied ? dlText('⛔ 受限')
+      : it.cloud ? dlText('☁ 云端')
+      : it.dup ? dlText('⛓ 硬链接')
+      : dlText('✓ 就绪');
     var stColor = it.denied ? 'var(--amber)' : it.cloud ? '#7fc7ff' : '';
     html+='<div class="l-row'+(it.done?' done':' counting')+(selectedRow===it.p?' sel':'')+'"'+
       ' data-path="'+escAttr(it.p)+'" data-kind="'+(it.f?'file':'dir')+'">'+
@@ -152,21 +152,21 @@ function renderFiles(){
   var arr=filesPool();
   var cnt=document.getElementById('file-search-count');
   if(cnt) cnt.textContent = fileSearch
-    ? '匹配 '+arr.length+' 项'+(scanning?' · 实时更新中':'')
-    : '共 '+arr.length+' 个 ≥1MB 大文件'+(scanning?' · 实时更新中':'');
+    ? dlText('匹配 ')+arr.length+dlText(' 项')+(scanning?dlText(' · 实时更新中'):'')
+    : dlText('共 ')+arr.length+dlText(' 个 ≥1MB 大文件')+(scanning?dlText(' · 实时更新中'):'');
   var html='<div class="f-meta">'+(fileSearch
-    ? '搜索「'+esc(fileSearch)+'」命中 <b>'+arr.length+'</b> 项（大文件 + 目录名匹配）'
-    : '共 <b>'+arr.length+'</b> 个 ≥1MB 的大文件')+'</div>';
+    ? dlText('搜索「')+esc(fileSearch)+dlText('」命中 <b>')+arr.length+dlText('</b> 项（大文件 + 目录名匹配）')
+    : dlText('共 <b>')+arr.length+dlText('</b> 个 ≥1MB 的大文件'))+'</div>';
   if(!arr.length){
     html+='<div class="empty"><div class="e-ic">📦</div><div>'+
-      (fileSearch?'没有匹配「'+esc(fileSearch)+'」的文件或目录（搜索范围：已入索引的大文件与全部目录）'
-      :(scanning?'扫描中，发现大文件后自动上榜':'本次扫描未发现 ≥1MB 的大文件'))+'</div></div>';
+      (fileSearch?dlText('没有匹配「')+esc(fileSearch)+dlText('」的文件或目录（搜索范围：已入索引的大文件与全部目录）')
+      :(scanning?dlText('扫描中，发现大文件后自动上榜'):dlText('本次扫描未发现 ≥1MB 的大文件')))+'</div></div>';
     box.innerHTML=html;
     return;
   }
   var shown=arr.slice(0,FILES_MAX_ROWS);
-  html+='<div class="f-head"><div>#</div><div>名称</div><div class="f-fsize" style="text-align:right">大小</div>'+
-    '<div>所在位置</div><div></div></div>';
+  html+=dlText('<div class="f-head"><div>#</div><div>名称</div><div class="f-fsize" style="text-align:right">大小</div>')+
+    dlText('<div>所在位置</div><div></div></div>');
   for(var i=0;i<shown.length;i++){
     var n=shown[i];
     var isDir=!n.f;
@@ -178,12 +178,12 @@ function renderFiles(){
       '<span class="nm" title="'+escAttr(n.p)+'">'+esc(n.n)+'</span></div>'+
       '<div class="f-fsize">'+fmt(n.s)+'</div>'+
       '<div class="f-dir" title="'+escAttr(n.p)+'">'+esc(loc)+'</div>'+
-      '<div class="f-act"><button class="icon-btn act-open">📂 定位</button>'+
-      '<button class="icon-btn act-copy">📋 复制</button></div></div>';
+      dlText('<div class="f-act"><button class="icon-btn act-open">📂 定位</button>')+
+      dlText('<button class="icon-btn act-copy">📋 复制</button></div></div>');
   }
   if(arr.length>shown.length){
-    html+='<div class="f-meta">（仅显示前 '+FILES_MAX_ROWS+' 个，其余 '+
-      (arr.length-shown.length)+' 个已省略，导出 CSV 含全部结果）</div>';
+    html+=dlText('<div class="f-meta">（仅显示前 ')+FILES_MAX_ROWS+dlText(' 个，其余 ')+
+      (arr.length-shown.length)+dlText(' 个已省略，导出 CSV 含全部结果）</div>');
   }
   box.innerHTML=html;
 }
@@ -245,7 +245,7 @@ function typesPool(){
   var m=new Map();   // ext -> {ext,n,s,al}
   fileIndex.forEach(function(f){
     if(f.s<BIG_FILE_MIN || !inScope(f.p)) return;   // 与大文件榜同口径：只聚合当前范围
-    var e=extOf(f.n)||'（无扩展名）';
+    var e=extOf(f.n)||dlText('（无扩展名）');
     var t=m.get(e);
     if(!t){ t={ext:e,n:0,s:0,al:0}; m.set(e,t); }
     t.n++; t.s+=f.s; t.al+=alOf(f);
@@ -261,15 +261,15 @@ function renderTypes(){
   var arr=typesPool();
   var meta=document.getElementById('types-meta');
   if(meta) meta.innerHTML = arr.length
-    ? '<b>'+arr.length+'</b> 种类型 · <b>'+arr.reduce(function(a,t){return a+t.n;},0).toLocaleString()+'</b> 个文件 · 单击行查看该类型文件'
-    : '暂无类型数据（扫描开始后自动聚合）';
+    ? '<b>'+arr.length+dlText('</b> 种类型 · <b>')+arr.reduce(function(a,t){return a+t.n;},0).toLocaleString()+dlText('</b> 个文件 · 单击行查看该类型文件')
+    : dlText('暂无类型数据（扫描开始后自动聚合）');
   if(!arr.length){
-    box.innerHTML='<div class="t-empty">'+(scanning?'扫描中…':'先扫描，类型分布自动聚合')+'</div>';
+    box.innerHTML='<div class="t-empty">'+(scanning?dlText('扫描中…'):dlText('先扫描，类型分布自动聚合'))+'</div>';
     return;
   }
   var tot=0; for(var q=0;q<arr.length;q++) tot+=arr[q].s;
-  var html='<div class="t-head"><div>类型</div><div class="rt">文件数</div>'+
-    '<div class="rt">大小</div><div class="rt">占用</div><div>占比</div></div>';
+  var html=dlText('<div class="t-head"><div>类型</div><div class="rt">文件数</div>')+
+    dlText('<div class="rt">大小</div><div class="rt">占用</div><div>占比</div></div>');
   for(var i=0;i<arr.length;i++){
     var t=arr[i];
     var pct=tot>0?(t.s/tot*100):0;
@@ -329,15 +329,15 @@ function renderDiff(){
   var meta=document.getElementById('diff-meta');
   loadPrevCache(function(prev){
     if(!prev || !prev.m.size){
-      if(meta) meta.innerHTML='暂无历史数据——连续完成两次扫描后，这里显示「上次 vs 本次」的目录级增减';
-      box.innerHTML='<div class="t-empty">完成两次扫描后可查看：哪些目录在增长、哪些是新出现的大头</div>';
+      if(meta) meta.innerHTML=dlText('暂无历史数据——连续完成两次扫描后，这里显示「上次 vs 本次」的目录级增减');
+      box.innerHTML=dlText('<div class="t-empty">完成两次扫描后可查看：哪些目录在增长、哪些是新出现的大头</div>');
       return;
     }
     // 上次扫描必须是同一范围：跨范围（如上次 C: 这次 D:）对比没有意义
     function rk(s){ return String(s||'').toLowerCase().split(',').filter(Boolean).sort().join(','); }
     if(rk(prev.root) !== rk(ROOTS.join(','))){
-      if(meta) meta.innerHTML='上次扫描是其他范围（'+esc(prev.root)+'）——重新扫描当前范围后即可对比';
-      box.innerHTML='<div class="t-empty">历史对比按范围分开：切回上次扫描的范围，或重新扫描当前范围</div>';
+      if(meta) meta.innerHTML=dlText('上次扫描是其他范围（')+esc(prev.root)+dlText('）——重新扫描当前范围后即可对比');
+      box.innerHTML=dlText('<div class="t-empty">历史对比按范围分开：切回上次扫描的范围，或重新扫描当前范围</div>');
       return;
     }
     var grown=[], added=[];
@@ -352,12 +352,12 @@ function renderDiff(){
     grown = grown.slice(0, 20);
     added = added.slice(0, 20);
     var prevDate = prev.at ? new Date(prev.at).toLocaleString() : '—';
-    if(meta) meta.innerHTML='上次：'+esc(prevDate)+' · '+
-      '<b>'+grown.length+'</b> 个增长目录 / <b>'+added.length+'</b> 个新增大目录（≥1MB）';
+    if(meta) meta.innerHTML=dlText('上次：')+esc(prevDate)+' · '+
+      '<b>'+grown.length+dlText('</b> 个增长目录 / <b>')+added.length+dlText('</b> 个新增大目录（≥1MB）');
     var html='';
     if(grown.length){
-      html+='<div class="f-meta" style="padding-left:18px">📈 增长最大（本次 - 上次）</div>'+
-        '<div class="t-head"><div>目录</div><div class="rt">上次</div><div class="rt">本次</div><div class="rt">增量</div><div></div></div>';
+      html+=dlText('<div class="f-meta" style="padding-left:18px">📈 增长最大（本次 - 上次）</div>')+
+        dlText('<div class="t-head"><div>目录</div><div class="rt">上次</div><div class="rt">本次</div><div class="rt">增量</div><div></div></div>');
       for(var i=0;i<grown.length;i++){
         var g=grown[i];
         var old=prev.m.get(g.p.toLowerCase());
@@ -368,17 +368,17 @@ function renderDiff(){
       }
     }
     if(added.length){
-      html+='<div class="f-meta" style="padding-left:18px;margin-top:10px">🆕 新出现的大目录</div>'+
-        '<div class="t-head"><div>目录</div><div class="rt" colspan2></div><div class="rt">大小</div><div></div><div></div></div>';
+      html+=dlText('<div class="f-meta" style="padding-left:18px;margin-top:10px">🆕 新出现的大目录</div>')+
+        dlText('<div class="t-head"><div>目录</div><div class="rt" colspan2></div><div class="rt">大小</div><div></div><div></div></div>');
       for(var j=0;j<added.length;j++){
         var a=added[j];
         html+='<div class="t-row" data-path="'+escAttr(a.p)+'">'+
           '<div class="t-ext" title="'+escAttr(a.p)+'">'+esc(a.n)+'</div>'+
-          '<div class="t-num">—</div><div class="t-num">'+fmt(a.s)+'</div><div class="t-num">新增</div><div></div></div>';
+          '<div class="t-num">—</div><div class="t-num">'+fmt(a.s)+dlText('</div><div class="t-num">新增</div><div></div></div>');
       }
     }
     if(!grown.length && !added.length){
-      html='<div class="t-empty">与上次相比没有明显增长（≥1MB 粒度）——盘面很稳定 👍</div>';
+      html=dlText('<div class="t-empty">与上次相比没有明显增长（≥1MB 粒度）——盘面很稳定 👍</div>');
     }
     box.innerHTML=html;
   });

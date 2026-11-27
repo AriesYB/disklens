@@ -502,3 +502,13 @@ body[data-view="diff"] #diff{display:block}
 ::-webkit-scrollbar-thumb{background:#242e3e;border-radius:6px;border:3px solid #0d1017}
 ::-webkit-scrollbar-thumb:hover{background:#31405a}
 ::-webkit-scrollbar-corner{background:transparent}
+
+#app-language {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 5px 8px;
+  font: inherit;
+  flex-shrink: 0;
+}

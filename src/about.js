@@ -58,7 +58,7 @@
     if (d.lastAbnormal) {
       return '⚠ 上次会话异常退出（panic ' + (d.panics || 0) + ' 次）——可带日志反馈帮助定位';
     }
-    return '上次会话正常退出 · 本机日志留档 ' + (d.panics ? ('（含 panic ' + d.panics + ' 次）') : '');
+    return dlText('上次会话正常退出 · 本机日志留档 ') + (d.panics ? (dlText('（含 panic ') + d.panics + dlText(' 次）')) : '');
   }
   function buildReport(d, tailLimit, includeNotice) {
     function tail(text, empty) {
@@ -91,7 +91,7 @@
 
     toggle.disabled = true;
     $('feedback-submit').disabled = true;
-    log.placeholder = '正在读取日志…';
+    log.placeholder = dlText('正在读取日志…');
     log.readOnly = true;
     feed.diagReport(function (report) {
       toggle.disabled = false;
@@ -103,7 +103,7 @@
       } else {
         toggle.checked = false;
         preview.hidden = true;
-        $('feedback-status').textContent = '无法读取诊断日志。你仍可提交文字反馈。';
+        $('feedback-status').textContent = dlText('无法读取诊断日志。你仍可提交文字反馈。');
       }
     });
   }
@@ -117,7 +117,7 @@
     if (submit.disabled) return;
     var text = $('feedback-text').value.trim();
     if (!text) {
-      status.textContent = '请填写反馈内容。';
+      status.textContent = dlText('请填写反馈内容。');
       $('feedback-text').focus();
       return;
     }
@@ -133,7 +133,7 @@
     fields.disabled = submit.disabled = true;
     $('feedback-copy-preview').hidden = true;
     $('feedback-copy-text').value = '';
-    status.textContent = '正在提交…';
+    status.textContent = dlText('正在提交…');
     var controller = new AbortController();
     var timeout = setTimeout(function () { controller.abort(); }, 10000);
     try {
@@ -149,17 +149,17 @@
       if (result.ok !== true || typeof result.id !== 'string') throw new Error('server');
       form.reset();
       $('feedback-log-preview').hidden = true;
-      status.textContent = '反馈已提交。编号 ' + result.id;
+      status.textContent = dlText('反馈已提交。编号 ') + result.id;
     } catch (error) {
       clearTimeout(timeout);
-      var kind = { bug: '问题', suggest: '建议', other: '其他' }[payload.type];
+      var kind = { bug: dlText('问题'), suggest: dlText('建议'), other: dlText('其他') }[payload.type];
       var copy = ['DiskLens v' + payload.version + ' · ' + kind, payload.text];
-      if (payload.contact) copy.push('联系方式：' + payload.contact);
+      if (payload.contact) copy.push(dlText('联系方式：') + payload.contact);
       if (payload.diagnostics) copy.push(payload.diagnostics);
       var copyText = copy.join('\n\n');
       var copied = await copyPath(copyText, null);
-      status.textContent = (error.message === 'rate-limit' ? '提交太频繁，请稍后再试。' : '未收到提交确认。') +
-        (copied ? '已复制反馈内容。' : '可手动复制下方内容。');
+      status.textContent = (error.message === 'rate-limit' ? dlText('提交太频繁，请稍后再试。') : dlText('未收到提交确认。')) +
+        (copied ? dlText('已复制反馈内容。') : dlText('可手动复制下方内容。'));
       if (!copied) {
         $('feedback-copy-text').value = copyText;
         $('feedback-copy-preview').hidden = false;
@@ -177,7 +177,7 @@
     $('about-mask').addEventListener('mousedown', function (ev) {
       if (ev.target === $('about-mask')) closeAbout();
     });
-    $('about-home').addEventListener('click', function () { openUrl(URLS.home); });
+    $('about-home').addEventListener('click', function () { openUrl(diskLensLanguage === 'en' ? 'https://ikanp.top/en/disklens/' : URLS.home); });
     $('about-github').addEventListener('click', function () { openUrl(URLS.github); });
     $('about-issues').addEventListener('click', function () { openUrl(URLS.issues); });
     $('about-feedback').addEventListener('click', function () { showFeedback(true); });
@@ -189,19 +189,19 @@
     $('feedback-include-log').addEventListener('change', loadFeedbackLog);
     $('feedback-form').addEventListener('submit', submitFeedback);
     $('about-rel').addEventListener('click', function () { openUrl(URLS.rel); });
-    $('about-site').addEventListener('click', function () { openUrl(URLS.site); });
+    $('about-site').addEventListener('click', function () { openUrl(diskLensLanguage === 'en' ? 'https://ikanp.top/en/' : URLS.site); });
     // 诊断反馈：复制报告 / 带日志提 Issue（用户点击确认后才离开本机）
     $('about-diag-copy').addEventListener('click', function () {
       fetchDiag(function (d) {
-        if (!d) { setStatus('诊断日志不可用（浏览器模式或读取失败）', 'err'); return; }
+        if (!d) { setStatus(dlText('诊断日志不可用（浏览器模式或读取失败）'), 'err'); return; }
         copyPath(buildReport(d, 0, true), null).then(function (copied) {
-          setStatus(copied ? '已复制诊断报告' : '复制诊断报告失败', copied ? 'done' : 'err');
+          setStatus(copied ? dlText('已复制诊断报告') : dlText('复制诊断报告失败'), copied ? 'done' : 'err');
         });
       });
     });
     $('about-diag-issue').addEventListener('click', function () {
       fetchDiag(function (d) {
-        if (!d) { setStatus('诊断日志不可用（浏览器模式或读取失败）', 'err'); return; }
+        if (!d) { setStatus(dlText('诊断日志不可用（浏览器模式或读取失败）'), 'err'); return; }
         var body = buildReport(d, 0, true);
         if (body.length > 6000) body = body.slice(0, 6000) + '\n…（过长截断，可用「复制诊断报告」补充）';
         var url = URLS.github + '/issues/new?title=' +

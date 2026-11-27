@@ -56,7 +56,7 @@ function curScopeKey(){
 }
 // 当前展示范围的口语名（空态/提示用）：多盘=「💻 所有磁盘」，单盘=盘根
 function scopeLabel(){
-  return isMultiRoot() ? '💻 所有磁盘' : String(window.ROOT||'');
+  return isMultiRoot() ? dlText('💻 所有磁盘') : String(window.ROOT||'');
 }
 // 路径是否属于当前展示范围：多盘=任一根前缀命中；单盘=该盘前缀
 function inScope(p){
@@ -75,11 +75,11 @@ function deniedInScope(){
 // 时长口语化（「切回上次结果」提示用）
 function fmtAge(ms){
   var m = Math.round(ms/60000);
-  if(m < 1) return '刚刚';
-  if(m < 60) return m + ' 分钟';
+  if(m < 1) return dlText('刚刚');
+  if(m < 60) return m + dlText(' 分钟');
   var h = Math.round(m/60);
-  if(h < 24) return h + ' 小时';
-  return Math.round(h/24) + ' 天';
+  if(h < 24) return h + dlText(' 小时');
+  return Math.round(h/24) + dlText(' 天');
 }
 
 // ===== 会话内存上限 =====
@@ -157,7 +157,7 @@ function ensurePcRoot(){
   if(!isMultiRoot()) return;
   var pc = store.get(THISPC.toLowerCase());
   if(!pc){
-    pc = { n:'💻 所有磁盘', s:0, al:0, done:false, p:THISPC, f:false, c:[] };
+    pc = { n:dlText('💻 所有磁盘'), s:0, al:0, done:false, p:THISPC, f:false, c:[] };
     store.set(THISPC.toLowerCase(), pc);
   }
   pc.c = [];
@@ -170,14 +170,30 @@ function ensurePcRoot(){
 function alOf(n) { return (n && n.al != null) ? n.al : (n ? n.s : 0); }
 
 var VIEW_HINTS = {
-  treemap: '单击展开/收起 · 双击进入 · 右键更多操作',
-  list:    '双击进入目录 · 单击表头排序 · 右键更多操作',
-  files:   '双击定位所在目录 · 「定位」在资源管理器中选中 · 顶部可按名称搜索（含目录）',
-  types:   '单击类型行 → 查看该扩展名的全部大文件',
-  diff:    '上次扫描 vs 本次：增长/新增最大的目录（重扫两次后可用）'
+  treemap: dlText('单击展开/收起 · 双击进入 · 右键更多操作'),
+  list:    dlText('双击进入目录 · 单击表头排序 · 右键更多操作'),
+  files:   dlText('双击定位所在目录 · 「定位」在资源管理器中选中 · 顶部可按名称搜索（含目录）'),
+  types:   dlText('单击类型行 → 查看该扩展名的全部大文件'),
+  diff:    dlText('上次扫描 vs 本次：增长/新增最大的目录（重扫两次后可用）')
 };
 
 function markDirty(){ dirty = true; }
+document.addEventListener('disklens-language-change', function (event) {
+  var oldStatus = lastStatusMsg;
+  if (event.detail === 'en') {
+    var original = Object.keys(diskLensEnglish).find(function (key) {
+      return diskLensEnglish[key] === lastStatusMsg;
+    });
+    lastStatusMsg = original || oldStatus;
+  } else {
+    lastStatusMsg = dlNativeText(oldStatus);
+  }
+  document.getElementById('status').textContent = lastStatusMsg;
+  var root = store.get(THISPC.toLowerCase());
+  if (root) root.n = dlText('💻 所有磁盘');
+  if (document.getElementById('denied-mask').style.display !== 'none') openDeniedPanel();
+  markDirty();
+});
 
 function ensureChain(path){
   var k = path.toLowerCase();
@@ -380,7 +396,7 @@ function beginScanUI(roots, full){
   syncPathControls();
   setScanning(true);
   rememberScope();   // 扫描态下逐出其他范围（scanning=true 时只留当前范围，压内存峰值）
-  setStatus('后台扫描中…', 'scanning');
+  setStatus(dlText('后台扫描中…'), 'scanning');
   syncDrivesSelect(); loadDrives();
   render();
 }
@@ -531,7 +547,7 @@ var lastAutoRender = 0;   // 监视模式渲染合流的时间戳
       catch(e){
         window.__errs = window.__errs || [];
         window.__errs.push('render: ' + e.message);
-        try { setStatus('渲染异常：' + e.message, 'err'); } catch(_) {}
+        try { setStatus(dlText('渲染异常：') + e.message, 'err'); } catch(_) {}
       }
     }
   }
@@ -547,24 +563,24 @@ function render(){
     // 该范围还没有数据（切到没扫过的盘）：不用转圈 spinner（会被误读成正在扫描），
     // 静态空态 + 清掉上一范围残留的面包屑/摘要/底栏，口径统一指向新范围
     var b=document.getElementById('bar');
-    if(b) b.innerHTML='<b>'+esc(scopeLabel())+' · 尚未扫描</b>';
+    if(b) b.innerHTML='<b>'+esc(scopeLabel())+dlText(' · 尚未扫描</b>');
     var sm=document.getElementById('summary');
     if(sm){
       var parts=[];
-      if(volTotal) parts.push('卷总容量 <b>'+fmt(volTotal)+'</b>');
-      if(volUsed) parts.push('卷已用 <b>'+fmt(volUsed)+'</b>');
-      parts.push('<span style="color:var(--muted,#9a9a9a)">尚未扫描 · 点「开始扫描」开始</span>');
+      if(volTotal) parts.push(dlText('卷总容量 <b>')+fmt(volTotal)+'</b>');
+      if(volUsed) parts.push(dlText('卷已用 <b>')+fmt(volUsed)+'</b>');
+      parts.push(dlText('<span style="color:var(--muted,#9a9a9a)">尚未扫描 · 点「开始扫描」开始</span>'));
       sm.innerHTML=parts.join(' · ');
     }
     var st=document.getElementById('foot-stats');
     if(st){
       st.title = scopeLabel();
-      st.innerHTML='当前 <b>'+esc(scopeLabel())+'</b> · 尚未扫描';
+      st.innerHTML=dlText('当前 <b>')+esc(scopeLabel())+dlText('</b> · 尚未扫描');
     }
     var wt = document.getElementById('wait');
     if(wt){ wt.style.display='flex';
       wt.innerHTML='<div><div style="font-size:46px;margin-bottom:14px">🗂️</div>'+
-        '<div style="color:#9a9a9a">'+esc(scopeLabel())+' 还没有扫描记录 —— 点上方「开始扫描」开始</div></div>'; }
+        '<div style="color:#9a9a9a">'+esc(scopeLabel())+dlText(' 还没有扫描记录 —— 点上方「开始扫描」开始</div></div>'); }
     return;
   }
   updateCrumb(node);
@@ -602,7 +618,7 @@ function scanDisplayTotals(node){
 function updateCrumb(node){
   var b=document.getElementById('bar'); b.innerHTML='';
   if(stack.length){
-    var bk=document.createElement('span'); bk.className='crumb'; bk.textContent='⬅ 返回';
+    var bk=document.createElement('span'); bk.className='crumb'; bk.textContent=dlText('⬅ 返回');
     bk.onclick=function(){ goUp(); }; b.appendChild(bk);
     b.appendChild(sep());
   }
@@ -622,7 +638,7 @@ function updateCrumb(node){
   var cb=document.createElement('b');
   // 目录双口径：逻辑大小 = 展示主口径；占用 = 簇对齐后的真实磁盘占用
   var totals = scanDisplayTotals(node);
-  cb.textContent=node.n+' = '+fmt(totals.s)+(node.f?'':' · 占用 '+fmt(alOf(totals)));
+  cb.textContent=node.n+' = '+fmt(totals.s)+(node.f?'':dlText(' · 占用 ')+fmt(alOf(totals)));
   b.appendChild(cb);
 }
 function updateSummary(node){
@@ -632,14 +648,14 @@ function updateSummary(node){
   if(node.summarized) parts.push('<span title="可对当前目录开始扫描，展开更多明细">部分明细已聚合</span>');
   if(root&&root.s>0){
     // 双口径：逻辑大小为主展示，磁盘占用（簇对齐/去重后的真实占用）括号补充
-    parts.push((scanning?'已扫描 ':'根目录总计 ')+'<b>'+fmt(root.s)+'</b>'+'（占用 '+fmt(alOf(root))+'）');
+    parts.push((scanning?dlText('已扫描 '):dlText('根目录总计 '))+'<b>'+fmt(root.s)+'</b>'+dlText('（占用 ')+fmt(alOf(root))+dlText('）'));
   }
-  if(volUsed) parts.push('卷已用 <b>'+fmt(volUsed)+'</b>');
+  if(volUsed) parts.push(dlText('卷已用 <b>')+fmt(volUsed)+'</b>');
   if(scanning && scanProgress){
-    parts.push('已访问 '+scanProgress.directoriesVisited.toLocaleString()+' 个目录、'+
-      scanProgress.filesVisited.toLocaleString()+' 个文件');
+    parts.push(dlText('已访问 ')+scanProgress.directoriesVisited.toLocaleString()+dlText(' 个目录、')+
+      scanProgress.filesVisited.toLocaleString()+dlText(' 个文件'));
     if(scanProgress.rootsTotal>1)
-      parts.push('已完成 '+scanProgress.rootsDone+'/'+scanProgress.rootsTotal+' 个扫描根');
+      parts.push(dlText('已完成 ')+scanProgress.rootsDone+'/'+scanProgress.rootsTotal+dlText(' 个扫描根'));
   }
   // 扫描完成后的差额透明化：扫描器看不到的部分 = 卷已用 - 扫描占用
   // （还原点/NTFS 元数据/无权限目录；负值说明占用估算偏高，如压缩文件近似）
@@ -655,15 +671,15 @@ function updateSummary(node){
   if(dCnt) parts.push('<span id="denied-link" style="color:var(--amber);cursor:pointer;text-decoration:underline dotted" title="这些目录无权限读取，体积只含已读到的部分——点击查看清单">⛔ '+dCnt+' 个目录无权限</span>');
   // AI 提案待确认入口已改为右下角固定悬浮角标（#prop-fab，见 aiassist.js）：
   // 不随摘要文字流布局，小窗也不会被挤没/截断
-  if(scanning&&scanT0) parts.push('用时 '+((Date.now()-scanT0)/1000).toFixed(1)+'s');
-  else if(lastScanSecs) parts.push('用时 '+lastScanSecs.toFixed(1)+'s');   // 完成态保留耗时
-  if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?' · 已感知 '+watchChanges+' 项变更':'')+'</span>');
+  if(scanning&&scanT0) parts.push(dlText('用时 ')+((Date.now()-scanT0)/1000).toFixed(1)+'s');
+  else if(lastScanSecs) parts.push(dlText('用时 ')+lastScanSecs.toFixed(1)+'s');   // 完成态保留耗时
+  if(watchActive) parts.push('<span style="color:var(--green)">⏱ 实时监视中'+(watchChanges?dlText(' · 已感知 ')+watchChanges+dlText(' 项变更'):'')+'</span>');
   document.getElementById('summary').innerHTML=parts.join(' · ');
   var st=document.getElementById('foot-stats');
   if(node){
     var location = curPath===THISPC ? scopeLabel() : curPath;
     st.title = location;
-    st.innerHTML='当前 <b>'+esc(location)+'</b> · '+node.c.length+' 项';
+    st.innerHTML=dlText('当前 <b>')+esc(location)+'</b> · '+node.c.length+dlText(' 项');
   }
 }
 
@@ -681,7 +697,7 @@ function openDeniedPanel(){
   document.getElementById('denied-n').textContent='（'+rows.length+'）';
   var list=document.getElementById('denied-list');
   if(!rows.length){
-    list.innerHTML='<div class="d-empty">当前扫描没有受限目录</div>';
+    list.innerHTML=dlText('<div class="d-empty">当前扫描没有受限目录</div>');
   } else {
     var html='';
     for(var i=0;i<rows.length;i++){
@@ -690,7 +706,7 @@ function openDeniedPanel(){
         '<div class="d-path" title="'+escAttr(n.p)+'">📁 '+esc(n.p)+'</div>'+
         '<div class="d-size">'+fmt(n.s||0)+'</div>'+
         '<div class="d-al">'+fmt(alOf(n))+'</div>'+
-        '<div class="d-act"><button class="d-open">📂 定位</button><button class="d-go">进入</button></div></div>';
+        dlText('<div class="d-act"><button class="d-open">📂 定位</button><button class="d-go">进入</button></div></div>');
     }
     list.innerHTML=html;
   }
@@ -720,7 +736,7 @@ function openDeniedPanel(){
     var paths=[];
     for(var k in deniedSeen){ if(inScope(k)) paths.push(k); }
     copyPath(paths.join('\r\n'),null);
-    setStatus('已复制 '+paths.length+' 条路径','done');
+    setStatus(dlText('已复制 ')+paths.length+dlText(' 条路径'),'done');
   });
 })();
 
@@ -740,39 +756,39 @@ function exportCSV(defaultName, header, rows){
       document.body.appendChild(t); t.select();
       var done=false; try{ done=document.execCommand('copy'); }catch(e){}
       document.body.removeChild(t);
-      setStatus(done?'已复制 CSV 到剪贴板（浏览器模式）':'剪贴板不可用，浏览器模式请在客户端内导出', done?'done':'err');
+      setStatus(done?dlText('已复制 CSV 到剪贴板（浏览器模式）'):dlText('剪贴板不可用，浏览器模式请在客户端内导出'), done?'done':'err');
     }
     if(navigator.clipboard&&navigator.clipboard.writeText){
       navigator.clipboard.writeText(csv).then(function(){
-        setStatus('已复制 CSV 到剪贴板（浏览器模式）','done');
+        setStatus(dlText('已复制 CSV 到剪贴板（浏览器模式）'),'done');
       },fallback);
     } else fallback();
     return;
   }
   window.__TAURI__.dialog.save({
     defaultPath: defaultName,
-    filters: [{ name:'CSV 表格', extensions:['csv'] }]
+    filters: [{ name:dlText('CSV 表格'), extensions:['csv'] }]
   }).then(function(path){
     if(!path) return;   // 用户取消
     window.__TAURI__.core.invoke('save_text_file', { path: path, contents: csv })
-      .then(function(){ setStatus('已导出：'+path,'done'); })
-      .catch(function(e){ setStatus('导出失败：'+e,'err'); });
+      .then(function(){ setStatus(dlText('已导出：')+path,'done'); })
+      .catch(function(e){ setStatus(dlText('导出失败：')+e,'err'); });
   }).catch(function(){});
 }
 // 大文件榜（含当前搜索结果；导出全量，不受 500 行显示限制）
 function exportFilesCSV(){
   var arr=filesPool();
   var rows=arr.map(function(n,i){
-    return [i+1, n.p, n.n, n.f?'文件':'目录', n.s, alOf(n), fmt(n.s)];
+    return [i+1, n.p, n.n, n.f?dlText('文件'):dlText('目录'), n.s, alOf(n), fmt(n.s)];
   });
   exportCSV('disklens-files.csv',
-    ['排名','完整路径','名称','类型','大小(字节)','占用(字节)','大小(可读)'], rows);
+    [dlText('排名'),dlText('完整路径'),dlText('名称'),dlText('类型'),dlText('大小(字节)'),dlText('占用(字节)'),dlText('大小(可读)')], rows);
 }
 function exportTypesCSV(){
   var arr=typesPool();
   var rows=arr.map(function(t){ return [t.ext, t.n, t.s, t.al, fmt(t.s)]; });
   exportCSV('disklens-types.csv',
-    ['扩展名','文件数','大小(字节)','占用(字节)','大小(可读)'], rows);
+    [dlText('扩展名'),dlText('文件数'),dlText('大小(字节)'),dlText('占用(字节)'),dlText('大小(可读)')], rows);
 }
 
 /* ===== 工具栏 ===== */
@@ -881,7 +897,7 @@ function TauriFeed(){
     currentScanId = ev.payload.scanId;
     scanProgress = null;
     beginScanUI(ev.payload.roots, ev.payload.full);
-    if(ev.payload.byAi) setStatus('AI 发起的后台扫描中…', 'scanning');
+    if(ev.payload.byAi) setStatus(dlText('AI 发起的后台扫描中…'), 'scanning');
   });
   window.__TAURI__.event.listen('scan-progress', function(ev){
     if(!scanning || currentScanId!==ev.payload.scanId) return;
@@ -894,9 +910,9 @@ function TauriFeed(){
     for(var i=0;i<arr.length;i++) applyEvent(arr[i]);
   });
   window.__TAURI__.event.listen('scan-finished', function(ev){
-    var msg = ev.payload || '完成';
+    var msg = ev.payload || dlText('完成');
     var completed = msg.indexOf('扫描完成') === 0;
-    setStatus(msg, completed ? 'done' : 'err');
+    setStatus(dlNativeText(msg), completed ? 'done' : 'err');
     setScanning(false);
     if(!completed) return;
     autoExpandView();
@@ -914,19 +930,19 @@ function TauriFeed(){
   });
   window.__TAURI__.event.listen('scan-refresh-finished', function(ev){
     var result = ev.payload;
-    if(result[1]) setStatus(result[1], result[1].startsWith('目录刷新完成') ? 'done' : 'err');
+    if(result[1]) setStatus(dlNativeText(result[1]), result[1].startsWith('目录刷新完成') ? 'done' : 'err');
     completePriority(result[0]);
   });
   window.__TAURI__.event.listen('scan-refresh-running', function(ev){
     localScanning = !!ev.payload;
     syncScanButtons();
     if(localScanning){
-      setStatus('后台刷新目录中…', 'scanning');
+      setStatus(dlText('后台刷新目录中…'), 'scanning');
     } else if(localStopPending){
       localStopPending = false;
-      setStatus('目录刷新已停止', 'done');
+      setStatus(dlText('目录刷新已停止'), 'done');
     } else if(!scanning && lastStatusCls==='scanning'){
-      setStatus('目录刷新结束', 'done');
+      setStatus(dlText('目录刷新结束'), 'done');
     }
   });
   window.__TAURI__.event.listen('fs-batch', function(ev){
@@ -949,7 +965,7 @@ TauriFeed.prototype.start = function(roots, full){
   self.stopping = false;
   scanPending = true;
   syncScanButtons();
-  setStatus('准备后台扫描…', 'scanning');
+  setStatus(dlText('准备后台扫描…'), 'scanning');
   var arr = Array.isArray(roots) ? roots : [roots];
   window.__TAURI__.core.invoke('scan_start', { roots: arr, full: !!full }).then(function(){
     if(self.stopping && (scanning || scanPending)) self.stop();
@@ -971,7 +987,7 @@ TauriFeed.prototype.open = function(p, sel){
 /* 调出资源管理器的原生右键菜单（shell IContextMenu 托管，菜单出现在光标处） */
 TauriFeed.prototype.shellContextMenu = function(p){
   window.__TAURI__.core.invoke('shell_context_menu', { path: p }).catch(function(e){
-    setStatus('调出系统右键菜单失败：' + String(e).slice(0, 80), 'err');
+    setStatus(dlText('调出系统右键菜单失败：') + String(e).slice(0, 80), 'err');
   });
 };
 TauriFeed.prototype.listVolumes = function(cb){
@@ -1163,19 +1179,19 @@ MockFeed.prototype.start = function(roots, onDone){
       applyEvent({ path:p, parent:parts.slice(0,-1).join('\\'), name:parts[parts.length-1],
                    size:Math.round(allPaths[p]*GB), done:true, file:false, denied:denied });
     }
-    var msg = '模拟扫描完成';
+    var msg = dlText('模拟扫描完成');
     if(self.onDone) self.onDone(msg);
     else { setStatus(msg, 'done'); setScanning(false); autoExpandView(); }
   }, 13200+(ticks2+1)*620));
 };
 MockFeed.prototype.stop = function(){
-  this._clear(); setStatus('已停止','done'); setScanning(false);
+  this._clear(); setStatus(dlText('已停止'),'done'); setScanning(false);
 };
 MockFeed.prototype.open = function(p){
-  setStatus('浏览器模式：打开文件夹需在 Tauri 客户端内使用','err');
+  setStatus(dlText('浏览器模式：打开文件夹需在 Tauri 客户端内使用'),'err');
 };
 MockFeed.prototype.shellContextMenu = function(){
-  setStatus('浏览器模式：调出系统右键菜单需在 Tauri 客户端内使用','err');
+  setStatus(dlText('浏览器模式：调出系统右键菜单需在 Tauri 客户端内使用'),'err');
 };
 
 /* ===== Mock 迁移：模拟三阶段事务事件流（浏览器演示用） ===== */
@@ -1223,11 +1239,11 @@ MockFeed.prototype.migrateStart = function(src, destRoot){
     if (self._migStopped) { self._migStopped = false; handler({ stage:'aborted', message:'已停止：已完成部分保留，重新发起会自动续传', locked:[], bytes_done:0, bytes_total:0, files_done:0, files_total:0, current:'' }); return; }
     t++;
     if (t <= ticks) {
-      handler({ stage:'copy', message:'复制中…', locked:[], bytes_done:Math.round(total*t/ticks), bytes_total:total,
+      handler({ stage:'copy', message:dlText('复制中…'), locked:[], bytes_done:Math.round(total*t/ticks), bytes_total:total,
                 files_done:Math.round(files*t/ticks), files_total:files, current:src+'\\file-'+t+'.dat' });
       self.timers.push(setTimeout(tick, 280));
     } else if (t === ticks+1) {
-      handler({ stage:'verify', message:'校验中…', locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
+      handler({ stage:'verify', message:dlText('校验中…'), locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
       self.timers.push(setTimeout(tick, 500));
     } else if (t === ticks+2) {
       handler({ stage:'switch', message:'切换中：删除源目录内容…', locked:[], bytes_done:total, bytes_total:total, files_done:files, files_total:files, current:'' });
@@ -1280,7 +1296,7 @@ function hideSplash(){
   var sp = document.getElementById('splash');
   if(sp && !sp.classList.contains('hide')){
     var h = document.getElementById('sp-hint');
-    if(h) h.textContent = '就绪';
+    if(h) h.textContent = dlText('就绪');
     sp.classList.add('hide');
     setTimeout(function(){ if(sp.parentNode) sp.parentNode.removeChild(sp); }, 500);
   }
@@ -1319,7 +1335,7 @@ window.addEventListener('DOMContentLoaded', function(){
         window.__diagAbnormal = true;
         diagLog('warn', '检测到上次会话异常退出（panic ' + (d.panics||0) + ' 次）');
         setTimeout(function(){
-          setStatus('⚠ 上次会话异常退出——可在「关于」面板带日志反馈', 'err');
+          setStatus(dlText('⚠ 上次会话异常退出——可在「关于」面板带日志反馈'), 'err');
         }, 2600);
       }
     });
@@ -1336,7 +1352,7 @@ window.addEventListener('DOMContentLoaded', function(){
         setTimeout(function(){
           if(!scanning && curScopeKey()===restored && scopeAt[restored]===meta.at) pushAiSnapshot(meta.at);
         }, 300);
-        setStatus('已恢复上次扫描结果（' + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + ' 小时前）· 建议重新扫描刷新', 'done');
+        setStatus(dlText('已恢复上次扫描结果（') + Math.max(1, Math.round((Date.now()-meta.at)/3600000)) + dlText(' 小时前）· 建议重新扫描刷新'), 'done');
         markDirty();
       }
     });
@@ -1351,7 +1367,7 @@ window.addEventListener('DOMContentLoaded', function(){
     // 浏览器模式：自动跑一轮合成扫描，打开页面即可看到完整交互
     ROOTS = [window.ROOT];
     setScanning(true);
-    setStatus('浏览器模式（合成数据）');
+    setStatus(dlText('浏览器模式（合成数据）'));
     render();
     feed.start(window.ROOT);
   }
@@ -1364,7 +1380,7 @@ window.addEventListener('DOMContentLoaded', function(){
   document.getElementById('expand-depth').addEventListener('change', applyExpandSettings);
   document.getElementById('scan-btn').addEventListener('click', startScan);
   document.getElementById('stop-btn').addEventListener('click', function(){
-    setStatus('正在停止扫描…', 'scanning');
+    setStatus(dlText('正在停止扫描…'), 'scanning');
     if(localScanning){
       localStopPending = true;
       priQueue = []; priQueued = {}; priInflight = [];
@@ -1378,7 +1394,7 @@ window.addEventListener('DOMContentLoaded', function(){
     if(!this.value) return;
     if (scanning) {
       // 扫描进行中切换范围会与引擎状态错位——先恢复选中项再提示
-      setStatus('扫描进行中——请先「停止」再切换扫描范围', 'err');
+      setStatus(dlText('扫描进行中——请先「停止」再切换扫描范围'), 'err');
       syncPathControls();
       return;
     }
@@ -1424,12 +1440,12 @@ function switchScope(picked){
   var hasData = isMultiRoot()
     ? ROOTS.every(function(root){ var n = store.get(root.toLowerCase()); return n && n.done; })
     : !!(rootNode && rootNode.done);
-  var place = isMultiRoot() ? '全部磁盘' : String(window.ROOT);
+  var place = isMultiRoot() ? dlText('全部磁盘') : String(window.ROOT);
   var at = scopeAt[curScopeKey()];
   if(hasData){
-    setStatus('已切换到 ' + place + ' · 显示上次扫描结果' + (at ? '（' + fmtAge(Date.now() - at) + '前）' : '') + ' · 点「开始扫描」刷新', 'done');
+    setStatus(dlText('已切换到 ') + place + dlText(' · 显示上次扫描结果') + (at ? '（' + fmtAge(Date.now() - at) + dlText('前）') : '') + dlText(' · 点「开始扫描」刷新'), 'done');
   } else {
-    setStatus('已切换到 ' + place + ' · 该范围尚未扫描，点「开始扫描」开始', '');
+    setStatus(dlText('已切换到 ') + place + dlText(' · 该范围尚未扫描，点「开始扫描」开始'), '');
   }
   syncDrivesSelect();
   markDirty();
@@ -1465,12 +1481,12 @@ function pathFromControls(){
 function commitPathInput(){
   if(scanning){ syncPathControls(); return; }
   var path = pathFromControls();
-  if(!path){ setStatus('请输入有效的盘内路径', 'err'); return; }
+  if(!path){ setStatus(dlText('请输入有效的盘内路径'), 'err'); return; }
   if(path.toLowerCase()===curPath.toLowerCase()){
     syncPathControls();
   } else if(path!==THISPC && inScope(path) && store.has(path.toLowerCase())){
     var node = store.get(path.toLowerCase());
-    if(node.f){ setStatus('请输入文件夹路径', 'err'); return; }
+    if(node.f){ setStatus(dlText('请输入文件夹路径'), 'err'); return; }
     navigate(node.p);
   } else {
     switchScope(path);
@@ -1478,9 +1494,9 @@ function commitPathInput(){
 }
 
 function startScan(){
-  if (scanning) { setStatus('扫描进行中——请先「停止」再切换扫描范围', 'err'); return; }
+  if (scanning) { setStatus(dlText('扫描进行中——请先「停止」再切换扫描范围'), 'err'); return; }
   var picked = pathFromControls();
-  if(!picked){ setStatus('请输入有效的盘内路径', 'err'); return; }
+  if(!picked){ setStatus(dlText('请输入有效的盘内路径'), 'err'); return; }
   var roots;
   if (picked === THISPC) {
     roots = drivesCache.map(function(v){ return v.mount; });
@@ -1500,7 +1516,7 @@ function needsDetailedScan(roots){
 
 function startScanRoots(roots, full){
   if(scanning || localScanning || scanPending){
-    setStatus('已有扫描在进行，请先等它结束或点击「停止」', 'scanning');
+    setStatus(dlText('已有扫描在进行，请先等它结束或点击「停止」'), 'scanning');
     return;
   }
   if(!IN_TAURI) beginScanUI(roots, full);
@@ -1520,12 +1536,12 @@ function loadDrives(){
     if (IN_TAURI && list.length > 1) {
       var totFree = 0, totAll = 0;
       for (var q = 0; q < list.length; q++) { totFree += list[q].free_bytes||0; totAll += list[q].total_bytes||0; }
-      html += '<option value="' + escAttr(THISPC) + '">💻 全部磁盘（' + list.length + ' 个 · 剩余 ' + fmt(totFree) + ' / ' + fmt(totAll) + '）</option>';
+      html += '<option value="' + escAttr(THISPC) + dlText('">💻 全部磁盘（') + list.length + dlText(' 个 · 剩余 ') + fmt(totFree) + ' / ' + fmt(totAll) + '）</option>';
     }
     for (var i = 0; i < list.length; i++) {
       var v = list[i];
       html += '<option value="' + escAttr(v.mount) + '">' + esc(v.mount + (v.label ? ' ' + v.label : '') +
-        ' · 剩余 ' + fmt(v.free_bytes)) + '</option>';
+        dlText(' · 剩余 ') + fmt(v.free_bytes)) + '</option>';
     }
     sel.innerHTML = html;
     syncDrivesSelect();
@@ -1554,7 +1570,7 @@ function syncDrivesSelect(){
   var mount = curPath===THISPC ? THISPC : String(curPath||window.ROOT).slice(0,3).toUpperCase();
   var option = Array.from(sel.options).find(function(o){ return o.value.toUpperCase()===mount; });
   if(!option){
-    option = new Option(mount===THISPC ? '全部磁盘' : mount, mount);
+    option = new Option(mount===THISPC ? dlText('全部磁盘') : mount, mount);
     sel.add(option);
   }
   sel.value = option.value;
@@ -1565,5 +1581,5 @@ function syncPathControls(){
   syncDrivesSelect();
   window.rootInput.disabled = curPath===THISPC;
   window.rootInput.value = curPath===THISPC ? '' : curPath.slice(3);
-  window.rootInput.title = curPath===THISPC ? '全部磁盘' : curPath;
+  window.rootInput.title = curPath===THISPC ? dlText('全部磁盘') : curPath;
 }

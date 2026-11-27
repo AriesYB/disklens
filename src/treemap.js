@@ -20,14 +20,14 @@ function colors(d){ return PALETTE[((d%PALETTE.length)+PALETTE.length)%PALETTE.l
 /* 共享右键菜单：treemap / 列表 / 大文件榜 三视图通用 */
 function openContextMenu(ev,fp,isFile){
   menuPath=fp; menuSel=!!isFile;
-  document.getElementById('mi-open-t').textContent=isFile?'打开所在文件夹（并选中）':'在资源管理器中打开';
+  document.getElementById('mi-open-t').textContent=isFile?dlText('打开所在文件夹（并选中）'):dlText('在资源管理器中打开');
   document.getElementById('mi-enter').style.display=isFile?'none':'';
   document.getElementById('mi-expand').style.display=isFile?'none':'';
   document.getElementById('mi-rescan').style.display=isFile?'none':'';
   document.getElementById('mi-migrate').style.display=isFile?'none':'';
   document.getElementById('mi-ai').style.display=isFile?'none':'';
-  document.getElementById('mi-expand-t').textContent=expanded[fp]?'收起':'展开';
-  document.getElementById('mi-copy-t').textContent='复制完整路径';
+  document.getElementById('mi-expand-t').textContent=expanded[fp]?dlText('收起'):dlText('展开');
+  document.getElementById('mi-copy-t').textContent=dlText('复制完整路径');
   document.getElementById('ctxpath').textContent=fp;
   var c=document.getElementById('ctx');
   // 先显示再测量：display:none 时 offsetWidth/Height 为 0
@@ -108,15 +108,15 @@ function getCell(kk){
       var t=document.getElementById('tip'); t.style.display='block';
       t.style.left=Math.min(ev.clientX+14,window.innerWidth-560)+'px';
       t.style.top=(ev.clientY+14)+'px';
-      var fp=n.agg?('聚合 '+n.agg+' 个极小/未扫完项'):(el.__path||n.p||'');
+      var fp=n.agg?(dlText('聚合 ')+n.agg+dlText(' 个极小/未扫完项')):(el.__path||n.p||'');
       t.innerHTML='<div style="color:#9fd1ff;word-break:break-all">'+esc(fp)+'</div><b>'+fmt(n.raw!=null?n.raw:n.s)+'</b>'+
-        (n.f?'':'<span style="color:#aaa"> · 占用 '+fmt((n.al!=null)?n.al:n.s)+'</span>')+
-        (n.cloud?'<span style="color:#7fc7ff"> ☁ 云端占位</span>':'')+
-        (n.dup?'<span style="color:#b8c4d4"> ⛓ 硬链接副本（已在他处计数）</span>':'')+
-        (n.f?'<span style="color:#888"> · 文件</span>':'<span style="color:#888"> · 目录 · 单击展开/收起 · 双击进入</span>')+
-        (n.denied?'<br><span style="color:#ffd479">⛔ 无权限：体积只含已读到的部分</span>':'')+
+        (n.f?'':dlText('<span style="color:#aaa"> · 占用 ')+fmt((n.al!=null)?n.al:n.s)+'</span>')+
+        (n.cloud?dlText('<span style="color:#7fc7ff"> ☁ 云端占位</span>'):'')+
+        (n.dup?dlText('<span style="color:#b8c4d4"> ⛓ 硬链接副本（已在他处计数）</span>'):'')+
+        (n.f?dlText('<span style="color:#888"> · 文件</span>'):dlText('<span style="color:#888"> · 目录 · 单击展开/收起 · 双击进入</span>'))+
+        (n.denied?dlText('<br><span style="color:#ffd479">⛔ 无权限：体积只含已读到的部分</span>'):'')+
         (n.done?'':'<br><span style="color:#ffd479">counting...</span>')+
-        '<br><span style="color:#888">右键：'+(n.f?'打开所在文件夹':'更多操作')+'</span>';
+        dlText('<br><span style="color:#888">右键：')+(n.f?dlText('打开所在文件夹'):dlText('更多操作'))+'</span>';
     });
     d.addEventListener('mouseleave',function(){ document.getElementById('tip').style.display='none'; });
     d.addEventListener('click',function(ev){ ev.stopPropagation();
@@ -187,7 +187,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   if(!main.length){
     if(agg){
       var d0=getCell(keyBase+'|:agg');
-      paintCell(d0,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+      paintCell(d0,{n:{n:dlText('… 剩余')+aggN+dlText('项（极小/未扫完）'),s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
       d0.style.background='#3f3f46';
     }
     return;
@@ -220,7 +220,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   if(goodSum<=0){
     if(agg){
       var d1=getCell(keyBase+'|:agg');
-      paintCell(d1,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+      paintCell(d1,{n:{n:dlText('… 剩余')+aggN+dlText('项（极小/未扫完）'),s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
       d1.style.background='#3f3f46';
     }
     return;
@@ -229,7 +229,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   var availH=h0-stripH;
   if(availH<10){
     var d2=getCell(keyBase+'|:agg');
-    paintCell(d2,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
+    paintCell(d2,{n:{n:dlText('… 剩余')+aggN+dlText('项（极小/未扫完）'),s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0,w0,h0,keyBase,keyBase+'|:agg',seen,0);
     d2.style.background='#3f3f46';
     return;
   }
@@ -255,7 +255,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
         o.x+2,o.y+16,Math.max(0,o.w-4),Math.max(0,o.h-16),pth,ck,seen,depth);
       ck.style.backgroundColor='#223247';
       var cl=ck.querySelector('.lbl');
-      cl.textContent='⟳ 统计中…';
+      cl.textContent=dlText('⟳ 统计中…');
       cl.style.fontSize=(o.w>160&&o.h>56)?'14px':'11px';
       cl.style.paddingTop=(o.h>56)?'18px':'2px';
     }
@@ -263,7 +263,7 @@ function layoutInto(node,x0,y0,w0,h0,keyBase,seen){
   if(agg&&stripH>0){
     var akk=keyBase+'|:agg';
     var ad=getCell(akk);
-    paintCell(ad,{n:{n:'… 剩余'+aggN+'项（极小/未扫完）',s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0+availH,w0,stripH,keyBase,akk,seen,depth);
+    paintCell(ad,{n:{n:dlText('… 剩余')+aggN+dlText('项（极小/未扫完）'),s:aggS,raw:aggS,done:true,f:1,agg:aggN}},x0,y0+availH,w0,stripH,keyBase,akk,seen,depth);
     ad.style.background='#3f3f46';
   }
 }
@@ -279,7 +279,7 @@ function renderTreemap(){
   var wait = document.getElementById('wait');
   if(items.length&&tot>0){ wait.style.display='none'; }
   else if(node.done){ wait.style.display='flex'; wait.innerHTML='<div><div style="margin-bottom:10px">'+esc(node.n)+'</div><div style="color:#8a8a8a">'+
-    (node.summarized?'已汇总大小。点击「开始扫描」查看目录明细。':'空目录，或全部子项已折叠进“剩余”条')+'</div></div>'; }
+    (node.summarized?dlText('已汇总大小。点击「开始扫描」查看目录明细。'):dlText('空目录，或全部子项已折叠进“剩余”条'))+'</div></div>'; }
   else { wait.style.display='flex'; wait.innerHTML='<div><div class="spin"></div><div style="margin-top:12px">counting directories...</div></div>'; }
   var seen={};
   layoutInto(node,0,0,W,H,curPath,seen);
@@ -311,7 +311,7 @@ document.getElementById('mi-sysmenu').addEventListener('click',function(){
   var p = menuPath;
   hideCtx();
   if(!p) return;
-  setStatus('已请求调出系统右键菜单','done');
+  setStatus(dlText('已请求调出系统右键菜单'),'done');
   feed.shellContextMenu(p);
 });
 document.getElementById('mi-open').addEventListener('click',function(){ openPathInExplorer(menuPath,menuSel); hideCtx(); });
@@ -332,7 +332,7 @@ document.getElementById('mi-rescan').addEventListener('click',function(){
   var p = menuPath;
   hideCtx();
   if(p&&!menuSel){
-    setStatus('正在重新扫描此目录…','scanning');
+    setStatus(dlText('正在重新扫描此目录…'),'scanning');
     feed.scanRefresh(p);
   }
 });
@@ -341,23 +341,25 @@ document.getElementById('mi-recycle').addEventListener('click',function(){
   var p = menuPath;
   hideCtx();
   if(!p) return;
-  if(scanning){ setStatus('扫描进行中——请先停止再删除','err'); return; }
+  if(scanning){ setStatus(dlText('扫描进行中——请先停止再删除'),'err'); return; }
   // 防呆：盘根（'c:\'）与虚拟根不可删
   if(p === THISPC || p.replace(/\\+$/,'').length <= 2){
-    setStatus('盘根不可删除','err'); return;
+    setStatus(dlText('盘根不可删除'),'err'); return;
   }
   var n = store.get(p.toLowerCase());
-  var tip = '将「' + p + '」' + (n ? '（' + fmt(n.s) + '）' : '') + ' 移入回收站？\n' +
-    '可在系统回收站还原，确认无误前请勿清空回收站。';
+  var tip = (diskLensLanguage === 'en'
+    ? 'Move “' + p + '”' + (n ? ' (' + fmt(n.s) + ')' : '') + ' to the Recycle Bin?\n'
+    : '将「' + p + '」' + (n ? '（' + fmt(n.s) + '）' : '') + ' 移入回收站？\n') +
+    dlText('可在系统回收站还原，确认无误前请勿清空回收站。');
   if(!window.confirm(tip)) return;
-  setStatus('正在移入回收站…','scanning');
+  setStatus(dlText('正在移入回收站…'),'scanning');
   feed.recycleDelete([p], function(failed){
     if(failed && failed.length){
-      setStatus('移入回收站失败（文件被占用？）：' + failed[0],'err');
+      setStatus(dlText('移入回收站失败（文件被占用？）：') + failed[0],'err');
       return;
     }
     diagLog('info', '右键移入回收站: ' + p);
-    setStatus('已移入回收站：' + p,'done');
+    setStatus(dlText('已移入回收站：') + p,'done');
     // 本地即时摘除：removeSubtree 返回被删子树合计，沿祖先链扣减体积。
     // 监视模式下 watcher 随后也会报 remove，此时节点已不在、天然幂等
     var rm = removeSubtree(p);
@@ -392,9 +394,9 @@ window.addEventListener('resize',function(){
   _rsT=setTimeout(function(){ _rsT=null; render(); },180);
 });
 function copyPath(p,fbEl){
-  function restore(){ if(fbEl) fbEl.textContent='复制完整路径'; }
-  function ok(){ if(fbEl){ fbEl.textContent='✓ 已复制'; setTimeout(restore,900); } }
-  function fail(){ if(fbEl){ fbEl.textContent='复制失败'; setTimeout(restore,1200); } }
+  function restore(){ if(fbEl) fbEl.textContent=dlText('复制完整路径'); }
+  function ok(){ if(fbEl){ fbEl.textContent=dlText('✓ 已复制'); setTimeout(restore,900); } }
+  function fail(){ if(fbEl){ fbEl.textContent=dlText('复制失败'); setTimeout(restore,1200); } }
   function fallback(){ var t=document.createElement('textarea'); t.value=p;
     document.body.appendChild(t); t.select();
     var done=false; try{ done=document.execCommand('copy'); }catch(e){ }
